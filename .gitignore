@@ -161,5 +161,6 @@ cython_debug/
 
 # project files
 logs
-Tears_of_Steel_1080p
+inputs/Tears_of_Steel_1080p
 inputs/Tears_of_Steel_1080p.mov
+inpainted

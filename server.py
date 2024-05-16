@@ -1,7 +1,10 @@
 # import packages
 import os
 import sys
+import time
 from functions import *
+
+start = time.time()
 
 # Get the log file path from environment variable
 log_file = os.environ.get('log_file')
@@ -45,12 +48,24 @@ processed_frame_names = process_frames_in_parallel(
     process_frame_server_side, 
     int(os.environ.get('num_processes')),
     square_size=int(os.environ.get('square_size')), 
-    filter_factor=int(os.environ.get('filter_factor'))
+    horizontal_stride=int(os.environ.get('horizontal_stride')),
+    vertical_stride=int(os.environ.get('vertical_stride'))
 )
 
 # reconstruct video from shrunk frames
 frame_rate = eval(unprocessed_video_info['average_frame_rate'])
 reconstruct_video_from_frames(video_folder + '/shrunk', video_folder + '/shrunk.avi', frame_rate)
-print('Frames have been processed and shrunk video was saved as' + video_folder + '/shrunk.avi')
+print('Frames have been processed and shrunk video was saved as', video_folder + '/shrunk.avi')
 
-print('Server side process completed.')
+# Printing video folder so that the orchestrator can capture it
+print("video_folder:", video_folder)
+
+# check bitrate saving from shrinking video TODO: mask size should be added unless it is rebuilt at client side using strides
+scene_video_info = get_video_info(scene_file)
+shrunk_video_info = get_video_info(video_folder + '/shrunk.avi')
+shrunk_video_size_ratio = float(shrunk_video_info['size']) / float(scene_video_info['size'])
+print('Video size ratio:', shrunk_video_size_ratio)
+
+end = time.time()
+
+print('Server side process completed in', end - start, 'seconds.')
