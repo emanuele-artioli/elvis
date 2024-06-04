@@ -18,7 +18,7 @@ subvideo_length = int(os.environ.get('subvideo_length'))
 experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}'
 metrics_inpainted_file = f'{experiment_folder}/nei_{neighbor_length}_ref_{ref_stride}_sub_{subvideo_length}_inpainted.csv'
 metrics_inpainted_df = pd.read_csv(metrics_inpainted_file)
-metrics_original_file = f'{experiment_folder}/nei_{neighbor_length}_ref_{ref_stride}_sub_{subvideo_length}_original.csv'
+metrics_original_file = f'videos/{video_name}/scene_{scene_number}/{resolution}/original.csv'
 metrics_original_df = pd.read_csv(metrics_original_file)
 
 # calculate aggregates
@@ -29,7 +29,7 @@ original_stds = metrics_original_df.std(axis=0)
 
 # get file sizes
 shrunk_file = f'{experiment_folder}/shrunk.mp4'
-original_file = f'{experiment_folder}/original.mp4'
+original_file = f'videos/{video_name}/scene_{scene_number}/{resolution}/original.mp4'
 shrunk_size = os.path.getsize(shrunk_file)
 original_size = os.path.getsize(original_file)
 
