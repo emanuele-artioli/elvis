@@ -160,7 +160,6 @@ cython_debug/
 #.idea/
 
 # project files
-logs
-inputs/Tears_of_Steel_1080p
-inputs/Tears_of_Steel_1080p.mov
-inpainted
+videos/
+old/
+tests/

@@ -1,71 +1,18 @@
 # import packages
 import os
-import sys
-import time
 from functions import *
 
-start = time.time()
-
-# Get the log file path from environment variable
-log_file = os.environ.get('log_file')
-
-# Redirect stdout and stderr to the log file
-sys.stdout = open(log_file, 'a')
-sys.stderr = open(log_file, 'a')
-
-# Log information
-print("Server script started.")
-
-# get video info
-unprocessed_video_file = os.environ.get('unprocessed_video_file')
-unprocessed_video_info = get_video_info(unprocessed_video_file)
-print(f'{unprocessed_video_file} info: {unprocessed_video_info}')
-
-# split video into scenes with parameters from orchestrator
-scene_similarity_threshold = int(os.environ.get('scene_similarity_threshold'))
-max_scenes = int(os.environ.get('max_scenes'))
-width = os.environ.get('width')
-height = os.environ.get('height')
-video_folder = split_video_into_scenes(
-    unprocessed_video_file, 
-    (width, height),
-    scene_similarity_threshold,
-    max_scenes
-)
-print(f'{unprocessed_video_file} was split into scenes and stored in {video_folder}')
-
-# choose scene
+video_name = os.environ.get('video_name')
 scene_number = os.environ.get('scene_number')
-scene_file = f'{video_folder}/scene_{scene_number}.avi'
-# split scene into frames
-frames_folder, _ = scene_file.rsplit('.', 1)
-split_video_into_frames(scene_file, frames_folder)
-print(f'Scene number {scene_number} was split into frames and stored in {frames_folder}')
+resolution = os.environ.get('resolution')
+original_frames_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/original'
 
 # break frames into blocks, remove blocks based on mask, reconstruct frames without removed blocks, 
 processed_frame_names = process_frames_in_parallel(
-    frames_folder, 
+    original_frames_folder, 
     process_frame_server_side, 
-    int(os.environ.get('num_processes')),
+    num_processes=32,
     square_size=int(os.environ.get('square_size')), 
     horizontal_stride=int(os.environ.get('horizontal_stride')),
     vertical_stride=int(os.environ.get('vertical_stride'))
 )
-
-# reconstruct video from shrunk frames
-frame_rate = eval(unprocessed_video_info['average_frame_rate'])
-reconstruct_video_from_frames(video_folder + '/shrunk', video_folder + '/shrunk.avi', frame_rate)
-print('Frames have been processed and shrunk video was saved as', video_folder + '/shrunk.avi')
-
-# Printing video folder so that the orchestrator can capture it
-print("video_folder:", video_folder)
-
-# check bitrate saving from shrinking video TODO: mask size should be added unless it is rebuilt at client side using strides
-scene_video_info = get_video_info(scene_file)
-shrunk_video_info = get_video_info(video_folder + '/shrunk.avi')
-shrunk_video_size_ratio = float(shrunk_video_info['size']) / float(scene_video_info['size'])
-print('Video size ratio:', shrunk_video_size_ratio)
-
-end = time.time()
-
-print('Server side process completed in', end - start, 'seconds.')

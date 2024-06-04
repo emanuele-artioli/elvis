@@ -1,93 +1,144 @@
-cd
-cd embrace
-# should the list of packages be installed at this point?
-source activate embrace
+#!/bin/bash
 
-echo "Orchestrator script started."
+# SETUP
 
-# define running parameters TODO: put them as arguments of the script, so many config can be run in chain
-unprocessed_video_file="inputs/Tears_of_Steel_1080p.mov"
-scene_similarity_threshold="45"
-max_scenes="2"
-scene_number="2"
-width="640"
-height="384"
-square_size="16"
-horizontal_stride="2"
-vertical_stride="2"
-num_processes="64"
-fp="fp16" #TODO: to allow for fp32, make this parameter in python like "if fp else None"
-neighbor_length="3"
-ref_stride="3"
-subvideo_length="11"
+# pass parameters to python scripts
+export video_name=$1
+export scene_number=$2
+export resolution="$3:$4"
+export frame_rate=$5 # TODO: add the damn frame interpolation, of course!!
+export square_size=$6
+export horizontal_stride=$7
+export vertical_stride=$8
+export neighbor_length=$9
+export ref_stride=${10}
+export subvideo_length=${11}
+export bitrate=${12}
 
-# define video name
-video_name="scene_${scene_number}_${height}p_square_${square_size}_stride_${horizontal_stride}x${vertical_stride}_inpaint_${fp}_${neighbor_length}_${ref_stride}_${subvideo_length}"
+# Iterate over all video files in the input directory and split them into scenes
+for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
+    if [[ -f "$file" ]]; then
+        echo "Detected $file not split into scenes. Splitting..."
+        python split_video_into_scenes.py $file 45 10
+    fi
+done
 
-# Define the directory for log files
-log_dir="logs"
-# Ensure the log directory exists
-mkdir -p "$log_dir"
-# Generate name for log file
-log_file="${log_dir}/${video_name}.txt"
-# Redirect stdout and stderr to the new log file
-exec > >(tee -a "$log_file") 2>&1
+# EXPERIMENT
 
-# export running parameters
-export log_file="$log_file"
-export unprocessed_video_file="$unprocessed_video_file"
-export scene_similarity_threshold="$scene_similarity_threshold"
-export max_scenes="$max_scenes"
-export scene_number="$scene_number"
-export width="$width"
-export height="$height"
-export square_size="$square_size"
-export horizontal_stride="$horizontal_stride"
-export vertical_stride="$vertical_stride"
-export num_processes="$num_processes"
+# Create the experiment folder
+experiment_name="squ_${6}_hor_${7}_ver_${8}"
+mkdir -p "videos/$1/scene_$2/"$3:$4"/$experiment_name"
 
-# running server script and extracting video folder and file size ratio from logs
-output=$(python server.py)
-video_folder=$(grep "video_folder:" "$log_file" | cut -d " " -f 2)
-video_size_ratio=$(grep "Video size ratio:" "$log_file" | cut -d " " -f 2)
+resize_video() {
+    local input_file=$1
+    local output_dir=$2
+    local resolution=$3
+    
+    # Check if the output file already exists
+    if [[ -f "$output_dir" ]]; then
+        echo "$output_dir already exists"
+        return 1
+    fi
 
-# passing variables to client script and running it
-export video_folder="$video_folder"
+    ffmpeg -i "$input_file" -an -vf scale="$resolution":force_original_aspect_ratio=increase,crop="$resolution" \
+           -c:v libx265 -crf 0 -pix_fmt yuv420p "$output_dir/frame_%04d.png"
+}
+# resize scene based on experiment resolution, save into 
+resize_video videos/$1/scene_$2.mp4 videos/$1/scene_$2/"$3:$4"/original "$3:$4"
+
+frames_into_video() {
+    local input_dir="$1"
+    local output_file="$2"
+    local frame_rate="$3"
+    local bitrate="$4"
+
+    # Check if the output already exists
+    if [[ -f "$output_file" ]]; then
+        echo "$output_file already exists"
+        return 1
+    fi
+
+    ffmpeg -framerate "$frame_rate" -i "$input_dir/frame_%04d.png" \
+           -b:v ${bitrate} -maxrate ${bitrate} -minrate ${bitrate} -bufsize ${bitrate} \
+           -c:v libx265 -pix_fmt yuv420p "$output_file"
+}
+
+frames_into_video videos/$1/scene_$2/"$3:$4"/original videos/$1/scene_$2/"$3:$4"/original.mp4 $5 ${12}
+
+# run server script
+python server.py 
+
+# move shrunk and masks into experiment folder
+mv -f "videos/$1/scene_$2/"$3:$4"/shrunk/" "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk"
+mv -f "videos/$1/scene_$2/"$3:$4"/masks/" "videos/$1/scene_$2/"$3:$4"/$experiment_name/masks"
+
+# get shrunk video from frames
+frames_into_video "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk" "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk.mp4" $5 ${12}
+
+# run client script
 python client.py
 
+# get stretched video from frames
+frames_into_video "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched" "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4" $5 ${12}
+
 # inpaint video
-SECONDS=0
-stretched_video_path="${PWD}/${video_folder}/stretched.avi"
-mask_path="${PWD}/${video_folder}/masks/frame0001.png"
 cd
-cd ProPainter
-source activate propainter
-cp $stretched_video_path "inputs/video_completion/stretched.avi"
-cp $mask_path "inputs/video_completion/frame0001.png"
+stretched_video_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4"
+mask_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/masks/frame_0001.png"
+cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
+cp $mask_path "ProPainter/inputs/video_completion/frame0001.png"
 # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
-python inference_propainter.py --video inputs/video_completion/stretched.avi --mask inputs/video_completion/frame0001.png\
- --$fp --neighbor_length $neighbor_length --ref_stride $ref_stride --subvideo_length $subvideo_length > /dev/null
-echo "Inpainting process run in $SECONDS seconds."
+cd ProPainter
+python inference_propainter.py \
+    --video inputs/video_completion/stretched.mp4 \
+    --mask inputs/video_completion/frame0001.png \
+    --neighbor_length $9 \
+    --ref_stride ${10} \
+    --subvideo_length ${11}
 
-# compare quality degradation of inpainted video with regularly encoded video at same bitrate
+# move inpainted to experiment folder
 cd
-reference_video_path="${PWD}/embrace/${video_folder}/scene_${scene_number}.avi"
-distorted_video_path="${PWD}/ProPainter/results/stretched/inpaint_out.avi"
-reference_target_path="${PWD}/embrace/inpainted/${video_name}_reference.yuv"
-distorted_target_path="${PWD}/embrace/inpainted/${video_name}_distorted.yuv"
+mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+
+cd embrace
+
+# quality degradation of inpainted video
+reference_video_path="videos/$1/scene_$2/"$3:$4"/original.mp4"
+distorted_video_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+reference_target_path="videos/$1/scene_$2/"$3:$4"/reference.yuv"
+distorted_target_path="videos/$1/scene_$2/"$3:$4"/distorted.yuv"
 # encode inpainted for vmaf, and save it in embrace folder renamed based on its parameters configuration
-ffmpeg -i $reference_video_path -f rawvideo -pix_fmt yuv420p -s ${width}x${height} $reference_target_path > /dev/null
-ffmpeg -i $distorted_video_path -f rawvideo -pix_fmt yuv420p -s ${width}x${height} $distorted_target_path > /dev/null
+ffmpeg -i $reference_video_path -f rawvideo -pix_fmt yuv420p $reference_target_path
+ffmpeg -i $distorted_video_path -f rawvideo -pix_fmt yuv420p $distorted_target_path
 # calculate quality degradation and save it as csv
-vmafossexec yuv420p $width $height $reference_target_path $distorted_target_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl\
- --log ${PWD}/embrace/logs/${video_name}.csv\
- --log-fmt csv --psnr --ssim --ms-ssim
+vmafossexec yuv420p $3 $4 $reference_target_path $distorted_target_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
+    --log videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv\
+    --log-fmt csv --psnr --ssim --ms-ssim
+# delete yuv files
+rm "videos/$1/scene_$2/"$3:$4"/reference.yuv"
+rm "videos/$1/scene_$2/"$3:$4"/distorted.yuv"
 
+# quality degradation of original video
+reference_video_path="videos/$1/scene_$2/"$3:$4"/original.mp4"
+distorted_video_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/original.mp4"
+reference_target_path="videos/$1/scene_$2/"$3:$4"/reference.yuv"
+distorted_target_path="videos/$1/scene_$2/"$3:$4"/distorted.yuv"
+# encode inpainted for vmaf, and save it in embrace folder renamed based on its parameters configuration
+ffmpeg -i $reference_video_path -f rawvideo -pix_fmt yuv420p $reference_target_path
+ffmpeg -i $distorted_video_path -f rawvideo -pix_fmt yuv420p $distorted_target_path
+# calculate quality degradation and save it as csv
+vmafossexec yuv420p $3 $4 $reference_target_path $distorted_target_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
+    --log videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_original.csv\
+    --log-fmt csv --psnr --ssim --ms-ssim
+# delete yuv files
+rm "videos/$1/scene_$2/"$3:$4"/reference.yuv"
+rm "videos/$1/scene_$2/"$3:$4"/distorted.yuv"
 
+# run metrics script
+python metrics.py
 
-# calculate flolpips
-# cd flolpips
-# source activate embrace
-# export reference_target_path="$reference_target_path"
-# export distorted_target_path="$distorted_target_path"
-# python embrace.py
+# save storage when running many experiments by deleting files and folders that will not be needed anymore
+# delete shrunk folder
+rm -r "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk"
+# delete stretched folder
+rm -r "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched"
