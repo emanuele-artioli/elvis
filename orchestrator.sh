@@ -81,7 +81,8 @@ python client.py
 # get stretched video from frames
 frames_into_video "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched" "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4" $5 ${12}
 
-# inpaint video
+# INPAINTING
+
 cd
 stretched_video_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4"
 mask_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/masks/frame_0001.png"
@@ -99,32 +100,68 @@ python inference_propainter.py \
 # move inpainted to experiment folder
 cd
 mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
-
 cd embrace
 
-# quality degradation
+# QUALITY MEASUREMENT
+
+# Function to run ffmpeg command and extract VMAF and PSNR values
+calculate_vmaf() {
+    local reference_file=$1
+    local distorted_file=$2
+    local log_file=$3
+    local model_file=$4
+
+    # Default filter_complex for 1080p
+    filter_complex="[0:v]scale=1920x1080:flags=bicubic[main]; [1:v]scale=1920x1080:flags=bicubic[ref]; [main][ref]libvmaf=log_path=${log_file}:log_fmt=csv"
+
+    if [ "$model_file" == "vmaf_4k_v0.6.1" ]; then
+        filter_complex="[0:v]scale=3840x2160:flags=bicubic[main]; [1:v]scale=3840x2160:flags=bicubic[ref]; [main][ref]libvmaf=model=version=${model_file}:log_path=${log_file}:log_fmt=csv"
+    elif [ "$model_file" == "vmaf_v0.6.1" ]; then
+        filter_complex="[0:v]scale=1920x1080:flags=bicubic[main]; [1:v]scale=1920x1080:flags=bicubic[ref]; [main][ref]libvmaf=model=version=${model_file}:log_path=${log_file}:log_fmt=csv"
+    fi
+
+    ffmpeg -i "$reference_file" -i "$distorted_file" -filter_complex "$filter_complex" -f null -
+}
+
+# encode reference video
 reference_input_path="videos/$1/scene_$2/"$3:$4"/original/frame_%04d.png"
 reference_output_path="videos/$1/scene_$2/"$3:$4"/reference.yuv"
-ffmpeg -i $reference_input_path -f rawvideo -pix_fmt yuv420p $reference_output_path
-
-# compare reference with inpainted video
-inpainted_input_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
-inpainted_output_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/inpainted.yuv"
-ffmpeg -i $inpainted_input_path -f rawvideo -pix_fmt yuv420p $inpainted_output_path
-# calculate quality degradation and save it as csv
-vmafossexec yuv420p $3 $4 $reference_output_path $inpainted_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
-    --log videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv\
-    --log-fmt csv --psnr --ssim --ms-ssim
-rm $inpainted_output_path
+# Check if the output already exists, if not create it
+if [[ -f "$reference_output_path" ]]; then
+    echo "$reference_output_path already exists"   
+else
+    ffmpeg -i $reference_input_path -f rawvideo -pix_fmt yuv420p $reference_output_path
+fi
 
 # compare reference with original video
 original_input_path="videos/$1/scene_$2/"$3:$4"/original.mp4"
 original_output_path="videos/$1/scene_$2/"$3:$4"/original.yuv"
-ffmpeg -i $original_input_path -f rawvideo -pix_fmt yuv420p $original_output_path
-# calculate quality degradation and save it as csv
-vmafossexec yuv420p $3 $4 $reference_output_path $original_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
-    --log videos/$1/scene_$2/"$3:$4"/original.csv\
-    --log-fmt csv --psnr --ssim --ms-ssim
+# Check if the output already exists, if not create it
+if [[ -f "$original_output_path" ]]; then
+    echo "$original_output_path already exists"   
+else
+    ffmpeg -i $original_input_path -f rawvideo -pix_fmt yuv420p $original_output_path
+    # calculate quality degradation and save it as csv
+    # vmafossexec yuv420p $3 $4 $reference_output_path $original_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
+    #     --log videos/$1/scene_$2/"$3:$4"/original.csv\
+    #     --log-fmt csv --psnr --ssim --ms-ssim
+    calculate_vmaf "$original_input_path" "$original_input_path" "videos/$1/scene_$2/"$3:$4"/original.csv" "vmaf_v0.6.1"
+fi
+
+# compare reference with inpainted video
+inpainted_input_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+inpainted_output_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/inpainted.yuv"
+# Check if the output already exists, if not create it
+if [[ -f "$inpainted_output_path" ]]; then
+    echo "$inpainted_output_path already exists"   
+else
+    ffmpeg -i $inpainted_input_path -f rawvideo -pix_fmt yuv420p $inpainted_output_path
+    # calculate quality degradation and save it as csv
+    # vmafossexec yuv420p $3 $4 $reference_output_path $inpainted_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
+    #     --log videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv\
+    #     --log-fmt csv --psnr --ssim --ms-ssim
+    calculate_vmaf "$reference_input_path" "$inpainted_input_path" "videos/$1/scene_$2/"$3\:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv" "vmaf_v0.6.1"
+fi
 
 # run metrics script
 python metrics.py

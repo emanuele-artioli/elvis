@@ -1,18 +1,18 @@
 #!/bin/bash
 
 # Define the combinations
-videos=("Tears_of_Steel_4k" "bbb_sunflower_2160p_60fps_normal")
-scene_numbers=("009")
-widths=("1280")
-heights=("720")
+videos=("Tears_of_Steel_4k24" "Big_Buck_Bunny_4k60")
+scene_numbers=("9")
+widths=("640" "960" "1280")
+heights=("360" "540" "720")
 framerates=("24" "60")
-square_sizes=("40")
+square_sizes=("20" "40")
 horizontal_stride=("1" "2" "3")
 vertical_stride=("1" "2" "3")
 neighbor_length=("2" "5")
 ref_stride=("2" "5")
 subvideo_length=("10" "30")
-bitrates=("1000k" "3000k")
+bitrates=("300k" "600k" "1000k" "3000k")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {
@@ -34,27 +34,31 @@ should_exclude_combination() {
     #     return 0  # Exclude this combination
     # fi
 
-    if [[ "$width" == "640" && "$height" != "360" ]]; then
+    if [[ "$width" == "640" && ("$height" != "360" || "$bitrate" != "300k") ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$width" == "1280" && "$height" != "720" ]]; then
+    if [[ "$width" == "960" && ("$height" != "540" || "$bitrate" != "600k") ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$width" == "1920" && "$height" != "1080" ]]; then
+    if [[ "$width" == "1280" && ("$height" != "720" || "$bitrate" != "1000k") ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$video" == "Tears_of_Steel_1080p" && "$framerate" != "24" ]]; then
+    if [[ "$width" == "1920" && ("$height" != "1080" || "$bitrate" != "3000k") ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$video" == "Tears_of_Steel_4k" && "$framerate" != "24" ]]; then
+    if [[ "$video" == "Tears_of_Steel_1080p24" && "$framerate" != "24" ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$video" == "bbb_sunflower_2160p_60fps_normal" && "$framerate" != "60" ]]; then
+    if [[ "$video" == "Tears_of_Steel_4k24" && "$framerate" != "24" ]]; then
+        return 0  # Exclude this combination
+    fi
+
+    if [[ "$video" == "Big_Buck_Bunny_4k60" && "$framerate" != "60" ]]; then
         return 0  # Exclude this combination
     fi
 
