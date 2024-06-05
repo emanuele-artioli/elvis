@@ -5,7 +5,7 @@
 # pass parameters to python scripts
 export video_name=$1
 export scene_number=$2
-export resolution="$3:$4"
+export resolution="${3}x${4}"
 export frame_rate=$5 # TODO: add the damn frame interpolation, of course!!
 export square_size=$6
 export horizontal_stride=$7
@@ -27,7 +27,7 @@ done
 
 # Create the experiment folder
 experiment_name="squ_${6}_hor_${7}_ver_${8}"
-mkdir -p "videos/$1/scene_$2/"$3:$4"/$experiment_name"
+mkdir -p "videos/$1/scene_$2/"${3}x${4}"/$experiment_name"
 
 resize_video() {
     local input_file=$1
@@ -44,7 +44,7 @@ resize_video() {
     ffmpeg -i "$input_file" -vf scale="$resolution":force_original_aspect_ratio=increase,crop="$resolution" "$output_dir/frame_%04d.png"
 }
 # resize scene based on experiment resolution, save into 
-resize_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/$3:$4/original" "$3:$4"
+resize_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/${3}x${4}/original" "${3}:${4}"
 
 frames_into_video() {
     local input_dir="$1"
@@ -63,29 +63,29 @@ frames_into_video() {
            -c:v libx265 -pix_fmt yuv420p "$output_file"
 }
 
-frames_into_video videos/$1/scene_$2/"$3:$4"/original videos/$1/scene_$2/"$3:$4"/original.mp4 $5 ${12}
+frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 $5 ${12}
 
 # run server script
 python server.py 
 
 # move shrunk and masks into experiment folder
-mv -f "videos/$1/scene_$2/"$3:$4"/shrunk/" "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk"
-mv -f "videos/$1/scene_$2/"$3:$4"/masks/" "videos/$1/scene_$2/"$3:$4"/$experiment_name/masks"
+mv -f "videos/$1/scene_$2/"${3}x${4}"/shrunk/" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk"
+mv -f "videos/$1/scene_$2/"${3}x${4}"/masks/" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks"
 
 # get shrunk video from frames
-frames_into_video "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk" "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk.mp4" $5 ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" $5 ${12}
 
 # run client script
 python client.py
 
 # get stretched video from frames
-frames_into_video "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched" "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4" $5 ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4" $5 ${12}
 
 # INPAINTING
 
 cd
-stretched_video_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched.mp4"
-mask_path="embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/masks/frame_0001.png"
+stretched_video_path="embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4"
+mask_path="embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks/frame_0001.png"
 cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
 cp $mask_path "ProPainter/inputs/video_completion/frame_0001.png"
 # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
@@ -99,7 +99,7 @@ python inference_propainter.py \
 
 # move inpainted to experiment folder
 cd
-mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
 cd embrace
 
 # QUALITY MEASUREMENT
@@ -123,51 +123,43 @@ calculate_vmaf() {
     ffmpeg -i "$reference_file" -i "$distorted_file" -filter_complex "$filter_complex" -f null -
 }
 
-# encode reference video
-reference_input_path="videos/$1/scene_$2/"$3:$4"/original/frame_%04d.png"
-reference_output_path="videos/$1/scene_$2/"$3:$4"/reference.yuv"
+# encode reference video lossless
+reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/frame_%04d.png"
+reference_output_path="videos/$1/scene_$2/"${3}x${4}"/reference.mp4"
 # Check if the output already exists, if not create it
 if [[ -f "$reference_output_path" ]]; then
     echo "$reference_output_path already exists"   
 else
-    ffmpeg -i $reference_input_path -f rawvideo -pix_fmt yuv420p $reference_output_path
+    ffmpeg -i $reference_input_path -c:v libx265 -crf 0 -pix_fmt yuv420p $reference_output_path
 fi
 
 # compare reference with original video
-original_input_path="videos/$1/scene_$2/"$3:$4"/original.mp4"
-original_output_path="videos/$1/scene_$2/"$3:$4"/original.yuv"
+original_input_path="videos/$1/scene_$2/"${3}x${4}"/original.mp4"
+original_csv_path="videos/$1/scene_$2/"${3}x${4}"/original.csv"
 # Check if the output already exists, if not create it
-if [[ -f "$original_output_path" ]]; then
-    echo "$original_output_path already exists"   
+if [[ -f "$original_csv_path" ]]; then
+    echo "$original_csv_path already exists"   
 else
-    ffmpeg -i $original_input_path -f rawvideo -pix_fmt yuv420p $original_output_path
-    # calculate quality degradation and save it as csv
-    # vmafossexec yuv420p $3 $4 $reference_output_path $original_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
-    #     --log videos/$1/scene_$2/"$3:$4"/original.csv\
-    #     --log-fmt csv --psnr --ssim --ms-ssim
-    calculate_vmaf "$original_input_path" "$original_input_path" "videos/$1/scene_$2/"$3:$4"/original.csv" "vmaf_v0.6.1"
+    calculate_vmaf "$reference_output_path" "$original_input_path" "$original_csv_path" "vmaf_v0.6.1"
 fi
 
 # compare reference with inpainted video
-inpainted_input_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
-inpainted_output_path="videos/$1/scene_$2/"$3:$4"/$experiment_name/inpainted.yuv"
+inpainted_input_path="videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+inpainted_csv_path="videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv"
 # Check if the output already exists, if not create it
-if [[ -f "$inpainted_output_path" ]]; then
-    echo "$inpainted_output_path already exists"   
+if [[ -f "$inpainted_csv_path" ]]; then
+    echo "$inpainted_csv_path already exists"   
 else
-    ffmpeg -i $inpainted_input_path -f rawvideo -pix_fmt yuv420p $inpainted_output_path
-    # calculate quality degradation and save it as csv
-    # vmafossexec yuv420p $3 $4 $reference_output_path $inpainted_output_path /home/shared/athena/vmaf/model/vmaf_v0.6.1.pkl \
-    #     --log videos/$1/scene_$2/"$3:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv\
-    #     --log-fmt csv --psnr --ssim --ms-ssim
-    calculate_vmaf "$reference_input_path" "$inpainted_input_path" "videos/$1/scene_$2/"$3\:$4"/$experiment_name/nei_${9}_ref_${10}_sub_${11}_inpainted.csv" "vmaf_v0.6.1"
+    calculate_vmaf "$reference_output_path" "$inpainted_input_path" "$inpainted_csv_path" "vmaf_v0.6.1"
 fi
 
 # run metrics script
 python metrics.py
 
+# CLEANING UP
+
 # save storage when running many experiments by deleting files and folders that will not be needed anymore
 # delete shrunk folder
-rm -r "videos/$1/scene_$2/"$3:$4"/$experiment_name/shrunk"
+rm -r "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk"
 # delete stretched folder
-rm -r "videos/$1/scene_$2/"$3:$4"/$experiment_name/stretched"
+rm -r "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched"
