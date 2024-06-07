@@ -5,14 +5,12 @@ videos=("Tears_of_Steel_4k24" "Big_Buck_Bunny_4k60")
 scene_numbers=("9")
 widths=("640" "960" "1280")
 heights=("360" "540" "720")
-framerates=("24" "60")
 square_sizes=("20" "40")
 horizontal_stride=("1" "2" "3")
 vertical_stride=("1" "2" "3")
 neighbor_length=("2" "5")
 ref_stride=("2" "5")
 subvideo_length=("10" "30")
-bitrates=("300k" "600k" "1000k" "3000k")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {
@@ -20,45 +18,31 @@ should_exclude_combination() {
     local scene_number="$2"
     local width="$3"
     local height="$4"
-    local framerate="$5"
-    local square_size="$6"
-    local h_stride="$7"
-    local v_stride="$8"
-    local neighbor="$9"
-    local ref="${10}"
-    local subvideo="${11}"
-    local bitrate="${12}"
+    local square_size="$5"
+    local h_stride="$6"
+    local v_stride="$7"
+    local neighbor="$8"
+    local ref="$9"
+    local subvideo="${10}"
 
     # Add more exclusion rules as needed
     # if [[ <condition> ]]; then
     #     return 0  # Exclude this combination
     # fi
 
-    if [[ "$width" == "640" && ("$height" != "360" || "$bitrate" != "300k") ]]; then
+    if [[ "$width" == "640" && "$height" != "360" ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$width" == "960" && ("$height" != "540" || "$bitrate" != "600k") ]]; then
+    if [[ "$width" == "960" && "$height" != "540" ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$width" == "1280" && ("$height" != "720" || "$bitrate" != "1000k") ]]; then
+    if [[ "$width" == "1280" && "$height" != "720" ]]; then
         return 0  # Exclude this combination
     fi
 
-    if [[ "$width" == "1920" && ("$height" != "1080" || "$bitrate" != "3000k") ]]; then
-        return 0  # Exclude this combination
-    fi
-
-    if [[ "$video" == "Tears_of_Steel_1080p24" && "$framerate" != "24" ]]; then
-        return 0  # Exclude this combination
-    fi
-
-    if [[ "$video" == "Tears_of_Steel_4k24" && "$framerate" != "24" ]]; then
-        return 0  # Exclude this combination
-    fi
-
-    if [[ "$video" == "Big_Buck_Bunny_4k60" && "$framerate" != "60" ]]; then
+    if [[ "$width" == "1920" && "$height" != "1080" ]]; then
         return 0  # Exclude this combination
     fi
 
@@ -75,25 +59,21 @@ for video in "${videos[@]}"; do
     for scene_number in "${scene_numbers[@]}"; do
         for width in "${widths[@]}"; do
             for height in "${heights[@]}"; do
-                for framerate in "${framerates[@]}"; do
-                    for square_size in "${square_sizes[@]}"; do
-                        for h_stride in "${horizontal_stride[@]}"; do
-                            for v_stride in "${vertical_stride[@]}"; do
-                                for neighbor in "${neighbor_length[@]}"; do
-                                    for ref in "${ref_stride[@]}"; do
-                                        for subvideo in "${subvideo_length[@]}"; do
-                                            for bitrate in "${bitrates[@]}"; do
-                                                # Check if this combination should be excluded
-                                                if should_exclude_combination "$video" "$scene_number" "$width" "$height" "$framerate" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo" "$bitrate"; then
-                                                    echo "Excluding combination: $video, $scene_number, $width, $height, $framerate, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo, $bitrate"
-                                                    continue
-                                                fi
+                for square_size in "${square_sizes[@]}"; do
+                    for h_stride in "${horizontal_stride[@]}"; do
+                        for v_stride in "${vertical_stride[@]}"; do
+                            for neighbor in "${neighbor_length[@]}"; do
+                                for ref in "${ref_stride[@]}"; do
+                                    for subvideo in "${subvideo_length[@]}"; do
+                                        # Check if this combination should be excluded
+                                        if should_exclude_combination "$video" "$scene_number" "$width" "$height" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo"; then
+                                            echo "Excluding combination: $video, $scene_number, $width, $height, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo"
+                                            continue
+                                        fi
 
-                                                # Call the orchestrator script with the combination, suppressing its output
-                                                echo "Running orchestrator with parameters: $video, $scene_number, $width, $height, $framerate, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo, $bitrate"
-                                                ./orchestrator.sh "$video" "$scene_number" "$width" "$height" "$framerate" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo" "$bitrate" > /dev/null 2>&1
-                                            done
-                                        done
+                                        # Call the orchestrator script with the combination, suppressing its output
+                                        echo "Running orchestrator with parameters: $video, $scene_number, $width, $height, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo"
+                                        ./orchestrator.sh "$video" "$scene_number" "$width" "$height" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo" > /dev/null 2>&1
                                     done
                                 done
                             done

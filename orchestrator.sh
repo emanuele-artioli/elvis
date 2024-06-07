@@ -6,7 +6,6 @@
 export video_name=$1
 export scene_number=$2
 export resolution="${3}x${4}"
-export frame_rate=$5 # TODO: add the damn frame interpolation, of course!!
 export square_size=$6
 export horizontal_stride=$7
 export vertical_stride=$8
@@ -49,8 +48,7 @@ resize_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/${3}x${4}/original" "$
 frames_into_video() {
     local input_dir="$1"
     local output_file="$2"
-    local frame_rate="$3"
-    local bitrate="$4"
+    local bitrate="$3"
 
     # Check if the output already exists
     if [[ -f "$output_file" ]]; then
@@ -58,12 +56,12 @@ frames_into_video() {
         return 1
     fi
 
-    ffmpeg -framerate "$frame_rate" -i "$input_dir/frame_%04d.png" \
+    ffmpeg -i "$input_dir/frame_%04d.png" \
            -b:v ${bitrate} -maxrate ${bitrate} -minrate ${bitrate} -bufsize ${bitrate} \
            -c:v libx265 -pix_fmt yuv420p "$output_file"
 }
 
-frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 $5 ${12}
+frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 ${12}
 
 # run server script
 python server.py 
@@ -73,13 +71,13 @@ mv -f "videos/$1/scene_$2/"${3}x${4}"/shrunk/" "videos/$1/scene_$2/"${3}x${4}"/$
 mv -f "videos/$1/scene_$2/"${3}x${4}"/masks/" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks"
 
 # get shrunk video from frames
-frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" $5 ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" ${12}
 
 # run client script
 python client.py
 
 # get stretched video from frames
-frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4" $5 ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4" ${12}
 
 # INPAINTING
 
@@ -95,43 +93,39 @@ python inference_propainter.py \
     --mask inputs/video_completion/frame_0001.png \
     --neighbor_length $9 \
     --ref_stride ${10} \
-    --subvideo_length ${11}
+    --subvideo_length ${11} \
+    --fp16
 
 # move inpainted to experiment folder
 cd
 mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
 cd embrace
 
-# QUALITY MEASUREMENT
+# QUALITY MEASUREMENT TODO: VMAF scores seem to be wrong... and libvmaf does not have psnr or ssim, move away from libvmaf
+# TODO: calculate degradation at each step of the encoding?
 
-# Function to run ffmpeg command and extract VMAF and PSNR values
-calculate_vmaf() {
+# Function to run ffmpeg command and extract metrics values
+calculate_metrics() {
     local reference_file=$1
     local distorted_file=$2
     local log_file=$3
-    local model_file=$4
 
     # Default filter_complex for 1080p
     filter_complex="[0:v]scale=1920x1080:flags=bicubic[main]; [1:v]scale=1920x1080:flags=bicubic[ref]; [main][ref]libvmaf=log_path=${log_file}:log_fmt=csv"
-
-    if [ "$model_file" == "vmaf_4k_v0.6.1" ]; then
-        filter_complex="[0:v]scale=3840x2160:flags=bicubic[main]; [1:v]scale=3840x2160:flags=bicubic[ref]; [main][ref]libvmaf=model=version=${model_file}:log_path=${log_file}:log_fmt=csv"
-    elif [ "$model_file" == "vmaf_v0.6.1" ]; then
-        filter_complex="[0:v]scale=1920x1080:flags=bicubic[main]; [1:v]scale=1920x1080:flags=bicubic[ref]; [main][ref]libvmaf=model=version=${model_file}:log_path=${log_file}:log_fmt=csv"
-    fi
-
     ffmpeg -i "$reference_file" -i "$distorted_file" -filter_complex "$filter_complex" -f null -
 }
 
-# encode reference video lossless
-reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/frame_%04d.png"
-reference_output_path="videos/$1/scene_$2/"${3}x${4}"/reference.mp4"
-# Check if the output already exists, if not create it
-if [[ -f "$reference_output_path" ]]; then
-    echo "$reference_output_path already exists"   
-else
-    ffmpeg -i $reference_input_path -c:v libx265 -crf 0 -pix_fmt yuv420p $reference_output_path
-fi
+# # encode reference video lossless TODO: no need, take the scene_n.mp4
+# reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/frame_%04d.png"
+# reference_output_path="videos/$1/scene_$2/"${3}x${4}"/reference.mp4"
+# # Check if the output already exists, if not create it
+# if [[ -f "$reference_output_path" ]]; then
+#     echo "$reference_output_path already exists"   
+# else
+#     ffmpeg -i $reference_input_path -c:v libx265 -crf 0 -pix_fmt yuv420p $reference_output_path
+# fi
+
+reference_output_path="videos/$1/scene_$2.mp4"
 
 # compare reference with original video
 original_input_path="videos/$1/scene_$2/"${3}x${4}"/original.mp4"
@@ -140,7 +134,7 @@ original_csv_path="videos/$1/scene_$2/"${3}x${4}"/original.csv"
 if [[ -f "$original_csv_path" ]]; then
     echo "$original_csv_path already exists"   
 else
-    calculate_vmaf "$reference_output_path" "$original_input_path" "$original_csv_path" "vmaf_v0.6.1"
+    calculate_metrics "$reference_output_path" "$original_input_path" "$original_csv_path"
 fi
 
 # compare reference with inpainted video
@@ -150,11 +144,11 @@ inpainted_csv_path="videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref
 if [[ -f "$inpainted_csv_path" ]]; then
     echo "$inpainted_csv_path already exists"   
 else
-    calculate_vmaf "$reference_output_path" "$inpainted_input_path" "$inpainted_csv_path" "vmaf_v0.6.1"
+    calculate_metrics "$reference_output_path" "$inpainted_input_path" "$inpainted_csv_path"
 fi
 
 # run metrics script
-python metrics.py
+python collect_metrics.py
 
 # CLEANING UP
 
