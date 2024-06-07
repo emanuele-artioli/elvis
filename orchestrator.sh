@@ -66,10 +66,10 @@ frames_into_video() {
                -c:v libx265 -pix_fmt yuv420p "$output_file"
     fi
 }
-
+# get original video from frames
 frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 ${12}
 
-# run server script
+# run server script to get masks and shrunk frames
 python server.py 
 
 # move shrunk and masks into experiment folder
@@ -79,7 +79,7 @@ mv -f "videos/$1/scene_$2/"${3}x${4}"/masks/" "videos/$1/scene_$2/"${3}x${4}"/$e
 # get shrunk video from frames
 frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" ${12}
 
-# run client script
+# run client script to get stretched frames
 python client.py
 
 # get stretched video from frames
@@ -113,7 +113,6 @@ cd embrace
 frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4" "lossless"
 
 # QUALITY MEASUREMENT TODO: VMAF scores seem to be wrong... and libvmaf does not have psnr or ssim, move away from libvmaf
-# TODO: calculate degradation at each step of the encoding?
 
 # Function to run ffmpeg command and extract metrics values
 calculate_metrics() {
