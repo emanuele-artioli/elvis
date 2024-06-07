@@ -12,7 +12,7 @@ vertical_stride = int(os.environ.get('vertical_stride'))
 # TODO: now we're passing a predetermined mask, needs a function that takes as input one or more masks, 
 # and yields one mask after another then loops back from the first, each time it's called
 
-mask_frame_path = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/masks/frame_0001.png'
+mask_frame_path = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/masks/0000.png'
 mask_frame = cv2.imread(mask_frame_path)
 mask_squares = split_image_into_squares(mask_frame, square_size)
 shrunk_frames_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/shrunk'

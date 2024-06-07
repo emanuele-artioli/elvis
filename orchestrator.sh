@@ -40,7 +40,7 @@ resize_video() {
     fi
 
     mkdir $output_dir
-    ffmpeg -i "$input_file" -vf scale="$resolution":force_original_aspect_ratio=increase,crop="$resolution" "$output_dir/frame_%04d.png"
+    ffmpeg -i "$input_file" -vf scale="$resolution":force_original_aspect_ratio=increase,crop="$resolution" -start_number 0 "$output_dir/%04d.png"
 }
 # resize scene based on experiment resolution, save into 
 resize_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/${3}x${4}/original" "${3}:${4}"
@@ -58,10 +58,10 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -i "$input_dir/frame_%04d.png" \
+        ffmpeg -i "$input_dir/%04d.png" \
                -c:v libx265 -preset ultrafast -x265-params lossless=1 -pix_fmt yuv420p "$output_file"
     else
-        ffmpeg -i "$input_dir/frame_%04d.png" \
+        ffmpeg -i "$input_dir/%04d.png" \
                -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" \
                -c:v libx265 -pix_fmt yuv420p "$output_file"
     fi
@@ -89,23 +89,28 @@ frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "v
 
 cd
 stretched_video_path="embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4"
-mask_path="embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks/frame_0001.png"
+mask_path="embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks/0000.png"
 cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
-cp $mask_path "ProPainter/inputs/video_completion/frame_0001.png"
+cp $mask_path "ProPainter/inputs/video_completion/0000.png"
 # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
 cd ProPainter
 python inference_propainter.py \
     --video inputs/video_completion/stretched.mp4 \
-    --mask inputs/video_completion/frame_0001.png \
+    --mask inputs/video_completion/0000.png \
+    --mask_dilation 0 \
     --neighbor_length $9 \
     --ref_stride ${10} \
     --subvideo_length ${11} \
+    --raft_iter 20 \
+    --save_frames \
     --fp16
 
-# move inpainted to experiment folder
+# move inpainted frames to experiment folder
 cd
-mv -f "ProPainter/results/stretched/inpaint_out.mp4" "embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4"
+mv -f "ProPainter/results/stretched/frames" "embrace/videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}"
 cd embrace
+# get inpainted video from frames
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}.mp4" "lossless"
 
 # QUALITY MEASUREMENT TODO: VMAF scores seem to be wrong... and libvmaf does not have psnr or ssim, move away from libvmaf
 # TODO: calculate degradation at each step of the encoding?
@@ -122,7 +127,7 @@ calculate_metrics() {
 }
 
 # # encode reference video lossless TODO: no need, take the scene_n.mp4
-# reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/frame_%04d.png"
+# reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/%04d.png"
 # reference_output_path="videos/$1/scene_$2/"${3}x${4}"/reference.mp4"
 # # Check if the output already exists, if not create it
 # if [[ -f "$reference_output_path" ]]; then
@@ -163,3 +168,5 @@ python collect_metrics.py
 rm -r "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk"
 # delete stretched folder
 rm -r "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched"
+# delete inpainted folder
+rm -r "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref_${10}_sub_${11}"
