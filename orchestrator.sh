@@ -56,9 +56,15 @@ frames_into_video() {
         return 1
     fi
 
-    ffmpeg -i "$input_dir/frame_%04d.png" \
-           -b:v ${bitrate} -maxrate ${bitrate} -minrate ${bitrate} -bufsize ${bitrate} \
-           -c:v libx265 -pix_fmt yuv420p "$output_file"
+    # Determine if encoding should be lossless or not
+    if [[ "$bitrate" == "lossless" ]]; then
+        ffmpeg -i "$input_dir/frame_%04d.png" \
+               -c:v libx265 -preset ultrafast -x265-params lossless=1 -pix_fmt yuv420p "$output_file"
+    else
+        ffmpeg -i "$input_dir/frame_%04d.png" \
+               -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" \
+               -c:v libx265 -pix_fmt yuv420p "$output_file"
+    fi
 }
 
 frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 ${12}
@@ -77,7 +83,7 @@ frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "vide
 python client.py
 
 # get stretched video from frames
-frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4" ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/stretched.mp4" "lossless"
 
 # INPAINTING
 
