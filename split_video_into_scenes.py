@@ -65,8 +65,17 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
                 # Save scene using ffmpeg
                 output_file = os.path.join(folder_path, f"scene_{scene_number}.mp4")
                 ffmpeg_command = [
-                    "ffmpeg", "-i", video_file, "-ss", f"{scene_start/1000}", "-to", f"{scene_end/1000}", 
-                    "-r", "24", "-c:v", "libx265", "-crf", "20", "-pix_fmt", "yuv420p", "-an", output_file
+                    "ffmpeg",
+                    "-i", video_file,
+                    "-ss", f"{scene_start/1000}",
+                    "-to", f"{scene_end/1000}",
+                    "-r", "24",
+                    "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+                    "-c:v", "libx265",
+                    "-crf", "20",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    output_file
                 ]
                 subprocess.run(ffmpeg_command)
                 scene_start = scene_end

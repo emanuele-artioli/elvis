@@ -28,7 +28,7 @@ done
 experiment_name="squ_${6}_hor_${7}_ver_${8}"
 mkdir -p "videos/$1/scene_$2/"${3}x${4}"/$experiment_name"
 
-resize_video() {
+resize_and_split_video() {
     local input_file=$1
     local output_dir=$2
     local resolution=$3
@@ -40,10 +40,10 @@ resize_video() {
     fi
 
     mkdir $output_dir
-    ffmpeg -i "$input_file" -vf scale="$resolution":force_original_aspect_ratio=increase,crop="$resolution" -start_number 0 "$output_dir/%04d.png"
+    ffmpeg -i "$input_file" -vf scale="$resolution" -start_number 0 "$output_dir/%04d.png"
 }
 # resize scene based on experiment resolution, save into 
-resize_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/${3}x${4}/original" "${3}:${4}"
+resize_and_split_video "videos/$1/scene_$2.mp4" "videos/$1/scene_$2/${3}x${4}/original" "${3}:${4}"
 
 frames_into_video() {
     local input_dir="$1"
@@ -58,12 +58,9 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -i "$input_dir/%04d.png" \
-               -c:v libx265 -preset ultrafast -x265-params lossless=1 -pix_fmt yuv420p "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p "$output_file"
     else
-        ffmpeg -i "$input_dir/%04d.png" \
-               -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" \
-               -c:v libx265 -pix_fmt yuv420p "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p "$output_file"
     fi
 }
 # get original video from frames
@@ -125,15 +122,8 @@ calculate_metrics() {
     ffmpeg -i "$reference_file" -i "$distorted_file" -filter_complex "$filter_complex" -f null -
 }
 
-# # encode reference video lossless TODO: no need, take the scene_n.mp4
-# reference_input_path="videos/$1/scene_$2/"${3}x${4}"/original/%04d.png"
-# reference_output_path="videos/$1/scene_$2/"${3}x${4}"/reference.mp4"
-# # Check if the output already exists, if not create it
-# if [[ -f "$reference_output_path" ]]; then
-#     echo "$reference_output_path already exists"   
-# else
-#     ffmpeg -i $reference_input_path -c:v libx265 -crf 0 -pix_fmt yuv420p $reference_output_path
-# fi
+# Function to run ffmpeg command and extract VMAF, PSNR, and SSIM values
+
 
 reference_output_path="videos/$1/scene_$2.mp4"
 
@@ -144,7 +134,8 @@ original_csv_path="videos/$1/scene_$2/"${3}x${4}"/original.csv"
 if [[ -f "$original_csv_path" ]]; then
     echo "$original_csv_path already exists"   
 else
-    calculate_metrics "$reference_output_path" "$original_input_path" "$original_csv_path"
+    # calculate_metrics "$reference_output_path" "$original_input_path" "$original_csv_path"
+    ffmpeg-quality-metrics $original_input_path $reference_output_path -m  psnr ssim vmaf -of csv > "$original_csv_path"
 fi
 
 # compare reference with inpainted video
@@ -154,7 +145,8 @@ inpainted_csv_path="videos/$1/scene_$2/"${3}x${4}"/$experiment_name/nei_${9}_ref
 if [[ -f "$inpainted_csv_path" ]]; then
     echo "$inpainted_csv_path already exists"   
 else
-    calculate_metrics "$reference_output_path" "$inpainted_input_path" "$inpainted_csv_path"
+    # calculate_metrics "$reference_output_path" "$inpainted_input_path" "$inpainted_csv_path"
+    ffmpeg-quality-metrics $inpainted_input_path $reference_output_path -m  psnr ssim vmaf -of csv > "$inpainted_csv_path"
 fi
 
 # run metrics script
