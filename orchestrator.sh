@@ -2,6 +2,43 @@
 
 # SETUP
 
+# Function to determine the appropriate bitrate for a given width
+function determine_bitrate() {
+    local original_width=$1
+    local division_factor=$2
+    
+    if [ -z "$original_width" ] || [ -z "$division_factor" ]; then
+        echo "Usage: determine_bitrate <video_width> <division_factor>"
+        return 1
+    fi
+
+    local new_width=$((original_width / division_factor))
+
+    local bitrate=0
+
+    # Determine bitrate based on the new width
+    if (( new_width <= 320 )); then
+        bitrate=145000    # 180p24 - 145 kbps
+    elif (( new_width <= 480 )); then
+        bitrate=300000   # 270p24 - 300 kbps
+    elif (( new_width <= 640 )); then
+        bitrate=660000    # 360p24 - 660 kbps
+    elif (( new_width <= 960 )); then
+        bitrate=1700000   # 540p24 - 1.7 Mbps
+    elif (( new_width <= 1280 )); then
+        bitrate=2400000   # 720p24 - 2.4 Mbps
+    elif (( new_width <= 1920 )); then
+        bitrate=4500000   # 1080p24 - 4.5 Mbps
+    elif (( new_width <= 2560 )); then
+        bitrate=8100000   # 1440p24 - 8.1 Mbps
+    else
+        bitrate=11600000  # 2160p24 - 11.6 Mbps
+    fi
+
+    echo "$bitrate"
+}
+bitrate=$(determine_bitrate ${3} ${7})
+
 # pass parameters to python scripts
 export video_name=$1
 export scene_number=$2
@@ -12,7 +49,7 @@ export vertical_stride=$8
 export neighbor_length=$9
 export ref_stride=${10}
 export subvideo_length=${11}
-export bitrate=${12}
+export bitrate=$bitrate
 
 # Iterate over all video files in the input directory and split them into scenes
 for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
@@ -64,7 +101,7 @@ frames_into_video() {
     fi
 }
 # get original video from frames
-frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 ${12}
+frames_into_video videos/$1/scene_$2/"${3}x${4}"/original videos/$1/scene_$2/"${3}x${4}"/original.mp4 $bitrate
 
 # run server script to get masks and shrunk frames
 python server.py 
@@ -74,7 +111,7 @@ mv -f "videos/$1/scene_$2/"${3}x${4}"/shrunk/" "videos/$1/scene_$2/"${3}x${4}"/$
 mv -f "videos/$1/scene_$2/"${3}x${4}"/masks/" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/masks"
 
 # get shrunk video from frames
-frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" ${12}
+frames_into_video "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk" "videos/$1/scene_$2/"${3}x${4}"/$experiment_name/shrunk.mp4" $bitrate
 
 # run client script to get stretched frames
 python client.py
