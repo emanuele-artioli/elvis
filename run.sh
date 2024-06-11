@@ -1,16 +1,18 @@
 #!/bin/bash
 
+# TODO: add time to run to metrics file
+
 # Define the combinations
-videos=("Tears_of_Steel_4k24" "Big_Buck_Bunny_4k60")
-scene_numbers=("9")
-widths=("640" "960" "1280")
-heights=("360" "540" "720")
+videos=("Tears_of_Steel_1080p")
+scene_numbers=("4")
+widths=("1280")
+heights=("720")
 square_sizes=("20" "40")
-horizontal_stride=("1" "2" "3")
+horizontal_stride=("2" "3")
 vertical_stride=("1" "2" "3")
-neighbor_length=("2" "5")
-ref_stride=("2" "5")
-subvideo_length=("10" "30")
+neighbor_length=("5" "10")
+ref_stride=("5" "10")
+subvideo_length=("30" "60")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {

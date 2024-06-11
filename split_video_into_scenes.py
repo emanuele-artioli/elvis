@@ -72,7 +72,7 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
                     "-r", "24",
                     "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
                     "-c:v", "libx265",
-                    "-crf", "20",
+                    "-x265-params", "lossless=1",
                     "-pix_fmt", "yuv420p",
                     "-an",
                     output_file
