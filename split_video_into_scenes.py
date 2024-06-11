@@ -59,7 +59,7 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
             # threshold *= 10
             # if (score > threshold) and (cap.get(cv2.CAP_PROP_POS_MSEC) - scene_start > 2000):
 
-                print(score)
+                # print(score)
                 # Get times of scene start and end, and save new video between those times
                 scene_end = cap.get(cv2.CAP_PROP_POS_MSEC)
                 # Save scene using ffmpeg
@@ -89,6 +89,94 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
     cap.release()
 
     return folder_path
+
+# def split_video_into_scenes(video_file: str, threshold: float = 0.9, max_scenes: int = None) -> str:
+#     # Extract folder path and create the folder if it doesn't exist, or exit if it already exists
+#     folder_path, _ = video_file.rsplit('.', 1)
+#     if os.path.exists(folder_path):
+#         print("Folder already exists.")
+#         return ""
+#     os.mkdir(folder_path)
+
+#     # Define the timestamp file path
+#     timestamp_file = os.path.join(folder_path, 'timestamps.txt')
+    
+#     if os.path.exists(timestamp_file):
+#         # Load timestamps from file
+#         with open(timestamp_file, 'r') as f:
+#             timestamps = [float(line.strip()) for line in f]
+#         print("Using existing timestamps.")
+#     else:
+#         # Open the video file
+#         cap = cv2.VideoCapture(video_file)
+#         if not cap.isOpened():
+#             print("Error: Could not open video.")
+#             return ""
+
+#         prev_frame = None
+#         scene_start = 0
+#         timestamps = [scene_start]
+
+#         # Parse the video frame by frame
+#         while cap.isOpened():
+#             ret, frame = cap.read()
+#             # Resize frame to speed up computation
+#             if not ret:
+#                 break
+#             height, width = frame.shape[:2]
+#             aspect_ratio = height / width
+#             new_height = int(640 * aspect_ratio)
+#             frame = cv2.resize(frame, (640, new_height))
+
+#             if prev_frame is not None:
+#                 # Calculate SSIM between frames
+#                 gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#                 gray_prev_frame = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+#                 score, _ = ssim(gray_frame, gray_prev_frame, full=True)
+#                 if (score < threshold) and (cap.get(cv2.CAP_PROP_POS_MSEC) - scene_start > 2000):
+#                     # print(score)
+#                     # Get end time of the current scene
+#                     scene_end = cap.get(cv2.CAP_PROP_POS_MSEC)
+#                     timestamps.append(scene_end)
+#                     scene_start = scene_end
+
+#             prev_frame = frame.copy()
+
+#         cap.release()
+
+#         # Save timestamps to file
+#         with open(timestamp_file, 'w') as f:
+#             for timestamp in timestamps:
+#                 f.write(f"{timestamp}\n")
+
+#     # Use the timestamps to split the video
+#     scene_number = 1
+#     scenes_extracted = 0
+
+#     for i in range(len(timestamps) - 1):
+#         scene_start = timestamps[i]
+#         scene_end = timestamps[i + 1]
+#         output_file = os.path.join(folder_path, f"scene_{scene_number}.mp4")
+#         ffmpeg_command = [
+#             "ffmpeg",
+#             "-i", video_file,
+#             "-ss", f"{scene_start/1000}",
+#             "-to", f"{scene_end/1000}",
+#             "-r", "24",
+#             "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+#             "-c:v", "libx265",
+#             "-x265-params", "lossless=1",
+#             "-pix_fmt", "yuv420p",
+#             "-an",
+#             output_file
+#         ]
+#         subprocess.run(ffmpeg_command)
+#         scene_number += 1
+#         scenes_extracted += 1
+#         if max_scenes is not None and scenes_extracted >= max_scenes:
+#             break
+
+#     return folder_path
 
 if __name__ == "__main__":
     split_video_into_scenes(

@@ -2,7 +2,8 @@
 
 # SETUP
 
-# Function to determine the appropriate bitrate for a given width
+# Function to determine the appropriate bitrate for a given width 
+# TODO: once we have the smart masks, change into pixel/kbps based
 function determine_bitrate() {
     local original_width=${1}
     local division_factor=${2}
@@ -77,7 +78,7 @@ resize_and_split_video() {
     fi
 
     mkdir $output_dir
-    ffmpeg -i "$input_file" -vf scale="$resolution" -start_number 0 "$output_dir/%04d.png"
+    ffmpeg -i "$input_file" -vf "fps=24,scale=${resolution}" -q:v 1 -vsync 0 -copyts -start_number 0 "$output_dir/%04d.png"
 }
 # resize scene based on experiment resolution, save into 
 resize_and_split_video "videos/${1}/scene_${2}.mp4" "videos/${1}/scene_${2}/${3}x${4}/original" "${3}:${4}"
@@ -95,9 +96,9 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -copyts "$output_file"
     else
-        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -copyts "$output_file"
     fi
 }
 # get original video from frames
@@ -180,3 +181,8 @@ rm -r "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk"
 rm -r "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched"
 # delete inpainted folder
 rm -r "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}"
+
+cd
+cd ProPainter
+rm results/
+rm video_completion/
