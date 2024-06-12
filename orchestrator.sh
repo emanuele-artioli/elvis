@@ -120,34 +120,7 @@ python client.py
 # get stretched video from frames
 frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched.mp4" "lossless"
 
-# INPAINTING
-
-cd
-stretched_video_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched.mp4"
-mask_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/masks/0000.png"
-cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
-cp $mask_path "ProPainter/inputs/video_completion/0000.png"
-# TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
-cd ProPainter
-python inference_propainter.py \
-    --video inputs/video_completion/stretched.mp4 \
-    --mask inputs/video_completion/0000.png \
-    --mask_dilation 0 \
-    --neighbor_length ${8} \
-    --ref_stride ${9} \
-    --subvideo_length ${10} \
-    --raft_iter 20 \
-    --save_frames \
-    --fp16
-
-# move inpainted frames to experiment folder
-cd
-mv -f "ProPainter/results/stretched/frames" "embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}"
-cd embrace
-# get inpainted video from frames
-frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}.mp4" "lossless"
-
-# QUALITY MEASUREMENT
+# QUALITY MEASUREMENT ORIGINAL
 
 reference_output_path="videos/${1}/scene_${2}.mp4"
 
@@ -161,8 +134,41 @@ else
     ffmpeg-quality-metrics $original_input_path $reference_output_path -m  psnr ssim vmaf -of csv > "$original_csv_path"
 fi
 
-# compare reference with inpainted video
 inpainted_input_path="videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}.mp4"
+# Check if the output already exists, if not create it
+if [[ -f "$inpainted_input_path" ]]; then
+    echo "$inpainted_input_path already exists"   
+else
+    # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
+    cd
+    stretched_video_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched.mp4"
+    mask_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/masks/0000.png"
+    cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
+    cp $mask_path "ProPainter/inputs/video_completion/0000.png"
+    cd ProPainter
+    # INPAINTING
+    python inference_propainter.py \
+        --video inputs/video_completion/stretched.mp4 \
+        --mask inputs/video_completion/0000.png \
+        --mask_dilation 0 \
+        --neighbor_length ${8} \
+        --ref_stride ${9} \
+        --subvideo_length ${10} \
+        --raft_iter 20 \
+        --save_frames \
+        --fp16
+
+    # move inpainted frames to experiment folder
+    cd
+    mv -f "ProPainter/results/stretched/frames" "embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}"
+    cd embrace
+    # get inpainted video from frames
+    frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}" "$inpainted_input_path" "lossless"
+fi
+
+# QUALITY MEASUREMENT INPAINTED
+
+# compare reference with inpainted video
 inpainted_csv_path="videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub_${10}.csv"
 # Check if the output already exists, if not create it
 if [[ -f "$inpainted_csv_path" ]]; then
