@@ -15,7 +15,7 @@ vertical_stride = int(os.environ.get('vertical_stride'))
 mask_frame_path = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/masks/0000.png'
 mask_frame = cv2.imread(mask_frame_path)
 mask_squares = split_image_into_squares(mask_frame, square_size)
-shrunk_frames_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/shrunk'
+shrunk_frames_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}/encoded_shrunk'
 
 processed_frame_names = process_frames_in_parallel(
     shrunk_frames_folder, 

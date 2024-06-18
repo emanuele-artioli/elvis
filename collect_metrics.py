@@ -12,6 +12,7 @@ vertical_stride = int(os.environ.get('vertical_stride'))
 neighbor_length = os.environ.get('neighbor_length')
 ref_stride = int(os.environ.get('ref_stride'))
 subvideo_length = int(os.environ.get('subvideo_length'))
+bitrate = os.environ.get('bitrate')
 
 # read experiment metrics
 experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}'
@@ -37,6 +38,7 @@ results = pd.DataFrame.from_dict({
     'neighbor_length': [neighbor_length],
     'ref_stride': [ref_stride],
     'subvideo_length': [subvideo_length],
+    'bitrate': [bitrate],
 
     'mse_ori_mean': original_means['mse_avg'],
     # 'mse_ori_std': original_stds['mse_avg'],

@@ -2,44 +2,6 @@
 
 # SETUP
 
-# Function to determine the appropriate bitrate for a given width 
-# TODO: once we have the smart masks, change into pixel/kbps based
-function determine_bitrate() {
-    local original_width=${1}
-    local division_factor=${2}
-    
-    if [ -z "$original_width" ] || [ -z "$division_factor" ]; then
-        echo "Usage: determine_bitrate <video_width> <division_factor>"
-        return 1
-    fi
-
-    local new_width=$((original_width / division_factor))
-
-    local bitrate=0
-
-    # Determine bitrate based on the new width
-    if (( new_width <= 320 )); then
-        bitrate=145000    # 180p24 - 145 kbps
-    elif (( new_width <= 480 )); then
-        bitrate=300000   # 270p24 - 300 kbps
-    elif (( new_width <= 640 )); then
-        bitrate=660000    # 360p24 - 660 kbps
-    elif (( new_width <= 960 )); then
-        bitrate=1700000   # 540p24 - 1.7 Mbps
-    elif (( new_width <= 1280 )); then
-        bitrate=2400000   # 720p24 - 2.4 Mbps
-    elif (( new_width <= 1920 )); then
-        bitrate=4500000   # 1080p24 - 4.5 Mbps
-    elif (( new_width <= 2560 )); then
-        bitrate=8100000   # 1440p24 - 8.1 Mbps
-    else
-        bitrate=11600000  # 2160p24 - 11.6 Mbps
-    fi
-
-    echo "$bitrate"
-}
-bitrate=$(determine_bitrate ${3} ${6})
-
 # pass parameters to python scripts
 export video_name=${1}
 export scene_number=${2}
@@ -50,7 +12,6 @@ export vertical_stride=${7}
 export neighbor_length=${8}
 export ref_stride=${9}
 export subvideo_length=${10}
-export bitrate=$bitrate
 
 # Iterate over all video files in the input directory and split them into scenes
 for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
@@ -78,10 +39,24 @@ resize_and_split_video() {
     fi
 
     mkdir $output_dir
-    ffmpeg -i "$input_file" -vf "fps=24,scale=${resolution}" -q:v 1 -vsync 0 -copyts -start_number 0 "$output_dir/%04d.png"
+    ffmpeg -i "$input_file" -vf "fps=24,scale=${resolution}" -q:v 1 -fps_mode passthrough -copyts -start_number 0 "$output_dir/%04d.png"
 }
 # resize scene based on experiment resolution, save into 
 resize_and_split_video "videos/${1}/scene_${2}.mp4" "videos/${1}/scene_${2}/${3}x${4}/original" "${3}:${4}"
+
+# run server script to get masks and shrunk frames
+python server.py 
+
+# move shrunk and masks into experiment folder
+mv -f "videos/${1}/scene_${2}/"${3}x${4}"/shrunk/" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk"
+mv -f "videos/${1}/scene_${2}/"${3}x${4}"/masks/" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/masks"
+
+# get bitrate from shrunk size
+shrunk_frame="videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk/0000.png"
+shrunk_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$shrunk_frame")
+shrunk_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$shrunk_frame")
+bitrate=$(python3 calculate_bitrate.py "$shrunk_width" "$shrunk_height")
+export bitrate=$bitrate
 
 frames_into_video() {
     local input_dir="${1}"
@@ -96,23 +71,33 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -copyts "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -q:v 1 -fps_mode passthrough -copyts "$output_file"
     else
-        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -copyts "$output_file"
+        ffmpeg -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -q:v 1 -fps_mode passthrough -copyts "$output_file"
     fi
 }
-# get original video from frames
-frames_into_video videos/${1}/scene_${2}/"${3}x${4}"/original videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/original.mp4 $bitrate
-
-# run server script to get masks and shrunk frames
-python server.py 
-
-# move shrunk and masks into experiment folder
-mv -f "videos/${1}/scene_${2}/"${3}x${4}"/shrunk/" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk"
-mv -f "videos/${1}/scene_${2}/"${3}x${4}"/masks/" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/masks"
 
 # get shrunk video from frames
 frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk.mp4" $bitrate
+
+# get original video from frames
+frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/original" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/original.mp4" $bitrate
+
+video_into_frames() {
+    local input_file=${1}
+    local output_dir=${2}
+
+    # Check if the output directory already exists, if not create it
+    if [[ -d "$output_dir" ]]; then
+        echo "$output_dir already exists"
+        return 1        
+    fi
+
+    mkdir $output_dir
+    ffmpeg -i "$input_file" -vf "fps=24" -q:v 1 -fps_mode passthrough -copyts -start_number 0 "$output_dir/%04d.png"
+}
+# get encoded_shrunk frames from video
+video_into_frames "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk.mp4" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/encoded_shrunk"
 
 # run client script to get stretched frames
 python client.py
@@ -143,6 +128,7 @@ else
     cd
     stretched_video_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/stretched.mp4"
     mask_path="embrace/videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/masks/0000.png"
+    mkdir -p "ProPainter/inputs/video_completion"
     cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
     cp $mask_path "ProPainter/inputs/video_completion/0000.png"
     cd ProPainter
@@ -190,5 +176,5 @@ rm -r "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/nei_${8}_ref_${9}_sub
 
 cd
 cd ProPainter
-rm results/
-rm video_completion/
+rm -r results/stretched/
+rm -r inputs/video_completion/

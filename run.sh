@@ -3,16 +3,16 @@
 # TODO: add time to run to metrics file
 
 # Define the combinations
-videos=("Tears_of_Steel_1080p")
-scene_numbers=("4")
-widths=("1280")
-heights=("720")
-square_sizes=("20")
-horizontal_stride=("2" "3")
-vertical_stride=("1" "2" "3")
-neighbor_length=("5" "10")
-ref_stride=("5" "10")
-subvideo_length=("30" "60")
+videos=("Tears_of_Steel_4k")
+scene_numbers=("9")
+widths=("1920")
+heights=("1080")
+square_sizes=("16" "20" "40")
+horizontal_stride=("2")
+vertical_stride=("2")
+neighbor_length=("2" "3" "5" "10")
+ref_stride=("2" "3" "5" "10")
+subvideo_length=("5" "10" "15" "25" "50")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {
@@ -49,9 +49,9 @@ should_exclude_combination() {
     fi
 
     # TODO: let's keep it to see if it actually ends up in the same video as original
-    # if [[ "$h_stride" == "1" && "$v_stride" == "1" ]]; then
-    #     return 0  # Exclude this combination
-    # fi
+    if [[ "$h_stride" == "1" && "$v_stride" == "1" ]]; then
+        return 0  # Exclude this combination
+    fi
 
     return 1  # Do not exclude this combination
 }
