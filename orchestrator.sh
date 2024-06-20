@@ -21,7 +21,9 @@ for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
     fi
 done
 
-# EXPERIMENT
+# SERVER SIDE
+
+server_start_time=$(date +%s)
 
 # Create the experiment folder
 experiment_name="squ_${5}_hor_${6}_ver_${7}"
@@ -82,6 +84,10 @@ frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/shrunk" "
 
 # get original video from frames
 frames_into_video "videos/${1}/scene_${2}/"${3}x${4}"/original" "videos/${1}/scene_${2}/"${3}x${4}"/$experiment_name/original.mp4" $bitrate
+
+# CLIENT SIDE
+
+client_start_time=$(date +%s)
 
 video_into_frames() {
     local input_file=${1}
@@ -161,6 +167,11 @@ if [[ -f "$inpainted_csv_path" ]]; then
     echo "$inpainted_csv_path already exists"   
 else
     ffmpeg-quality-metrics $inpainted_input_path $reference_output_path -m  psnr ssim vmaf -of csv > "$inpainted_csv_path"
+    # calculate time elapsed
+    end_time=$(date +%s)
+    export server_start_time=$server_start_time
+    export client_start_time=$client_start_time
+    export end_time=$end_time
     # run metrics script
     python collect_metrics.py
 fi

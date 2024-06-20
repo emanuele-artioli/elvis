@@ -13,6 +13,13 @@ neighbor_length = os.environ.get('neighbor_length')
 ref_stride = int(os.environ.get('ref_stride'))
 subvideo_length = int(os.environ.get('subvideo_length'))
 bitrate = os.environ.get('bitrate')
+server_start_time = int(os.environ.get('server_start_time'))
+client_start_time = int(os.environ.get('client_start_time'))
+end_time = int(os.environ.get('end_time'))
+
+# calculate elapsed times
+server_runtime = client_start_time - server_start_time
+client_runtime = end_time - client_start_time
 
 # read experiment metrics
 experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_hor_{horizontal_stride}_ver_{vertical_stride}'
@@ -39,6 +46,8 @@ results = pd.DataFrame.from_dict({
     'ref_stride': [ref_stride],
     'subvideo_length': [subvideo_length],
     'bitrate': [bitrate],
+    'server_runtime': [server_runtime],
+    'client_runtime': [client_runtime],
 
     'mse_ori_mean': original_means['mse_avg'],
     # 'mse_ori_std': original_stds['mse_avg'],

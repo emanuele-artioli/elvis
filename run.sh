@@ -7,6 +7,8 @@ videos=("Tears_of_Steel_4k")
 scene_numbers=("9")
 widths=("1920")
 heights=("1080")
+# TODO: maybe change this into number of vertical and horizontal blocks? 
+# Smaller resolutions probably benefit from smaller blocks and vice versa
 square_sizes=("16" "20" "40")
 horizontal_stride=("2")
 vertical_stride=("2")
