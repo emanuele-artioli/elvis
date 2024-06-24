@@ -66,6 +66,7 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
                 output_file = os.path.join(folder_path, f"scene_{scene_number}.mp4")
                 ffmpeg_command = [
                     "ffmpeg",
+                    "-loglevel", "warning",
                     "-i", video_file,
                     "-ss", f"{scene_start/1000}",
                     "-to", f"{scene_end/1000}",
@@ -159,6 +160,7 @@ def split_video_into_scenes(video_file: str, threshold: int = 0.9, max_scenes: i
 #         output_file = os.path.join(folder_path, f"scene_{scene_number}.mp4")
 #         ffmpeg_command = [
 #             "ffmpeg",
+#             "-loglevel", "warning",
 #             "-i", video_file,
 #             "-ss", f"{scene_start/1000}",
 #             "-to", f"{scene_end/1000}",
