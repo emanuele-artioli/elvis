@@ -209,8 +209,8 @@ alpha = float(os.environ.get('alpha'))
 resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
 experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{blocks_to_remove}_alp_{alpha}'
 frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
-temporal_file = f'videos/{video_name}/EVCA/scene_{scene_number}_TC_blocks.csv'
-spatial_file = f'videos/{video_name}/EVCA/scene_{scene_number}_SC_blocks.csv'
+temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity/reference_TC_blocks.csv'
+spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity/reference_SC_blocks.csv'
 
 lowest_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, blocks_to_remove)
 

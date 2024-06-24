@@ -15,8 +15,9 @@ make_lower_multiple() {
 run_evca() {
     local input_video_path=$1
     local output_video_path=$2
-    local square_size=$3
-    local csv_path=$4
+    local resolution=$3
+    local square_size=$4
+    local csv_path=$5
 
     # Get the number of frames in the input video using ffprobe
     local frame_count=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$input_video_path")
@@ -26,7 +27,7 @@ run_evca() {
     else
         ffmpeg -loglevel warning -i "$input_video_path" -c:v rawvideo -pix_fmt yuv420p "$output_video_path"
         cd
-        python3 EVCA/main.py -i "embrace/$output_video_path" -b $square_size -f $frame_count -c $csv_path -bi 1
+        python3 EVCA/main.py -i "embrace/$output_video_path" -r $resolution -b $square_size -f $frame_count -c $csv_path -bi 1
         cd ~/embrace
     fi
 }
@@ -59,9 +60,9 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -q:v 1 -fps_mode passthrough -copyts "$output_file"
+        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%04d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -fps_mode passthrough -copyts "$output_file"
     else
-        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -q:v 1 -fps_mode passthrough -copyts "$output_file"
+        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%04d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -fps_mode passthrough -copyts "$output_file"
     fi
 }
 
@@ -97,15 +98,15 @@ height=$(make_lower_multiple $height $square_size)
 resolution="${width}x${height}"
 
 # pass parameters to python scripts
-export video_name
-export scene_number
-export resolution
-export square_size
-export blocks_to_remove
-export alpha
-export neighbor_length
-export ref_stride
-export subvideo_length
+export video_name=$video_name
+export scene_number=$scene_number
+export resolution=$resolution
+export square_size=$square_size
+export blocks_to_remove=$blocks_to_remove
+export alpha=$alpha
+export neighbor_length=$neighbor_length
+export ref_stride=$ref_stride
+export subvideo_length=$subvideo_length
 
 # Iterate over all video files in the input directory, split them into scenes
 for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
@@ -113,9 +114,6 @@ for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
         python split_video_into_scenes.py $file 0.5 3
     fi
 done
-
-# calculate scene complexities
-run_evca "videos/${video_name}/scene_${scene_number}.mp4" "videos/${video_name}/scene_${scene_number}.yuv" "${square_size}" "embrace/videos/${video_name}/EVCA/scene_${scene_number}.csv"
 
 # SERVER SIDE
 
@@ -127,6 +125,12 @@ mkdir -p "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$exper
 
 # resize scene based on experiment resolution, save into 
 video_into_resized_frames "videos/${video_name}/scene_${scene_number}.mp4" "videos/${video_name}/scene_${scene_number}/${width}x${height}/original" "${width}:${height}"
+
+# get reference video from frames
+frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.mp4" "lossless"
+
+# calculate scene complexities
+run_evca "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.mp4" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.yuv" "${resolution}" "${square_size}" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/complexity/reference.csv"
 
 # run script to get smart masks and shrunk frames
 python shrink_frames.py
