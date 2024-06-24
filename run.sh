@@ -3,18 +3,18 @@
 # TODO: add time to run to metrics file
 
 # Define the combinations
-videos=("Tears_of_Steel_4k")
-scene_numbers=("9")
-widths=("1920")
-heights=("1080")
+videos=("Tears_of_Steel_4k" "bbb_sunflower_2160p_60fps_normal")
+scene_numbers=("3" "5" "7" "9")
+widths=("640" "960" "1280" "1920")
+heights=("360" "540" "720" "1080")
 # TODO: maybe change this into number of vertical and horizontal blocks? 
 # Smaller resolutions probably benefit from smaller blocks and vice versa
-square_sizes=("16" "20" "40")
-horizontal_stride=("2")
-vertical_stride=("2")
-neighbor_length=("2" "3" "5" "10")
-ref_stride=("2" "3" "5" "10")
-subvideo_length=("5" "10" "15" "25" "50")
+square_sizes=("16" "20" "32" "40")
+blocks_to_remove=("10" "20" "30" "40") # TODO: should be a percentage so it does not break for small resolutions
+alpha=("0.0" "0.5" "1.0")
+neighbor_length=("2" "10")
+ref_stride=("2" "10")
+subvideo_length=("12" "48")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {
@@ -23,8 +23,8 @@ should_exclude_combination() {
     local width="$3"
     local height="$4"
     local square_size="$5"
-    local h_stride="$6"
-    local v_stride="$7"
+    local blocks="$6"
+    local alpha_val="$7"
     local neighbor="$8"
     local ref="$9"
     local subvideo="${10}"
@@ -50,11 +50,6 @@ should_exclude_combination() {
         return 0  # Exclude this combination
     fi
 
-    # TODO: let's keep it to see if it actually ends up in the same video as original
-    if [[ "$h_stride" == "1" && "$v_stride" == "1" ]]; then
-        return 0  # Exclude this combination
-    fi
-
     return 1  # Do not exclude this combination
 }
 
@@ -64,20 +59,20 @@ for video in "${videos[@]}"; do
         for width in "${widths[@]}"; do
             for height in "${heights[@]}"; do
                 for square_size in "${square_sizes[@]}"; do
-                    for h_stride in "${horizontal_stride[@]}"; do
-                        for v_stride in "${vertical_stride[@]}"; do
+                    for blocks in "${blocks_to_remove[@]}"; do
+                        for alpha_val in "${alpha[@]}"; do
                             for neighbor in "${neighbor_length[@]}"; do
                                 for ref in "${ref_stride[@]}"; do
                                     for subvideo in "${subvideo_length[@]}"; do
                                         # Check if this combination should be excluded
-                                        if should_exclude_combination "$video" "$scene_number" "$width" "$height" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo"; then
-                                            echo "Excluding combination: $video, $scene_number, $width, $height, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo"
+                                        if should_exclude_combination "$video" "$scene_number" "$width" "$height" "$square_size" "$blocks" "$alpha_val" "$neighbor" "$ref" "$subvideo"; then
+                                            echo "Excluding combination: $video, $scene_number, $width, $height, $square_size, $blocks, $alpha_val, $neighbor, $ref, $subvideo"
                                             continue
                                         fi
 
                                         # Call the orchestrator script with the combination, suppressing its output
-                                        echo "Running orchestrator with parameters: $video, $scene_number, $width, $height, $square_size, $h_stride, $v_stride, $neighbor, $ref, $subvideo"
-                                        ./orchestrator.sh "$video" "$scene_number" "$width" "$height" "$square_size" "$h_stride" "$v_stride" "$neighbor" "$ref" "$subvideo" > /dev/null 2>&1
+                                        echo "Running orchestrator with parameters: $video, $scene_number, $width, $height, $square_size, $blocks, $alpha_val, $neighbor, $ref, $subvideo"
+                                        ./orchestrator.sh "$video" "$scene_number" "$width" "$height" "$square_size" "$blocks" "$alpha_val" "$neighbor" "$ref" "$subvideo" > /dev/null 2>&1
                                     done
                                 done
                             done

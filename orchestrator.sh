@@ -111,7 +111,7 @@ export subvideo_length=$subvideo_length
 # Iterate over all video files in the input directory, split them into scenes
 for file in "videos"/*.{flv,mp4,mov,mkv,avi}; do
     if [[ -f "$file" ]]; then
-        python split_video_into_scenes.py $file 0.5 3
+        python split_video_into_scenes.py $file 0.5 10
     fi
 done
 
