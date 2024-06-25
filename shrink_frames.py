@@ -19,13 +19,13 @@ def normalize_array(arr):
     normalized_arr = (arr - arr_min) / (arr_max - arr_min)
     return normalized_arr
 
-def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, blocks_to_remove):
+def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove):
     # Load the CSV files into 2D NumPy arrays
     temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
     spatial_array = np.loadtxt(spatial_file, delimiter=',', skiprows=1)
 
     num_blocks_x = width // square_size  # Number of horizontal blocks
-    num_blocks_y = height // square_size   # Number of vertical blocks
+    num_blocks_y = height // square_size  # Number of vertical blocks
     num_frames = temporal_array.shape[1]  # Number of frames (number of columns in CSV)
 
     # Reshape the arrays to (num_frames, num_blocks_y, num_blocks_x)
@@ -43,15 +43,17 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
     importance = np.zeros((num_frames, num_blocks_y, num_blocks_x))
 
     # Calculate the importance values (for the last frame, there is no successive temporal complexity, so we rely only on spatial)
-    # TODO: maybe come up with different importance functions and compare their result? 
     for i in range(num_frames):
         if i == num_frames - 1:
             importance[i] = spatial_3d_array[i]
         else:
             importance[i] = alpha * spatial_3d_array[i] + (1 - alpha) * temporal_3d_array[i + 1]
 
-    # Initialize the list to store coordinates of the n lowest values
+    # Initialize the list to store coordinates of the lowest values
     lowest_values_coords = []
+
+    # Calculate the number of blocks to remove based on the percentage
+    percentage_to_remove = int(percentage_to_remove * num_blocks_x)
 
     # Loop through each frame
     for i in range(num_frames):
@@ -60,19 +62,19 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
         for j in range(num_blocks_y):
             # Get the current row
             current_row = importance[i, j, :]
-            
-            # Find the indices of the n lowest values in the current row
-            if len(current_row) > blocks_to_remove:
-                lowest_indices = np.argsort(current_row)[:blocks_to_remove]
+
+            # Find the indices of the lowest values in the current row based on the percentage
+            if len(current_row) > percentage_to_remove:
+                lowest_indices = np.argsort(current_row)[:percentage_to_remove]
             else:
                 lowest_indices = np.argsort(current_row)
 
             # Store the coordinates for column (frame and row given by indices)
             row_coords = [k for k in lowest_indices]
             frame_coords.append(row_coords)
-        
+
         lowest_values_coords.append(frame_coords)
-    
+
     return lowest_values_coords
 
 def split_image_into_squares(image: np.array, l: int) -> np.array:
@@ -204,15 +206,15 @@ width, height = resolution.split('x')
 width = int(width)
 height = int(height)
 square_size = int(os.environ.get('square_size'))
-blocks_to_remove = int(os.environ.get('blocks_to_remove'))
+percentage_to_remove = float(os.environ.get('percentage_to_remove'))
 alpha = float(os.environ.get('alpha'))
 resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{blocks_to_remove}_alp_{alpha}'
+experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
 frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
 temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity/reference_TC_blocks.csv'
 spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity/reference_SC_blocks.csv'
 
-lowest_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, blocks_to_remove)
+lowest_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
 
 with ProcessPoolExecutor() as executor:
     results = []

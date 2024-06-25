@@ -80,12 +80,13 @@ video_into_frames() {
     ffmpeg -loglevel warning -i "$input_file" -vf "fps=24" -q:v 1 -fps_mode passthrough -copyts -start_number 0 "$output_dir/%04d.png"
 }
 
+# TODO: add more parameters from ProPainter
 video_name=$1
 scene_number=$2
 width=$3
 height=$4
 square_size=$5
-blocks_to_remove=$6
+percentage_to_remove=$6
 alpha=$7
 neighbor_length=$8
 ref_stride=$9
@@ -102,7 +103,7 @@ export video_name=$video_name
 export scene_number=$scene_number
 export resolution=$resolution
 export square_size=$square_size
-export blocks_to_remove=$blocks_to_remove
+export percentage_to_remove=$percentage_to_remove
 export alpha=$alpha
 export neighbor_length=$neighbor_length
 export ref_stride=$ref_stride
@@ -120,7 +121,7 @@ done
 server_start_time=$(date +%s)
 
 # Create the experiment folder
-experiment_name="squ_${square_size}_rem_${blocks_to_remove}_alp_${alpha}"
+experiment_name="squ_${square_size}_rem_${percentage_to_remove}_alp_${alpha}"
 mkdir -p "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name"
 
 # resize scene based on experiment resolution, save into 
