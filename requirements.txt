@@ -45,3 +45,4 @@ yapf
 ipykernel
 ffmpeg-quality-metrics
 pyarrow
+seaborn

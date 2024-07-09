@@ -128,10 +128,10 @@ mkdir -p "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$exper
 video_into_resized_frames "videos/${video_name}/scene_${scene_number}.mp4" "videos/${video_name}/scene_${scene_number}/${width}x${height}/original" "${width}:${height}"
 
 # get reference video from frames
-frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.mp4" "lossless"
+frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference_${square_size}.mp4" "lossless"
 
 # calculate scene complexities
-run_evca "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.mp4" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference.yuv" "${resolution}" "${square_size}" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/complexity/reference.csv"
+run_evca "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference_${square_size}.mp4" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference_${square_size}.yuv" "${resolution}" "${square_size}" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/complexity_${square_size}/reference.csv"
 
 # run script to get smart masks and shrunk frames
 python shrink_frames.py

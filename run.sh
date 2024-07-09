@@ -3,14 +3,14 @@
 # TODO: add time to run to metrics file
 
 # Define the combinations
-videos=("Tears_of_Steel_4k" "bbb_sunflower_2160p_60fps_normal")
-scene_numbers=("3" "5" "7" "9")
-widths=("640" "960" "1280" "1920")
-heights=("360" "540" "720" "1080")
+videos=("bbb_sunflower_2160p_60fps_normal")
+scene_numbers=("3" "9")
+widths=("640" "1280")
+heights=("360" "720")
 # TODO: maybe change this into number of vertical and horizontal blocks? 
 # Smaller resolutions probably benefit from smaller blocks and vice versa
 square_sizes=("16" "20" "32" "40")
-blocks_to_remove=("10" "20" "30" "40") # TODO: should be a percentage so it does not break for small resolutions
+blocks_to_remove=("0.25" "0.5" "0.75")
 alpha=("0.0" "0.5" "1.0")
 neighbor_length=("2" "10")
 ref_stride=("2" "10")
