@@ -1,20 +1,18 @@
 #!/bin/bash
 
-# TODO: add time to run to metrics file
-
 # Define the combinations
-videos=("bbb_sunflower_2160p_60fps_normal")
-scene_numbers=("3" "9")
-widths=("640" "1280")
-heights=("360" "720")
+videos=("Tears_of_Steel_4k")
+scene_numbers=("9")
+widths=("432")
+heights=("240")
 # TODO: maybe change this into number of vertical and horizontal blocks? 
 # Smaller resolutions probably benefit from smaller blocks and vice versa
-square_sizes=("16" "20" "32" "40")
-blocks_to_remove=("0.25" "0.5" "0.75")
-alpha=("0.0" "0.5" "1.0")
-neighbor_length=("2" "10")
-ref_stride=("2" "10")
-subvideo_length=("12" "48")
+square_sizes=("16")
+blocks_to_remove=("0.5")
+alpha=("0.5")
+neighbor_length=("20" "48")
+ref_stride=("6")
+subvideo_length=("24")
 
 # Function to check if a combination should be excluded
 should_exclude_combination() {

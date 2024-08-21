@@ -12,7 +12,7 @@ def decompress_and_save_as_csv(input_compressed_npz, output_csv):
     # Convert frame numbers back to '0000.png' format
     rows = []
     for row in sorted_array:
-        frame_number = f'{row[0]:04}.png'
+        frame_number = f'{row[0]:05}.png'
         binary_values = [int(val) for val in row[1]]
         rows.append([frame_number] + binary_values)
     
