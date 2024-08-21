@@ -32,7 +32,7 @@ addict
 einops
 future
 scipy
-opencv-python
+opencv-python<=4.8.0.74
 scikit-image
 torchvision>=0.8.2  # Conflict with HNeRV, using >=0.8.2 to satisfy both
 imageio-ffmpeg

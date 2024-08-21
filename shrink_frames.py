@@ -212,39 +212,40 @@ def sort_and_compress_masks(input_csv, output_compressed_npz):
     # Save the sorted array to a compressed .npz file
     np.savez_compressed(output_compressed_npz, sorted_data=sorted_array)
 
-# get parameters from orchestrator
-video_name = os.environ.get('video_name')
-scene_number = os.environ.get('scene_number')
-resolution = os.environ.get('resolution')
-width, height = resolution.split('x')
-width = int(width)
-height = int(height)
-square_size = int(os.environ.get('square_size'))
-percentage_to_remove = float(os.environ.get('percentage_to_remove'))
-alpha = float(os.environ.get('alpha'))
-resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
-frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
-temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_TC_blocks.csv'
-spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_SC_blocks.csv'
+if __name__ == '__main__':
+    # get parameters from orchestrator
+    video_name = os.environ.get('video_name')
+    scene_number = os.environ.get('scene_number')
+    resolution = os.environ.get('resolution')
+    width, height = resolution.split('x')
+    width = int(width)
+    height = int(height)
+    square_size = int(os.environ.get('square_size'))
+    percentage_to_remove = float(os.environ.get('percentage_to_remove'))
+    alpha = float(os.environ.get('alpha'))
+    resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
+    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
+    frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
+    temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_TC_blocks.csv'
+    spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_SC_blocks.csv'
 
-removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
+    removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
 
-with ProcessPoolExecutor() as executor:
-    results = []
-    for frame_name in frame_names:
-        frame_number = int(frame_name.split('.')[0])
-        results.append(
-            executor.submit(
-                process_frame_server_side, 
-                frame_name, 
-                experiment_folder, 
-                square_size, 
-                removed_values_coords[frame_number]
+    with ProcessPoolExecutor() as executor:
+        results = []
+        for frame_name in frame_names:
+            frame_number = int(frame_name.split('.')[0])
+            results.append(
+                executor.submit(
+                    process_frame_server_side, 
+                    frame_name, 
+                    experiment_folder, 
+                    square_size, 
+                    removed_values_coords[frame_number]
+                )
             )
-        )
-    # Retrieve results
-    processed_frame_names = [future.result() for future in results]
+        # Retrieve results
+        processed_frame_names = [future.result() for future in results]
 
-# order csv by frame number and convert into npz
-sort_and_compress_masks(f'{experiment_folder}/masks.csv', f'{experiment_folder}/masks.npz')
+    # order csv by frame number and convert into npz
+    sort_and_compress_masks(f'{experiment_folder}/masks.csv', f'{experiment_folder}/masks.npz')

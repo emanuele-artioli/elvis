@@ -28,7 +28,7 @@ run_evca() {
         ffmpeg -loglevel warning -i "$input_video_path" -c:v rawvideo -pix_fmt yuv420p "$output_video_path"
         cd ..
         python3 EVCA/main.py -i "embrace/$output_video_path" -r $resolution -b $square_size -f $frame_count -c $csv_path -bi 1
-        cd ~/embrace
+        cd embrace
     fi
 }
 
@@ -193,52 +193,14 @@ fi
 
 # INPAINTING WITH PROPAINTER
 
-# inpainted_input_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
-# # Check if the output already exists, if not create it
-# if [[ -f "$inpainted_input_path" ]]; then
-#     echo "$inpainted_input_path already exists"   
-# else
-#     cd
-#     stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
-#     mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks/"
-#     mkdir -p "ProPainter/inputs/video_completion"
-#     cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
-#     cp -r $mask_path "ProPainter/inputs/video_completion/masks"
-#     cd ProPainter
-#     # INPAINTING
-#     python inference_propainter.py \
-#         --video inputs/video_completion/stretched.mp4 \
-#         --mask inputs/video_completion/masks \
-#         --mask_dilation 0 \
-#         --neighbor_length ${neighbor_length} \
-#         --ref_stride ${ref_stride} \
-#         --subvideo_length ${subvideo_length} \
-#         --raft_iter 50 \
-#         --save_frames \
-#         --fp16
-
-#     # move inpainted frames to experiment folder
-#     cd
-#     mv -f "ProPainter/results/stretched/frames" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
-#     rm -r ProPainter/results/stretched/
-#     rm -r ProPainter/inputs/video_completion/
-#     cd embrace
-#     # get inpainted video from frames
-#     frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}" "$inpainted_input_path" "lossless"
-# fi
-
-# INPAINTING WITH E2FGVI
-
 inpainted_input_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
 # Check if the output already exists, if not create it
 if [[ -f "$inpainted_input_path" ]]; then
     echo "$inpainted_input_path already exists"   
 else
-<<<<<<< HEAD
-    # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
     cd ..
     stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
-    mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks"
+    mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks/"
     mkdir -p "ProPainter/inputs/video_completion"
     cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
     cp -r $mask_path "ProPainter/inputs/video_completion/masks"
@@ -251,38 +213,47 @@ else
         --neighbor_length ${neighbor_length} \
         --ref_stride ${ref_stride} \
         --subvideo_length ${subvideo_length} \
-        --raft_iter 20 \
+        --raft_iter 50 \
         --save_frames \
         --fp16
 
     # move inpainted frames to experiment folder
     cd ..
     mv -f "ProPainter/results/stretched/frames" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
+    rm -r ProPainter/results/stretched/
+    rm -r ProPainter/inputs/video_completion/
     cd embrace
     # get inpainted video from frames
     frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}" "$inpainted_input_path" "lossless"
-=======
-    cd
-    stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
-    mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks/"
-    cp $stretched_video_path "E2FGVI/examples/stretched.mp4"
-    cp -r $mask_path "E2FGVI/examples/stretched_mask/"
-    cd E2FGVI
-    # inpaint
-    python test.py \
-        --model e2fgvi_hq \
-        --video examples/stretched.mp4 \
-        --mask examples/stretched_mask \
-        --ckpt release_model/E2FGVI-HQ-CVPR22.pth \
-        --width ${width} \
-        --height ${height}
-    # move inpainted video to experiment folder # TODO: return frames instead of video
-    cd
-    mv -f "E2FGVI/results/stretched_results.mp4" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
-    rm "E2FGVI/examples/stretched.mp4"
-    rm -r "E2FGVI/examples/stretched.mp4"
->>>>>>> 4751405c05b15ed9a138f1d52330665f90e3d96f
 fi
+
+# INPAINTING WITH E2FGVI
+
+# inpainted_input_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+# # Check if the output already exists, if not create it
+# if [[ -f "$inpainted_input_path" ]]; then
+#     echo "$inpainted_input_path already exists"   
+# else
+#     cd ..
+#     stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
+#     mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks/"
+#     cp $stretched_video_path "E2FGVI/examples/stretched.mp4"
+#     cp -r $mask_path "E2FGVI/examples/stretched_mask/"
+#     cd E2FGVI
+#     # inpaint
+#     python test.py \
+#         --model e2fgvi_hq \
+#         --video examples/stretched.mp4 \
+#         --mask examples/stretched_mask \
+#         --ckpt release_model/E2FGVI-HQ-CVPR22.pth \
+#         --width ${width} \
+#         --height ${height}
+#     # move inpainted video to experiment folder # TODO: return frames instead of video
+#     cd ..
+#     mv -f "E2FGVI/results/stretched_results.mp4" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+#     rm "E2FGVI/examples/stretched.mp4"
+#     rm -r "E2FGVI/examples/stretched.mp4"
+# fi
 
 # QUALITY MEASUREMENT INPAINTED
 
@@ -304,23 +275,9 @@ fi
 
 # # CLEANING UP
 
-<<<<<<< HEAD
-# delete shrunk folder
-rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk"
-# delete stretched folder
-rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched"
-# delete inpainted folder
-rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
-
-cd ..
-cd ProPainter
-rm -r results/stretched/
-rm -r inputs/video_completion/
-=======
 # # delete shrunk folder
 # rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk"
 # # delete stretched folder
 # rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched"
 # # delete inpainted folder
 # rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
->>>>>>> 4751405c05b15ed9a138f1d52330665f90e3d96f

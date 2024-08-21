@@ -164,40 +164,41 @@ def process_frame_client_side(frame_name, experiment_folder, square_size):
 
     return frame_name
 
-# get parameters from orchestrator
-video_name = os.environ.get('video_name')
-scene_number = os.environ.get('scene_number')
-resolution = os.environ.get('resolution')
-width, height = resolution.split('x')
-width = int(width)
-height = int(height)
-square_size = int(os.environ.get('square_size'))
-percentage_to_remove = float(os.environ.get('percentage_to_remove'))
-alpha = float(os.environ.get('alpha'))
-resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
-shrunk_frames_folder = f'{experiment_folder}/encoded_shrunk'
-frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
-compressed_masks = f'{experiment_folder}/masks.npz'
+if __name__ == '__main__':
+    # get parameters from orchestrator
+    video_name = os.environ.get('video_name')
+    scene_number = os.environ.get('scene_number')
+    resolution = os.environ.get('resolution')
+    width, height = resolution.split('x')
+    width = int(width)
+    height = int(height)
+    square_size = int(os.environ.get('square_size'))
+    percentage_to_remove = float(os.environ.get('percentage_to_remove'))
+    alpha = float(os.environ.get('alpha'))
+    resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
+    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
+    shrunk_frames_folder = f'{experiment_folder}/encoded_shrunk'
+    frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
+    compressed_masks = f'{experiment_folder}/masks.npz'
 
-# Decompress and reconstruct CSV
-reconstructed_masks = f'{experiment_folder}/reconstructed_masks.csv'
-decompress_and_save_as_csv(compressed_masks, reconstructed_masks)
+    # Decompress and reconstruct CSV
+    reconstructed_masks = f'{experiment_folder}/reconstructed_masks.csv'
+    decompress_and_save_as_csv(compressed_masks, reconstructed_masks)
 
-# Convert binary to masks
-convert_binary_to_masks(reconstructed_masks, f'{experiment_folder}/reconstructed_masks', square_size, (width, height))
+    # Convert binary to masks
+    convert_binary_to_masks(reconstructed_masks, f'{experiment_folder}/reconstructed_masks', square_size, (width, height))
 
-with ProcessPoolExecutor() as executor:
-    results = []
-    for frame_name in frame_names:
-        frame_number = int(frame_name.split('.')[0])
-        results.append(
-            executor.submit(
-                process_frame_client_side, 
-                frame_name, 
-                experiment_folder, 
-                square_size
+    with ProcessPoolExecutor() as executor:
+        results = []
+        for frame_name in frame_names:
+            frame_number = int(frame_name.split('.')[0])
+            results.append(
+                executor.submit(
+                    process_frame_client_side, 
+                    frame_name, 
+                    experiment_folder, 
+                    square_size
+                )
             )
-        )
-    # Retrieve results
-    processed_frame_names = [future.result() for future in results]
+        # Retrieve results
+        processed_frame_names = [future.result() for future in results]
