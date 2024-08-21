@@ -26,7 +26,7 @@ run_evca() {
         echo "$output_video_path already exists"
     else
         ffmpeg -loglevel warning -i "$input_video_path" -c:v rawvideo -pix_fmt yuv420p "$output_video_path"
-        cd
+        cd ..
         python3 EVCA/main.py -i "embrace/$output_video_path" -r $resolution -b $square_size -f $frame_count -c $csv_path -bi 1
         cd ~/embrace
     fi
@@ -189,7 +189,7 @@ if [[ -f "$inpainted_input_path" ]]; then
     echo "$inpainted_input_path already exists"   
 else
     # TODO: we can change the mask at each frame, and set masks to alternate the block they keep so that each block has more references.
-    cd
+    cd ..
     stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
     mask_path="embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/reconstructed_masks"
     mkdir -p "ProPainter/inputs/video_completion"
@@ -209,7 +209,7 @@ else
         --fp16
 
     # move inpainted frames to experiment folder
-    cd
+    cd ..
     mv -f "ProPainter/results/stretched/frames" "embrace/videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
     cd embrace
     # get inpainted video from frames
@@ -243,7 +243,7 @@ rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experime
 # delete inpainted folder
 rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
 
-cd
+cd ..
 cd ProPainter
 rm -r results/stretched/
 rm -r inputs/video_completion/
