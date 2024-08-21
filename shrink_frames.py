@@ -19,7 +19,7 @@ def normalize_array(arr):
     normalized_arr = (arr - arr_min) / (arr_max - arr_min)
     return normalized_arr
 
-def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove):
+def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove, smoothing_factor=0.5):
     # Load the CSV files into 2D NumPy arrays
     temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
     spatial_array = np.loadtxt(spatial_file, delimiter=',', skiprows=1)
@@ -50,10 +50,13 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
             importance[i] = alpha * spatial_3d_array[i] + (1 - alpha) * temporal_3d_array[i + 1]
 
     # Initialize the list to store coordinates of the lowest values
-    lowest_values_coords = []
+    removed_values_coords = []
 
     # Calculate the number of blocks to remove based on the percentage
-    percentage_to_remove = int(percentage_to_remove * num_blocks_x)
+    num_blocks_to_remove = int(percentage_to_remove * num_blocks_x)
+
+    # Initialize a previous_importance array for smoothing
+    previous_importance = None
 
     # Loop through each frame
     for i in range(num_frames):
@@ -63,19 +66,30 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
             # Get the current row
             current_row = importance[i, j, :]
 
-            # Find the indices of the lowest values in the current row based on the percentage
-            if len(current_row) > percentage_to_remove:
-                lowest_indices = np.argsort(current_row)[:percentage_to_remove]
+            # Apply smoothing with the previous frame's importance
+            if previous_importance is not None:
+                current_row = smoothing_factor * current_row + (1 - smoothing_factor) * previous_importance[j, :]
+
+            # Find the indices of the highest values in the current row based on the percentage
+            if len(current_row) > num_blocks_to_remove:
+                indices_to_remove = np.argsort(current_row)[-num_blocks_to_remove:]
             else:
-                lowest_indices = np.argsort(current_row)
+                indices_to_remove = np.argsort(current_row)
 
             # Store the coordinates for column (frame and row given by indices)
-            row_coords = [k for k in lowest_indices]
+            row_coords = [k for k in indices_to_remove]
             frame_coords.append(row_coords)
 
-        lowest_values_coords.append(frame_coords)
+            # Reduce the chance of these blocks to be removed from the next frame
+            if i < num_frames - 1:
+                importance[i + 1, j, indices_to_remove] /= 2
 
-    return lowest_values_coords
+        # Update previous_importance for the next iteration
+        previous_importance = importance[i]
+
+        removed_values_coords.append(frame_coords)
+
+    return removed_values_coords
 
 def split_image_into_squares(image: np.array, l: int) -> np.array:
     """
@@ -214,7 +228,7 @@ frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/ori
 temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_TC_blocks.csv'
 spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_SC_blocks.csv'
 
-lowest_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
+removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
 
 with ProcessPoolExecutor() as executor:
     results = []
@@ -226,7 +240,7 @@ with ProcessPoolExecutor() as executor:
                 frame_name, 
                 experiment_folder, 
                 square_size, 
-                lowest_values_coords[frame_number]
+                removed_values_coords[frame_number]
             )
         )
     # Retrieve results
