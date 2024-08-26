@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# source /etc/profile.d/opt-local.sh
+
 # SETUP
 
 make_lower_multiple() {
@@ -153,11 +155,27 @@ shrunk_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height
 bitrate=$(python3 calculate_bitrate.py "$shrunk_width" "$shrunk_height")
 export bitrate=$bitrate
 
-# get shrunk video from frames
+# get original video from frames TODO: do this for every long path, also maybe the original folder should be reference?
+original_folder="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original"
+original_file="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/original.mp4"
+frames_into_video $original_folder $original_file $bitrate
+
+# get shrunk video from frames with ffmpeg
 frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk.mp4" $bitrate
 
-# get original video from frames
-frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/original.mp4" $bitrate
+# get shrunk video from frames with HNeRV
+encoding_size=$(echo "scale=2; $(stat -c%s $original_file)/1024/1024" | bc)
+
+cd ../HNeRV
+export CUDA_VISIBLE_DEVICES=0
+# echo $encoding_size
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train_nerv_all.py  --outf test  --data_path ../embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/shrunk --vid ${video_name}_scene_${scene_number}   \
+    --conv_type convnext pshuffel --act gelu --norm none  --crop_list ${shrunk_height}_${shrunk_width}  \
+    --resize_list -1 --loss L2  --enc_strds 5 4 4 2 2 --enc_dim 64_16 \
+    --dec_strds 5 4 4 2 2 --ks 0_1_5 --reduce 1.2   \
+    --modelsize $encoding_size  -e 300 --eval_freq 30  --lower_width 12 -b 2 --lr 0.001
+cd ../embrace
 
 # CLIENT SIDE
 
@@ -273,7 +291,7 @@ else
     python collect_metrics.py
 fi
 
-# # CLEANING UP
+# # CLEANING UP TODO: move to run.sh, we launch orchestrator directly only in development, so keeping this stuff is good, while in run.sh we run into storage limitation, and there we need this
 
 # # delete shrunk folder
 # rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk"

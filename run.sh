@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Define the combinations
-videos=("Tears_of_Steel_4k")
-scene_numbers=("9")
+videos=("bear")
+scene_numbers=("1")
 widths=("432")
 heights=("240")
 # TODO: maybe change this into number of vertical and horizontal blocks? 
