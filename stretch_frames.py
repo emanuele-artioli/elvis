@@ -173,10 +173,10 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     square_size = int(os.environ.get('square_size'))
-    percentage_to_remove = float(os.environ.get('percentage_to_remove'))
+    to_remove = float(os.environ.get('to_remove'))
     alpha = float(os.environ.get('alpha'))
     resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
+    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
     shrunk_frames_folder = f'{experiment_folder}/encoded_shrunk'
     frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
     compressed_masks = f'{experiment_folder}/masks.npz'

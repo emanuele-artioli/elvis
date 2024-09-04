@@ -7,7 +7,7 @@ video_name = os.environ.get('video_name')
 scene_number = os.environ.get('scene_number')
 resolution = os.environ.get('resolution')
 square_size = os.environ.get('square_size')
-percentage_to_remove = float(os.environ.get('percentage_to_remove'))
+to_remove = float(os.environ.get('to_remove'))
 alpha = float(os.environ.get('alpha'))
 neighbor_length = os.environ.get('neighbor_length')
 ref_stride = int(os.environ.get('ref_stride'))
@@ -22,7 +22,7 @@ server_runtime = client_start_time - server_start_time
 client_runtime = end_time - client_start_time
 
 # read experiment metrics
-experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
+experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
 metrics_inpainted_file = f'{experiment_folder}/nei_{neighbor_length}_ref_{ref_stride}_sub_{subvideo_length}.csv'
 metrics_inpainted_df = pd.read_csv(metrics_inpainted_file)
 metrics_original_file = f'{experiment_folder}/original.csv'
@@ -40,7 +40,7 @@ results = pd.DataFrame.from_dict({
     'scene_number': [scene_number],
     'resolution': [resolution],
     'square_size': [square_size],
-    'percentage_to_remove': [percentage_to_remove],
+    'to_remove': [to_remove],
     'alpha': [alpha],
     'neighbor_length': [neighbor_length],
     'ref_stride': [ref_stride],

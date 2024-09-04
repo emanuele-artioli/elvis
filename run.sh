@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# TODO: instead of every possible combination in order, pick random values from the lists
+# TODO: potentially, give priority to values that result in a relatively good vmaf. Initialize a weight 
+
 # Define the combinations
 videos=("bear")
 scene_numbers=("1")

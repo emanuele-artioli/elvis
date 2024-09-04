@@ -1,6 +1,6 @@
-conda create -n embrace-test python=3.9 numpy=1.26.3 pandas=2.2.0 pytorch=2.2.0 torchvision cudatoolkit=11.3 -c pytorch -c conda-forge
+conda create -n embrace python=3.9 numpy=1.26.3 pandas=2.2.0 pytorch=2.3.0 torchvision cudatoolkit=11.8 -c pytorch -c conda-forge
 
-conda activate embrace-test
+conda activate embrace
 
 conda install ipykernel scipy scikit-image tensorboard tqdm=4.59.0 pyarrow seaborn tensorflow-datasets tensorflow gcsfs lpips pyyaml requests -c conda-forge
 
@@ -12,4 +12,8 @@ conda install imageio-ffmpeg -c conda-forge
 
 pip install ffmpeg-quality-metrics
 
-pip install mmcv-full==1.7.2 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.2/index.html
+pip install mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.3/index.html
+
+conda install platformdirs
+
+conda install termcolor

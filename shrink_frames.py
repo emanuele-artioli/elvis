@@ -19,7 +19,7 @@ def normalize_array(arr):
     normalized_arr = (arr - arr_min) / (arr_max - arr_min)
     return normalized_arr
 
-def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove, smoothing_factor=0.5):
+def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, smoothing_factor=0.5):
     # Load the CSV files into 2D NumPy arrays
     temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
     spatial_array = np.loadtxt(spatial_file, delimiter=',', skiprows=1)
@@ -52,8 +52,11 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
     # Initialize the list to store coordinates of the lowest values
     removed_values_coords = []
 
-    # Calculate the number of blocks to remove based on the percentage
-    num_blocks_to_remove = int(percentage_to_remove * num_blocks_x)
+    # to_remove can be a percentage, or a number of blocks
+    if to_remove < 1:
+        num_blocks_to_remove = int(to_remove * num_blocks_x)
+    else:
+        num_blocks_to_remove = int(to_remove)
 
     # Initialize a previous_importance array for smoothing
     previous_importance = None
@@ -221,15 +224,16 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     square_size = int(os.environ.get('square_size'))
-    percentage_to_remove = float(os.environ.get('percentage_to_remove'))
+    to_remove = float(os.environ.get('to_remove'))
     alpha = float(os.environ.get('alpha'))
+    smoothing_factor = float(os.environ.get('smoothing_factor'))
     resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{percentage_to_remove}_alp_{alpha}'
+    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
     frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
     temporal_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_TC_blocks.csv'
     spatial_file = f'videos/{video_name}/scene_{scene_number}/{width}x{height}/complexity_{square_size}/reference_SC_blocks.csv'
 
-    removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, percentage_to_remove)
+    removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, smoothing_factor)
 
     with ProcessPoolExecutor() as executor:
         results = []
