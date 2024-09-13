@@ -224,7 +224,7 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     square_size = int(os.environ.get('square_size'))
-    to_remove = float(os.environ.get('to_remove'))
+    to_remove = int(os.environ.get('to_remove'))
     alpha = float(os.environ.get('alpha'))
     smoothing_factor = float(os.environ.get('smoothing_factor'))
     resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'

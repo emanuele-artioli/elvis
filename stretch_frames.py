@@ -173,7 +173,7 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     square_size = int(os.environ.get('square_size'))
-    to_remove = float(os.environ.get('to_remove'))
+    to_remove = int(os.environ.get('to_remove'))
     alpha = float(os.environ.get('alpha'))
     resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
     experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
