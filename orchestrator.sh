@@ -34,24 +34,30 @@ run_evca() {
     fi
 }
 
-video_into_resized_frames() {
+video_into_frames() {
     local input_file=$1
     local output_dir=$2
     local width=$3
     local height=$4
 
-    # Check if the output directory already exists, if not create it
+    # Check if the output directory already exists; if not, create it
     if [[ -d "$output_dir" ]]; then
         echo "$output_dir already exists"
         return 1        
     fi
 
-    mkdir $output_dir
+    mkdir -p $output_dir
 
-    # Apply scale and crop filters to center and crop the image
+    # Construct the filter options
+    local filter_options=""
+    if [[ -n "$width" && -n "$height" ]]; then
+        filter_options="scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}"
+    fi
+
+    # Apply filters if specified
     ffmpeg -loglevel warning -i "$input_file" \
-        -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" \
-        -q:v 1 -fps_mode passthrough -copyts -start_number 0 "$output_dir/%05d.png"
+        -vf "$filter_options" \
+        -q:v 1 -start_number 0 "$output_dir/%05d.png"
 }
 
 frames_into_video() {
@@ -67,29 +73,16 @@ frames_into_video() {
 
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
-        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%05d.png" -c:v libx265 -x265-params lossless=1 -pix_fmt yuv420p -fps_mode passthrough -copyts "$output_file"
+        # Use HEVC (libx265) for lossless encoding
+        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx265 -x265-params lossless=1 "$output_file"
     else
-        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%05d.png" -b:v "$bitrate" -maxrate "$bitrate" -minrate "$bitrate" -bufsize "$bitrate" -c:v libx265 -pix_fmt yuv420p -fps_mode passthrough -copyts "$output_file"
+        # Use AVC (libx264) for lossy encoding
+        ffmpeg -loglevel warning -framerate 24 -i "$input_dir/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx264 -b:v "$bitrate" "$output_file"
     fi
 }
 
-video_into_frames() {
-    local input_file=$1
-    local output_dir=$2
-
-    # Check if the output directory already exists, if not create it
-    if [[ -d "$output_dir" ]]; then
-        echo "$output_dir already exists"
-        return 1        
-    fi
-
-    mkdir $output_dir
-    ffmpeg -loglevel warning -i "$input_file" -vf "fps=24" -q:v 1 -fps_mode passthrough -copyts -start_number 0 "$output_dir/%05d.png"
-}
-
-# Function to get the last created directory in a given parent directory
 get_last_created_directory() {
-    # Define the parent directory as the first argument
+    # Function to get the last created directory in a given parent directory
     local parent_dir="$1"
 
     # Navigate to the parent directory
@@ -106,37 +99,35 @@ get_last_created_directory() {
     echo "$parent_dir/$last_created_dir"
 }
 
-# Function to cut the right half of video frames and rename them
 rename_and_cut_frames() {
-  # Define the target folder (pass this as an argument to the function)
-  target_folder="$1"
+    # Function to cut the right half of video frames and rename them
+    target_folder="$1"
 
-  # Initialize a counter for the new file names
-  counter=0
+    # Initialize a counter for the new file names
+    counter=0
 
-  # Loop through each file in the target folder that matches the pattern "pred_*.png"
-  for file in "$target_folder"/pred_*.png; do
-    # Format the new filename with leading zeros (e.g., 00000.png)
-    new_name=$(printf "%05d.png" "$counter")
+    # Loop through each file in the target folder that matches the pattern "pred_*.png"
+    for file in "$target_folder"/pred_*.png; do
+        # Format the new filename with leading zeros (e.g., 00000.png)
+        new_name=$(printf "%05d.png" "$counter")
 
-    # Get the width of the image
-    double_width=$(identify -format "%w" "$file")
+        # Get the width of the image
+        double_width=$(identify -format "%w" "$file")
 
-    # Calculate the width of half the image
-    single_width=$((double_width / 2))
+        # Calculate the width of half the image
+        single_width=$((double_width / 2))
 
-    # Cut the right half of the image and save it with the new name
-    convert "$file" -crop "${single_width}x+${single_width}+0" "$target_folder/$new_name"
+        # Cut the right half of the image and save it with the new name
+        convert "$file" -crop "${single_width}x+${single_width}+0" "$target_folder/$new_name"
 
-    # Increment the counter
-    counter=$((counter + 1))
+        # Increment the counter
+        counter=$((counter + 1))
 
-    # Remove the original file after processing
-    rm "$file"
-  done
+        # Remove the original file after processing
+        rm "$file"
+    done
 }
 
-# Function to perform encoding with HNeRV
 function encode_with_hnerv {
     local video_name=$1
     local scene_number=$2
@@ -172,7 +163,6 @@ function encode_with_hnerv {
         --resize_list -1 \
         --loss L2 \
         --enc_strds 5 4 4 2 2 \
-        --enc_dim "${square_size}_${square_size}" \
         --dec_strds 5 4 4 2 2 \
         --ks 0_3_3 \
         --reduce 1.2 \
@@ -184,7 +174,6 @@ function encode_with_hnerv {
         --lr 0.001
 }
 
-# Function to perform decoding with HNeRV
 function decode_with_hnerv {
     local video_name=$1
     local scene_number=$2
@@ -212,7 +201,6 @@ function decode_with_hnerv {
         --resize_list -1 \
         --loss L2 \
         --enc_strds 5 4 4 2 2 \
-        --enc_dim "${square_size}_${square_size}" \
         --dec_strds 5 4 4 2 2 \
         --ks 0_3_3 \
         --reduce 1.2 \
@@ -236,7 +224,6 @@ function decode_with_hnerv {
     rename_and_cut_frames "$encoded_shrunk_folder"
 }
 
-# Function to perform inpainting with ProPainter
 function inpaint_with_propainter {
     local video_name=$1
     local scene_number=$2
@@ -280,7 +267,6 @@ function inpaint_with_propainter {
     frames_into_video "videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}" "$inpainted_input_path" "lossless"
 }
 
-# Function to perform inpainting with E2FGVI
 function inpaint_with_e2fgvi {
     local video_name=$1
     local scene_number=$2
@@ -376,7 +362,7 @@ experiment_name="squ_${square_size}_rem_${to_remove}_alp_${alpha}"
 mkdir -p "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name"
 
 # resize scene based on experiment resolution, save into 
-video_into_resized_frames "videos/${video_name}/scene_${scene_number}.mp4" "videos/${video_name}/scene_${scene_number}/${width}x${height}/original" $width $height
+video_into_frames "videos/${video_name}/scene_${scene_number}.mp4" "videos/${video_name}/scene_${scene_number}/${width}x${height}/original" $width $height
 
 # get reference video from frames
 frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/original" "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/reference_${square_size}.mp4" "lossless"
