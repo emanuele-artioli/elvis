@@ -1,74 +1,125 @@
-# import packages
 import os
 import pandas as pd
 
-# get parameters from orchestrator
+def get_codec_params(codec):
+    codec_params = {
+        "hnerv": ["ks", "enc_strds", "enc_dim", "fc_hw", "reduce", "lower_width", "dec_strds", "conv_type", "norm", "act", "workers", "batchSize", "epochs", "lr", "loss", "out_bias", "eval_freq", "quant_model_bit", "quant_embed_bit"],
+        "avc": [],
+        # Add other codecs if needed
+    }
+    params = codec_params.get(codec, [])
+    return {f'{codec}_{key}': os.environ.get(f'{codec}_{key}') for key in params}
+
+def get_inpainter_params(inpainter):
+    inpainter_params = {
+        "propainter": ["neighbor_length", "ref_stride", "subvideo_length", "mask_dilation", "raft_iter"],
+        "e2fgvi": ["step", "num_ref", "neighbor_stride", "savefps"],
+        # Add other inpainters if needed
+    }
+    params = inpainter_params.get(inpainter, [])
+    return {f'{inpainter}_{key}': os.environ.get(f'{inpainter}_{key}') for key in params}
+
+# Get parameters from environment
 video_name = os.environ.get('video_name')
-scene_number = os.environ.get('scene_number')
+experiment_name = os.environ.get('experiment_name')
 resolution = os.environ.get('resolution')
 square_size = os.environ.get('square_size')
-to_remove = int(os.environ.get('to_remove'))
+to_remove = float(os.environ.get('to_remove'))  # Changed to float
 alpha = float(os.environ.get('alpha'))
-neighbor_length = os.environ.get('neighbor_length')
-ref_stride = int(os.environ.get('ref_stride'))
-subvideo_length = int(os.environ.get('subvideo_length'))
+smoothing_factor = float(os.environ.get('smoothing_factor'))
+codec = os.environ.get('codec')
+codec_params = get_codec_params(codec)
+inpainter = os.environ.get('inpainter')
+inpainter_params = get_inpainter_params(inpainter)
 bitrate = os.environ.get('bitrate')
 server_start_time = int(os.environ.get('server_start_time'))
 client_start_time = int(os.environ.get('client_start_time'))
 end_time = int(os.environ.get('end_time'))
 
-# calculate elapsed times
+# Calculate elapsed times
 server_runtime = client_start_time - server_start_time
 client_runtime = end_time - client_start_time
 
-# read experiment metrics
-experiment_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
-metrics_inpainted_file = f'{experiment_folder}/nei_{neighbor_length}_ref_{ref_stride}_sub_{subvideo_length}.csv'
-metrics_inpainted_df = pd.read_csv(metrics_inpainted_file)
-metrics_original_file = f'{experiment_folder}/original.csv'
-metrics_original_df = pd.read_csv(metrics_original_file)
+# Read experiment metrics
+experiment_folder = f'experiments/{experiment_name}'
+inpainted_metrics = f'{experiment_folder}/inpainted_metrics.csv'
+original_metrics = f'{experiment_folder}/original_metrics.csv'
 
-# calculate aggregates
-inpainted_means = metrics_inpainted_df.mean(axis=0, numeric_only=True)
-inpainted_stds = metrics_inpainted_df.std(axis=0, numeric_only=True)
-original_means = metrics_original_df.mean(axis=0, numeric_only=True)
-original_stds = metrics_original_df.std(axis=0, numeric_only=True)
+# Check if files exist to avoid errors
+if os.path.isfile(inpainted_metrics) and os.path.isfile(original_metrics):
+    inpainted_df = pd.read_csv(inpainted_metrics)
+    original_df = pd.read_csv(original_metrics)
+    
+    # Calculate aggregates
+    inpainted_means = inpainted_df.mean(axis=0, numeric_only=True)
+    inpainted_stds = inpainted_df.std(axis=0, numeric_only=True)
+    original_means = original_df.mean(axis=0, numeric_only=True)
+    original_stds = original_df.std(axis=0, numeric_only=True)
+else:
+    print("Metrics files do not exist.")
+    inpainted_means = inpainted_stds = original_means = original_stds = pd.Series()
 
-# write a row of results.csv NOTE: some elements were passed as lists to avoid a pandas error
-results = pd.DataFrame.from_dict({
-    'video_name': [video_name],
-    'scene_number': [scene_number],
-    'resolution': [resolution],
-    'square_size': [square_size],
-    'to_remove': [to_remove],
-    'alpha': [alpha],
-    'neighbor_length': [neighbor_length],
-    'ref_stride': [ref_stride],
-    'subvideo_length': [subvideo_length],
-    'bitrate': [bitrate],
-    'server_runtime': [server_runtime],
-    'client_runtime': [client_runtime],
+# Initialize results dictionary with basic parameters
+results_dict = {
+    'video_name': video_name,
+    'resolution': resolution,
+    'square_size': square_size,
+    'to_remove': to_remove,
+    'alpha': alpha,
+    'bitrate': bitrate,
+    'server_runtime': server_runtime,
+    'client_runtime': client_runtime,
+    'smoothing_factor': smoothing_factor,
+}
 
-    'mse_ori_mean': original_means['mse_avg'],
-    # 'mse_ori_std': original_stds['mse_avg'],
-    'psnr_ori_mean': original_means['psnr_avg'],
-    # 'psnr_ori_std': original_stds['psnr_avg'],
-    'ssim_ori_mean': original_means['ssim_avg'],
-    # 'ssim_ori_std': original_stds['ssim_avg'],
-    'vmaf_ori_mean': original_means['vmaf'],
-    # 'vmaf_ori_std': original_stds['vmaf'],
+# Initialize codec and inpainter parameters to None with specific codec and inpainter names
+all_codec_params = {
+    "hnerv": ["ks", "enc_strds", "enc_dim", "fc_hw", "reduce", "lower_width", "dec_strds", "conv_type", "norm", "act", "workers", "batchSize", "epochs", "lr", "loss", "out_bias", "eval_freq", "quant_model_bit", "quant_embed_bit"],
+    "avc": [],
+    # Add other codecs if needed
+}
 
-    'mse_inp_mean': inpainted_means['mse_avg'],
-    # 'mse_inp_std': inpainted_stds['mse_avg'],
-    'psnr_inp_mean': inpainted_means['psnr_avg'],
-    # 'psnr_inp_std': inpainted_stds['psnr_avg'],
-    'ssim_inp_mean': inpainted_means['ssim_avg'],
-    # 'ssim_inp_std': inpainted_stds['ssim_avg'],
-    'vmaf_inp_mean': inpainted_means['vmaf'],
-    # 'vmaf_inp_std': inpainted_stds['vmaf'],
+all_inpainter_params = {
+    "propainter": ["neighbor_length", "ref_stride", "subvideo_length", "mask_dilation", "raft_iter"],
+    "e2fgvi": ["step", "num_ref", "neighbor_stride", "savefps"],
+    # Add other inpainters if needed
+}
 
-})
+# Set all codec params to None, prefixed with the specific codec name
+for codec_name, params in all_codec_params.items():
+    for param in params:
+        results_dict[f'{codec_name}_{param}'] = None
 
-# append row to results.csv, create file is it does not exist
-results_path='results.csv'
-results.to_csv(results_path, mode='a', index=False, header=not os.path.exists(results_path))
+# Set all inpainter params to None, prefixed with the specific inpainter name
+for inpainter_name, params in all_inpainter_params.items():
+    for param in params:
+        results_dict[f'{inpainter_name}_{param}'] = None
+
+# Add codec parameters to the dictionary with the specific codec name
+results_dict.update(codec_params)
+
+# Add inpainter parameters to the dictionary with the specific inpainter name
+results_dict.update(inpainter_params)
+
+# Add inpainted and original metrics
+results_dict['mse_ori_mean'] = original_means.get('mse_avg', None)
+results_dict['psnr_ori_mean'] = original_means.get('psnr_avg', None)
+results_dict['ssim_ori_mean'] = original_means.get('ssim_avg', None)
+results_dict['vmaf_ori_mean'] = original_means.get('vmaf', None)
+results_dict['mse_inp_mean'] = inpainted_means.get('mse_avg', None)
+results_dict['psnr_inp_mean'] = inpainted_means.get('psnr_avg', None)
+results_dict['ssim_inp_mean'] = inpainted_means.get('ssim_avg', None)
+results_dict['vmaf_inp_mean'] = inpainted_means.get('vmaf', None)
+results_dict['empty'] = ''
+
+# Convert results to DataFrame
+results = pd.DataFrame([results_dict])
+
+# Append results to CSV
+results_csv = 'experiment_results.csv'
+if os.path.isfile(results_csv):
+    results.to_csv(results_csv, mode='a', header=False, index=False)
+else:
+    results.to_csv(results_csv, mode='w', header=True, index=False)
+
+print("Results appended to CSV.")

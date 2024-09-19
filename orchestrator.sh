@@ -49,16 +49,17 @@ function video_into_frames {
 
     mkdir -p $output_dir
 
-    # Construct the filter options
-    local filter_options=""
-    if [[ -n "$width" && -n "$height" ]]; then
-        filter_options="scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}"
+    # Construct the ffmpeg command
+    if [[ -n $width && -n $height ]]; then
+        # Apply scale and crop filters if width and height are provided
+        ffmpeg -loglevel warning -i $input_file \
+            -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" \
+            -start_number 0 "$output_dir/%05d.png"
+    else
+        # No resizing, just extract frames
+        ffmpeg -loglevel warning -i "$input_file" \
+            -start_number 0 "$output_dir/%05d.png"
     fi
-
-    # Apply filters if specified
-    ffmpeg -loglevel warning -i "$input_file" \
-        -vf "$filter_options" \
-        -q:v 1 -start_number 0 "$output_dir/%05d.png"
 }
 
 function frames_into_video {
@@ -129,67 +130,19 @@ function rename_and_cut_frames {
     done
 }
 
-function encode_with_hnerv_old {
-    local experiment_name=$1
-    local shrunk_width=$2
-    local shrunk_height=$3
-    local encoding_size=$4
-    local input_frames="data/${experiment_name}"
-
-    # # Check if the input directory already exists; if not, create it
-    # if [[ -d "$input_frames" ]]; then
-    #     echo "$input_frames already exists"
-    #     return 1        
-    # fi
-    # cd ..
-    # cp "embrace/${experiment_name}/shrunk"/* "HNeRV/${input_frames}"/
-
-    # cd HNeRV
-    # export CUDA_VISIBLE_DEVICES=0
-    # export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-
-    # Use HNeRV to encode the video
-    python train_nerv_all.py \
-        --outf $experiment_name \
-        --data_path $input_frames \
-        --vid "$experiment_name" \
-        --crop_list "${shrunk_height}_${shrunk_width}" \
-        --ks "0_3_3" \
-        --enc_strds 5 4 4 2 2 \
-        --enc_dim "64_16" \
-        --modelsize "$encoding_size" \
-        --fc_hw "9_16" \
-        --reduce 1.2 \
-        --lower_width 32 \
-        --dec_strds 5 4 4 2 2 \
-        --conv_type "convnext" \
-        --norm "none" \
-        --act "gelu" \
-        --workers -1 \
-        --batchSize 1 \
-        --epochs 300 \
-        --lr 0.001 \
-        --loss "L2" \
-        --out_bias "tanh" \
-        --eval_freq 30 \
-        --overwrite
-
-    # cd ../embrace
-}
-
 function encode_with_hnerv {
     local experiment_name=$1
     local shrunk_width=$2
     local shrunk_height=$3
     local encoding_size=$4
     local ks=$5
-    local enc_strds=$6
+    local enc_strds=(${6// / })
     local enc_dim=$7
     local fc_hw=$8
     local reduce=$9
     local lower_width=${10}
-    local dec_strds=${11}
-    local conv_type=${12}
+    local dec_strds=(${11// / })
+    local conv_type=(${12// / })
     local norm=${13}
     local act=${14}
     local workers=${15}
@@ -205,24 +158,25 @@ function encode_with_hnerv {
     local input_frames="data/${experiment_name}"
 
     cd ..
+    mkdir -p "HNeRV/${input_frames}"
     cp "embrace/experiments/${experiment_name}/shrunk"/* "HNeRV/${input_frames}"/
     cd HNeRV
 
     # Use HNeRV to encode the video
     python train_nerv_all.py \
-        --outf $experiment_name \
+        --outf embrace \
         --data_path $input_frames \
-        --vid "$experiment_name" \
+        --vid $experiment_name \
         --crop_list "${shrunk_height}_${shrunk_width}" \
         --ks $ks \
-        --enc_strds $enc_strds \
+        --enc_strds "${enc_strds[@]}" \
         --enc_dim $enc_dim \
         --modelsize $encoding_size \
         --fc_hw $fc_hw \
         --reduce $reduce \
         --lower_width $lower_width \
-        --dec_strds $dec_strds \
-        --conv_type $conv_type \
+        --dec_strds "${dec_strds[@]}" \
+        --conv_type "${conv_type[@]}" \
         --norm $norm \
         --act $act \
         --workers $workers \
@@ -235,67 +189,19 @@ function encode_with_hnerv {
         --overwrite
 }
 
-function decode_with_hnerv_old {
-    local experiment_name=$1
-    local shrunk_width=$2
-    local shrunk_height=$3
-    local encoding_size=$4
-    local input_frames="data/${experiment_name}"
-    local weight_folder=$(get_last_created_directory "output/${experiment_name}")
-    local output_frames="embrace/${experiment_name}/encoded_shrunk"
-
-    # cd ../HNeRV
-    python train_nerv_all.py \
-        --outf $experiment_name \
-        --data_path $input_frames \
-        --vid "$experiment_name" \
-        --crop_list "${shrunk_height}_${shrunk_width}" \
-        --ks "0_3_3" \
-        --enc_strds 5 4 4 2 2 \
-        --enc_dim "64_16" \
-        --modelsize "$encoding_size" \
-        --fc_hw "9_16" \
-        --reduce 1.2 \
-        --lower_width 32 \
-        --dec_strds 5 4 4 2 2 \
-        --conv_type "convnext" \
-        --norm "none" \
-        --act "gelu" \
-        --workers -1 \
-        --batchSize 1 \
-        --epochs 300 \
-        --lr 0.001 \
-        --loss "L2" \
-        --out_bias "tanh" \
-        --eval_freq 30 \
-        --overwrite \
-        --eval_only \
-        --weight "${weight_folder}/model_latest.pth" \
-        --quant_model_bit 8 \
-        --quant_embed_bit 6 \
-        --dump_images
-
-    # # Move frames back into the embrace folder and rename them
-    # cd ..
-    # mkdir -p $output_frames
-    # cp "HNeRV/${weight_folder}/visualize_model_quant"/* $output_frames/
-    # rename_and_cut_frames $output_frames
-    # cd embrace
-}
-
 function decode_with_hnerv {
     local experiment_name=$1
     local shrunk_width=$2
     local shrunk_height=$3
     local encoding_size=$4
     local ks=$5
-    local enc_strds=$6
+    local enc_strds=(${6// / })
     local enc_dim=$7
     local fc_hw=$8
     local reduce=$9
     local lower_width=${10}
-    local dec_strds=${11}
-    local conv_type=${12}
+    local dec_strds=(${11// / })
+    local conv_type=(${12// / })
     local norm=${13}
     local act=${14}
     local workers=${15}
@@ -308,25 +214,26 @@ function decode_with_hnerv {
     local quant_model_bit=${22}
     local quant_embed_bit=${23}
 
+    cd ../HNeRV
     local input_frames="data/${experiment_name}"
-    local weight_folder=$(get_last_created_directory "output/${experiment_name}")
-    local output_frames="embrace/${experiment_name}/encoded_shrunk"
+    local weight_folder=$(get_last_created_directory "output/embrace/${experiment_name}")
+    local output_frames="embrace/experiments/${experiment_name}/decoded"
 
     # Use HNeRV to decode the video
     python train_nerv_all.py \
-        --outf $experiment_name \
+        --outf embrace \
         --data_path $input_frames \
         --vid "$experiment_name" \
         --crop_list "${shrunk_height}_${shrunk_width}" \
-        --ks "$ks" \
-        --enc_strds $enc_strds \
-        --enc_dim "$enc_dim" \
-        --modelsize "$encoding_size" \
-        --fc_hw "$fc_hw" \
-        --reduce "$reduce" \
-        --lower_width "$lower_width" \
-        --dec_strds $dec_strds \
-        --conv_type "$conv_type" \
+        --ks $ks \
+        --enc_strds "${enc_strds[@]}" \
+        --enc_dim $enc_dim \
+        --modelsize $encoding_size \
+        --fc_hw $fc_hw \
+        --reduce $reduce \
+        --lower_width $lower_width \
+        --dec_strds "${dec_strds[@]}" \
+        --conv_type "${conv_type[@]}" \
         --norm "$norm" \
         --act "$act" \
         --workers "$workers" \
@@ -338,74 +245,38 @@ function decode_with_hnerv {
         --eval_freq "$eval_freq" \
         --quant_model_bit "$quant_model_bit" \
         --quant_embed_bit "$quant_embed_bit" \
-        --overwrite \
         --eval_only \
         --weight "${weight_folder}/model_latest.pth" \
         --dump_images
-}
 
-function inpaint_with_propainter_old {
-    local video_name=$1
-    local scene_number=$2
-    local width=$3
-    local height=$4
-    local experiment_name=$5
-    local neighbor_length=$6
-    local ref_stride=$7
-    local subvideo_length=$8
-    
-    local stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/stretched.mp4"
-    local mask_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/reconstructed_masks/"
-    local inpainted_input_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
-
-    mkdir -p "ProPainter/inputs/video_completion"
-    cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
-    cp -r $mask_path "ProPainter/inputs/video_completion/masks"
-    cd ProPainter
-    
-    # INPAINTING
-    python inference_propainter.py \
-        --video inputs/video_completion/stretched.mp4 \
-        --mask inputs/video_completion/masks \
-        --mask_dilation 0 \
-        --neighbor_length ${neighbor_length} \
-        --ref_stride ${ref_stride} \
-        --subvideo_length ${subvideo_length} \
-        --raft_iter 50 \
-        --save_frames \
-        --fp16
-
-    # Move inpainted frames to experiment folder
+    # Move frames back into the embrace folder and rename them
     cd ..
-    mv -f "ProPainter/results/stretched/frames" "embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
-    rm -r ProPainter/results/stretched/
-    rm -r ProPainter/inputs/video_completion/
-    
+    mkdir -p $output_frames
+    cp "HNeRV/${weight_folder}/visualize_model_quant"/* $output_frames/
+    rename_and_cut_frames $output_frames
+    # clean HNeRV folders
+    rm -r "HNeRV/${input_frames}"
+    rm -r "HNeRV/output/embrace/${experiment_name}"
     cd embrace
-
-    # Get inpainted video from frames
-    frames_into_video "videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}" "$inpainted_input_path" "lossless"
 }
 
 function inpaint_with_propainter {
-    local video_name=$1
-    local scene_number=$2
-    local width=$3
-    local height=$4
-    local experiment_name=$5
-    local neighbor_length=$6
-    local ref_stride=$7
-    local subvideo_length=$8
-    local mask_dilation=$9
-    local raft_iter=${10}
+    local stretched_video=$1
+    local mask_frames=$2
+    local inpainted_frames=$3
+    local neighbor_length=$4
+    local ref_stride=$5
+    local subvideo_length=$6
+    local mask_dilation=$7
+    local raft_iter=$8
 
-    local stretched_video_path="embrace/${experiment_name}/stretched.mp4"
-    local mask_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/reconstructed_masks/"
-    local inpainted_input_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+    local stretched_video="embrace/${stretched_video}"
+    local mask_frames="embrace/${mask_frames}/"
+    local inpainted_frames="embrace/${inpainted_frames}"
 
-    mkdir -p "ProPainter/inputs/video_completion"
-    cp $stretched_video_path "ProPainter/inputs/video_completion/stretched.mp4"
-    cp -r $mask_path "ProPainter/inputs/video_completion/masks"
+    cd ..
+    cp $stretched_video "ProPainter/inputs/video_completion/stretched.mp4"
+    cp -r $mask_frames "ProPainter/inputs/video_completion/masks"
     cd ProPainter
     
     # INPAINTING
@@ -422,83 +293,41 @@ function inpaint_with_propainter {
 
     # Move inpainted frames to experiment folder
     cd ..
-    mv -f "ProPainter/results/stretched/frames" "embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
+    mv -f "ProPainter/results/stretched/frames" $inpainted_frames
     rm -r ProPainter/results/stretched/
-    rm -r ProPainter/inputs/video_completion/
-    
-    cd embrace
+    rm -r ProPainter/inputs/video_completion/stretched.mp4
+    rm -r ProPainter/inputs/video_completion/masks
 
     # Get inpainted video from frames
-    frames_into_video "videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}" "$inpainted_input_path" "lossless"
-}
-
-function inpaint_with_e2fgvi_old {
-    local video_name=$1
-    local scene_number=$2
-    local width=$3
-    local height=$4
-    local experiment_name=$5
-    local neighbor_length=$6
-    local ref_stride=$7
-    local subvideo_length=$8
-    
-    local stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/stretched.mp4"
-    local mask_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/reconstructed_masks/"
-    local inpainted_input_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
-
-    cp $stretched_video_path "E2FGVI/examples/stretched.mp4"
-    cp -r $mask_path "E2FGVI/examples/stretched_mask/"
-    cd E2FGVI
-    
-    # INPAINTING
-    python test.py \
-        --model e2fgvi_hq \
-        --video examples/stretched.mp4 \
-        --mask examples/stretched_mask \
-        --ckpt release_model/E2FGVI-HQ-CVPR22.pth \
-        --set_size \
-        --width ${width} \
-        --height ${height} \
-        --step 10 \
-        --num_ref -1 \
-        --neighbor_stride 5 \
-        --savefps 24 \
-    
-    # Move inpainted video to experiment folder
-    cd ..
-    mv -f "E2FGVI/results/stretched_results.mp4" "embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
-    rm "E2FGVI/examples/stretched.mp4"
-    rm -r "E2FGVI/examples/stretched_mask/"
+    frames_into_video $inpainted_frames "${inpainted_frames}.mp4" "lossless"
     cd embrace
 }
 
 function inpaint_with_e2fgvi {
-    local video_name=$1
-    local scene_number=$2
-    local width=$3
-    local height=$4
-    local experiment_name=$5
-    local neighbor_length=$6
-    local ref_stride=$7
-    local subvideo_length=$8
-    local step=$9
-    local num_ref=${10}
-    local neighbor_stride=${11}
-    local savefps=${12}
+    local stretched_video=$1
+    local mask_frames=$2
+    local inpainted_video=$3
+    local width=$4
+    local height=$5
+    local step=$6
+    local num_ref=$7
+    local neighbor_stride=$8
+    local savefps=$9
 
-    local stretched_video_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/stretched.mp4"
-    local mask_path="embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/reconstructed_masks/"
-    local inpainted_input_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+    local stretched_video="embrace/${stretched_video}"
+    local mask_frames="embrace/${mask_frames}"
+    local inpainted_video="embrace/${inpainted_video}"
 
-    cp $stretched_video_path "E2FGVI/examples/stretched.mp4"
-    cp -r $mask_path "E2FGVI/examples/stretched_mask/"
+    cd ..
+    cp $stretched_video "E2FGVI/examples/stretched.mp4"
+    cp -r $mask_frames "E2FGVI/examples/stretched_masks"
     cd E2FGVI
     
     # INPAINTING
     python test.py \
         --model e2fgvi_hq \
         --video examples/stretched.mp4 \
-        --mask examples/stretched_mask \
+        --mask examples/stretched_masks \
         --ckpt release_model/E2FGVI-HQ-CVPR22.pth \
         --set_size \
         --width "${width}" \
@@ -510,9 +339,9 @@ function inpaint_with_e2fgvi {
     
     # Move inpainted video to experiment folder
     cd ..
-    mv -f "E2FGVI/results/stretched_results.mp4" "embrace/videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+    mv -f "E2FGVI/results/stretched_results.mp4" $inpainted_video
     rm "E2FGVI/examples/stretched.mp4"
-    rm -r "E2FGVI/examples/stretched_mask/"
+    rm -r "E2FGVI/examples/stretched_masks/"
     cd embrace
 }
 
@@ -527,10 +356,10 @@ function inpaint_with_e2fgvi {
 # TODO: to improve scene change detection, don't set a threshold but compute it by taking the rolling median of the differences in the first 2 seconds, then checking whether each new difference is much higher, if it is, that's a scene change, if not, add it to the rolling median and go on
 
 # PARAMETERS
-encoder_params=""
+codec_params=""
 inpainter_params=""
 
-# embrace
+# Embrace
 video_name=$1
 video_path=$2
 width=$3
@@ -539,7 +368,7 @@ square_size=$5
 to_remove=$6
 alpha=$7
 smoothing_factor=$8
-encoder=$9
+codec=$9
 inpainter=${10}
 # Initialize the experiment_name with common parameters
 experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remove}_alp_${alpha}_sf_${smoothing_factor}"
@@ -547,12 +376,12 @@ experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remo
 shift 10
 
 # avc
-if [[ "$encoder" == "avc" ]]; then
+if [[ "$codec" == "avc" ]]; then
     experiment_name+="_avc"
 fi
 
 # hnerv
-if [[ "$encoder" == "hnerv" ]]; then
+if [[ "$codec" == "hnerv" ]]; then
     ks=$1
     enc_strds=$2
     enc_dim=$3
@@ -572,10 +401,36 @@ if [[ "$encoder" == "hnerv" ]]; then
     eval_freq=${17}
     quant_model_bit=${18}
     quant_embed_bit=${19}
-    # Fill encoder_params
-    encoder_params="$ks $enc_strds $enc_dim $fc_hw $reduce $lower_width $dec_strds $conv_type $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit"
+    
+    # Export HNeRV parameters with unique keywords
+    export hnerv_ks=$ks
+    export hnerv_enc_strds=$enc_strds
+    export hnerv_enc_dim=$enc_dim
+    export hnerv_fc_hw=$fc_hw
+    export hnerv_reduce=$reduce
+    export hnerv_lower_width=$lower_width
+    export hnerv_dec_strds=$dec_strds
+    export hnerv_conv_type=$conv_type
+    export hnerv_norm=$norm
+    export hnerv_act=$act
+    export hnerv_workers=$workers
+    export hnerv_batchSize=$batchSize
+    export hnerv_epochs=$epochs
+    export hnerv_lr=$lr
+    export hnerv_loss=$loss
+    export hnerv_out_bias=$out_bias
+    export hnerv_eval_freq=$eval_freq
+    export hnerv_quant_model_bit=$quant_model_bit
+    export hnerv_quant_embed_bit=$quant_embed_bit
+
+    # Prepare enc_strds and dec_strds for experiment_name by replacing spaces with underscores
+    enc_strds_for_name="${enc_strds// /_}"
+    dec_strds_for_name="${dec_strds// /_}"
+    conv_type_for_name="${conv_type// /_}"
+
     # Add HNeRV parameters to the experiment name
-    experiment_name+="_hnerv_ks_${ks}_es_${enc_strds}_ed_${enc_dim}_fh_${fc_hw}_red_${reduce}_lw_${lower_width}_ds_${dec_strds}_ct_${conv_type}_nor_${norm}_act_${act}_wor_${workers}_bs_${batchSize}_epo_${epochs}_lr_${lr}_los_${loss}_ob_${out_bias}_ef_${eval_freq}_qmb_${quant_model_bit}_qeb_${quant_embed_bit}"
+    experiment_name+="_hnerv_${ks}_${enc_strds_for_name}_${enc_dim}_${fc_hw}_${reduce}_${lower_width}_${dec_strds_for_name}_${conv_type_for_name}_${norm}_${act}_${workers}_${batchSize}_${epochs}_${lr}_${loss}_${out_bias}_${eval_freq}_${quant_model_bit}_${quant_embed_bit}"
+
     # Shift off the HNeRV-specific parameters
     shift 19
 fi
@@ -587,10 +442,20 @@ if [[ "$inpainter" == "propainter" ]]; then
     subvideo_length=$3
     mask_dilation=$4
     raft_iter=$5
+
+    # Export ProPainter parameters with unique keywords
+    export propainter_neighbor_length=$neighbor_length
+    export propainter_ref_stride=$ref_stride
+    export propainter_subvideo_length=$subvideo_length
+    export propainter_mask_dilation=$mask_dilation
+    export propainter_raft_iter=$raft_iter
+
     # Construct the inpainter_params string for ProPainter
     inpainter_params="$neighbor_length $ref_stride $subvideo_length $mask_dilation $raft_iter"
+
     # Add ProPainter parameters to the experiment name
-    experiment_name+="_propainter_nl_${neighbor_length}_rs_${ref_stride}_sl_${subvideo_length}_md_${mask_dilation}_ri_${raft_iter}"
+    experiment_name+="_propainter_${neighbor_length}_${ref_stride}_${subvideo_length}_${mask_dilation}_${raft_iter}"
+
     # Shift off the ProPainter-specific parameters
     shift 5
 fi
@@ -601,27 +466,39 @@ if [[ "$inpainter" == "e2fgvi" ]]; then
     num_ref=$2
     neighbor_stride=$3
     savefps=$4
+
+    # Export E2FGVI parameters with unique keywords
+    export e2fgvi_step=$step
+    export e2fgvi_num_ref=$num_ref
+    export e2fgvi_neighbor_stride=$neighbor_stride
+    export e2fgvi_savefps=$savefps
+
     # Construct the inpainter_params string for E2FGVI
     inpainter_params="$step $num_ref $neighbor_stride $savefps"
+
     # Add E2FGVI parameters to the experiment name
-    experiment_name+="e2fgvi_ste_${step}_nr_${num_ref}_ns_${neighbor_stride}_sf_${savefps}"
+    experiment_name+="_e2fgvi_${step}_${num_ref}_${neighbor_stride}_${savefps}"
+
     # Shift off the E2FGVI-specific parameters
     shift 4
 fi
 
-# check whether width and height are multiples of square_size, otherwise make them
+# Check whether width and height are multiples of square_size, otherwise make them
 width=$(make_lower_multiple $width $square_size)
 height=$(make_lower_multiple $height $square_size)
 
 resolution="${width}x${height}"
 
-# pass parameters to python scripts
+# Pass parameters to Python scripts
+export video_name=$video_name
 export resolution=$resolution
 export square_size=$square_size
 export to_remove=$to_remove
 export alpha=$alpha
 export smoothing_factor=$smoothing_factor
 export experiment_name=$experiment_name
+export codec=$codec
+export inpainter=$inpainter
 
 # SERVER SIDE
 
@@ -629,7 +506,7 @@ server_start_time=$(date +%s)
 
 # resize video based on experiment resolution, save into experiment folder
 experiment_folder="experiments/${experiment_name}"
-reference_frames="${experiment_folder}/reference_frames"
+reference_frames="${experiment_folder}/reference"
 video_into_frames $video_path $reference_frames $width $height
 
 # get reference video from frames
@@ -658,15 +535,14 @@ frames_into_video $reference_frames $original_video $bitrate
 # ENCODING
 
 shrunk_video="${experiment_folder}/shrunk.mp4"
-shrunk_folder="${experiment_folder}/shrunk"
-encoding_size=$(echo "scale=2; $(stat -c%s $original_file)/1024/1024" | bc)
+shrunk_frames="${experiment_folder}/shrunk"
+encoding_size=$(echo "scale=2; $(stat -c%s $original_video)/1024/1024" | bc)
 
 # Call the encoding function with HNeRV parameters if necessary
-if [[ $encoder == "hnerv" ]]; then
-    hnerv_input_folder="data/${experiment_name}"
-    encode_with_hnerv $experiment_name $shrunk_width $shrunk_height $encoding_size $encoder_params
-elif [[ $encoder == "avc" ]]; then
-    frames_into_video $shrunk_folder $shrunk_video $bitrate
+if [[ $codec == "hnerv" ]]; then
+    encode_with_hnerv $experiment_name $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+elif [[ $codec == "avc" ]]; then
+    frames_into_video $shrunk_frames $shrunk_video $bitrate
 fi
 
 # CLIENT SIDE
@@ -675,70 +551,75 @@ client_start_time=$(date +%s)
 
 # DECODING
 
-encoded_shrunk_folder="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/encoded_shrunk"
-
-# Uncomment one of the following lines based on the method you want to use:
-decode_with_hnerv "$video_name" "$scene_number" "$width" "$height" "$experiment_name" "$shrunk_width" "$shrunk_height" "$square_size" "$encoding_size" "$hnerv_input_folder"
-# video_into_frames $shrunk_file $encoded_shrunk_folder # decode with ffmpeg
+decoded_frames="${experiment_folder}/decoded"
+# Call the decoding function with HNeRV parameters if necessary
+if [[ $codec == "hnerv" ]]; then
+    decode_with_hnerv $experiment_name $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+elif [[ $codec == "avc" ]]; then
+    video_into_frames $shrunk_video $decoded_frames
+fi
 
 # STRETCHING
 
-stretched_file="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched.mp4"
-# Check if the stretched folder already exists, if not create it
-    if [[ -f "$stretched_file" ]]; then
-        echo "$stretched_file already exists"
+stretched_video="${experiment_folder}/stretched.mp4"
+# Check if the stretched file already exists, if not create it
+    if [[ -f "${stretched_video}" ]]; then
+        echo "${stretched_video} already exists"
     else
         # run client script to get stretched frames
-        python stretch_frames.py
+        python scripts/stretch_frames.py
         # get stretched video from frames
-        frames_into_video "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched" $stretched_file "lossless"
+        frames_into_video "${experiment_folder}/stretched" $stretched_video "lossless"
     fi
 
 # QUALITY MEASUREMENT ORIGINAL
 
-reference_output_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/reference_${square_size}.mp4"
-
 # compare reference with original video
-original_input_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/original.mp4"
-original_csv_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/original.csv"
+original_metrics="${experiment_folder}/original_metrics.csv"
 # Check if the output already exists, if not create it
-if [[ -f "$original_csv_path" ]]; then
-    echo "$original_csv_path already exists"   
+if [[ -f $original_metrics ]]; then
+    echo "${original_metrics} already exists"
 else
-    ffmpeg-quality-metrics $original_input_path $reference_output_path -m psnr ssim vmaf -of csv > "$original_csv_path"
+    ffmpeg-quality-metrics $original_video $reference_video -m psnr ssim vmaf -of csv > "$original_metrics"
 fi
 
 # INPAINTING
 
-inpainted_input_path="videos/${video_name}/scene_${scene_number}/${width}x${height}/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.mp4"
+mask_frames="${experiment_folder}/decoded_masks"
+inpainted_frames="${experiment_folder}/inpainted"
+inpainted_video="${experiment_folder}/inpainted.mp4"
 
-if [[ -f "$inpainted_input_path" ]]; then
-    echo "$inpainted_input_path already exists"
+if [[ -f "$inpainted_video" ]]; then
+    echo "$inpainted_video already exists"
 else
-    cd ..
-
-    # Uncomment one of the following lines based on the method you want to use:
-    # inpaint_with_propainter "$video_name" "$scene_number" "$width" "$height" "$experiment_name" "$neighbor_length" "$ref_stride" "$subvideo_length"
-    inpaint_with_e2fgvi "$video_name" "$scene_number" "$width" "$height" "$experiment_name" "$neighbor_length" "$ref_stride" "$subvideo_length"
+    # Call the appropriate inpainting function
+    if [[ "$inpainter" == "propainter" ]]; then
+        # Call the propainter function
+        inpaint_with_propainter $stretched_video $mask_frames $inpainted_frames $inpainter_params
+    elif [[ "$inpainter" == "e2fgvi" ]]; then
+        # Call the e2fgvi function
+        inpaint_with_e2fgvi $stretched_video $mask_frames $inpainted_video $width $height $inpainter_params
+    fi
 fi
 
 # QUALITY MEASUREMENT INPAINTED
 
 # compare reference with inpainted video
-inpainted_csv_path="videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}.csv"
+inpainted_metrics="${experiment_folder}/inpainted_metrics.csv"
 # Check if the output already exists, if not create it
-if [[ -f "$inpainted_csv_path" ]]; then
-    echo "$inpainted_csv_path already exists"   
+if [[ -f $inpainted_metrics ]]; then
+    echo "${inpainted_metrics} already exists"   
 else
-    ffmpeg-quality-metrics $inpainted_input_path $reference_output_path -m psnr ssim vmaf -of csv > "$inpainted_csv_path"
-    # calculate time elapsed
-    end_time=$(date +%s)
-    export server_start_time=$server_start_time
-    export client_start_time=$client_start_time
-    export end_time=$end_time
-    # run metrics script
-    python collect_metrics.py
+    ffmpeg-quality-metrics $inpainted_video $reference_video -m psnr ssim vmaf -of csv > "$inpainted_metrics"
 fi
+
+# calculate time elapsed
+end_time=$(date +%s)
+export server_start_time=$server_start_time
+export client_start_time=$client_start_time
+export end_time=$end_time
+# run metrics script
+python scripts/collect_metrics.py
 
 # # CLEANING UP TODO: move to run.sh, we launch orchestrator directly only in development, so keeping this stuff is good, while in run.sh we run into storage limitation, and there we need this
 

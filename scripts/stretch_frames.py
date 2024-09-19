@@ -153,9 +153,9 @@ def save_image(frame: np.array, output_folder: str, file_name: str) -> None:
 
 def process_frame_client_side(frame_name, experiment_folder, square_size):
 
-    frame = cv2.imread(f'{experiment_folder}/encoded_shrunk/{frame_name}')
+    frame = cv2.imread(f'{experiment_folder}/decoded/{frame_name}')
     frame_squares = split_image_into_squares(frame, square_size)
-    mask = cv2.imread(f'{experiment_folder}/reconstructed_masks/{frame_name}')
+    mask = cv2.imread(f'{experiment_folder}/decoded_masks/{frame_name}')
     mask_squares = split_image_into_squares(mask, square_size)
     stretched_squares = combine_squares_with_mask(frame_squares, mask_squares, square_size)
     stretched_flat = flatten_squares_into_image(stretched_squares)
@@ -169,24 +169,26 @@ if __name__ == '__main__':
     video_name = os.environ.get('video_name')
     scene_number = os.environ.get('scene_number')
     resolution = os.environ.get('resolution')
+    square_size = int(os.environ.get('square_size'))
+    to_remove = float(os.environ.get('to_remove'))
+    alpha = float(os.environ.get('alpha'))
+    # smoothing_factor = float(os.environ.get('smoothing_factor'))
+    experiment_name = os.environ.get('experiment_name')
+    # calculate derivate parameters
     width, height = resolution.split('x')
     width = int(width)
     height = int(height)
-    square_size = int(os.environ.get('square_size'))
-    to_remove = int(os.environ.get('to_remove'))
-    alpha = float(os.environ.get('alpha'))
-    resolution_folder = f'videos/{video_name}/scene_{scene_number}/{resolution}'
-    experiment_folder = f'{resolution_folder}/squ_{square_size}_rem_{to_remove}_alp_{alpha}'
-    shrunk_frames_folder = f'{experiment_folder}/encoded_shrunk'
-    frame_names = [frame_name for frame_name in os.listdir(f'{resolution_folder}/original') if frame_name.endswith('.png')]
+    experiment_folder = f'experiments/{experiment_name}'
+    decoded_frames = f'{experiment_folder}/decoded'
+    frame_names = [frame_name for frame_name in os.listdir(decoded_frames) if frame_name.endswith('.png')]
     compressed_masks = f'{experiment_folder}/masks.npz'
 
     # Decompress and reconstruct CSV
-    reconstructed_masks = f'{experiment_folder}/reconstructed_masks.csv'
-    decompress_and_save_as_csv(compressed_masks, reconstructed_masks)
+    decoded_masks = f'{experiment_folder}/decoded_masks.csv'
+    decompress_and_save_as_csv(compressed_masks, decoded_masks)
 
     # Convert binary to masks
-    convert_binary_to_masks(reconstructed_masks, f'{experiment_folder}/reconstructed_masks', square_size, (width, height))
+    convert_binary_to_masks(decoded_masks, f'{experiment_folder}/decoded_masks', square_size, (width, height))
 
     with ProcessPoolExecutor() as executor:
         results = []
