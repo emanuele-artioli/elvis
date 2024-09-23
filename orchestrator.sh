@@ -28,7 +28,7 @@ function run_evca {
     if [[ -f $output_video_path ]]; then
         echo "${output_video_path} already exists"
     else
-        ffmpeg -loglevel warning -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
+        ffmpeg -loglevel error -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
         cd ..
         python3 EVCA/main.py -i "embrace/${output_video_path}" -r $resolution -b $square_size -f $frame_count -c "embrace/${csv_path}" -bi 1
         cd embrace
@@ -52,12 +52,12 @@ function video_into_frames {
     # Construct the ffmpeg command
     if [[ -n $width && -n $height ]]; then
         # Apply scale and crop filters if width and height are provided
-        ffmpeg -loglevel warning -i $input_file \
+        ffmpeg -loglevel error -i $input_file \
             -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" \
             -start_number 0 "$output_dir/%05d.png"
     else
         # No resizing, just extract frames
-        ffmpeg -loglevel warning -i "$input_file" \
+        ffmpeg -loglevel error -i "$input_file" \
             -start_number 0 "$output_dir/%05d.png"
     fi
 }
@@ -76,10 +76,10 @@ function frames_into_video {
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
         # Use HEVC (libx265) for lossless encoding
-        ffmpeg -loglevel warning -framerate 24 -i "${input_dir}/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx265 -x265-params lossless=1 $output_file
+        ffmpeg -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx265 -x265-params lossless=1 $output_file
     else
         # Use AVC (libx264) for lossy encoding
-        ffmpeg -loglevel warning -framerate 24 -i "${input_dir}/%05d.png" -pix_fmt yuv420p -c:v libx264 -b:v $bitrate -bufsize $bitrate $output_file
+        ffmpeg -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -pix_fmt yuv420p -c:v libx264 -b:v $bitrate -bufsize $bitrate $output_file
     fi
 }
 
@@ -132,41 +132,49 @@ function rename_and_cut_frames {
 
 function encode_with_hnerv {
     local experiment_name=$1
-    local shrunk_width=$2
-    local shrunk_height=$3
-    local encoding_size=$4
-    local ks=$5
-    local enc_strds=(${6// / })
-    local enc_dim=$7
-    local fc_hw=$8
-    local reduce=$9
-    local lower_width=${10}
-    local dec_strds=(${11// / })
-    local conv_type=(${12// / })
-    local norm=${13}
-    local act=${14}
-    local workers=${15}
-    local batchSize=${16}
-    local epochs=${17}
-    local lr=${18}
-    local loss=${19}
-    local out_bias=${20}
-    local eval_freq=${21}
-    local quant_model_bit=${22}
-    local quant_embed_bit=${23}
-
-    local input_frames="data/${experiment_name}"
+    local frame_type=$2
+    local shrunk_width=$3
+    local shrunk_height=$4
+    local encoding_size=$5
+    local ks=$6
+    local enc_strds=(${7// / })
+    local enc_dim=$8
+    local fc_hw=$9
+    local reduce=${10}
+    local lower_width=${11}
+    local dec_strds=(${12// / })
+    local conv_type=(${13// / })
+    local norm=${14}
+    local act=${15}
+    local workers=${16}
+    local batchSize=${17}
+    local epochs=${18}
+    local lr=${19}
+    local loss=${20}
+    local out_bias=${21}
+    local eval_freq=${22}
+    local quant_model_bit=${23}
+    local quant_embed_bit=${24}
 
     cd ..
+    # Determine the input frames folder based on frame type
+    local input_frames="data/${experiment_name}_${frame_type}"
+    local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
+    # Check if the output already exists
+    if [[ -d "$output_frames" ]]; then
+        echo "$output_frames already exists"
+        cd embrace
+        return 1
+    fi
     mkdir -p "HNeRV/${input_frames}"
-    cp "embrace/experiments/${experiment_name}/shrunk"/* "HNeRV/${input_frames}"/
+    cp "embrace/experiments/${experiment_name}/${frame_type}"/* "HNeRV/${input_frames}"/
     cd HNeRV
 
     # Use HNeRV to encode the video
     python train_nerv_all.py \
         --outf embrace \
         --data_path $input_frames \
-        --vid $experiment_name \
+        --vid "${experiment_name}_${frame_type}" \
         --crop_list "${shrunk_height}_${shrunk_width}" \
         --ks $ks \
         --enc_strds "${enc_strds[@]}" \
@@ -187,43 +195,61 @@ function encode_with_hnerv {
         --out_bias $out_bias \
         --eval_freq $eval_freq \
         --overwrite
+
+    cd ../embrace
 }
 
 function decode_with_hnerv {
     local experiment_name=$1
-    local shrunk_width=$2
-    local shrunk_height=$3
-    local encoding_size=$4
-    local ks=$5
-    local enc_strds=(${6// / })
-    local enc_dim=$7
-    local fc_hw=$8
-    local reduce=$9
-    local lower_width=${10}
-    local dec_strds=(${11// / })
-    local conv_type=(${12// / })
-    local norm=${13}
-    local act=${14}
-    local workers=${15}
-    local batchSize=${16}
-    local epochs=${17}
-    local lr=${18}
-    local loss=${19}
-    local out_bias=${20}
-    local eval_freq=${21}
-    local quant_model_bit=${22}
-    local quant_embed_bit=${23}
+    local frame_type=$2  # New parameter: 'benchmark' or 'shrunk'
+    local shrunk_width=$3
+    local shrunk_height=$4
+    local encoding_size=$5
+    local ks=$6
+    local enc_strds=(${7// / })
+    local enc_dim=$8
+    local fc_hw=$9
+    local reduce=${10}
+    local lower_width=${11}
+    local dec_strds=(${12// / })
+    local conv_type=(${13// / })
+    local norm=${14}
+    local act=${15}
+    local workers=${16}
+    local batchSize=${17}
+    local epochs=${18}
+    local lr=${19}
+    local loss=${20}
+    local out_bias=${21}
+    local eval_freq=${22}
+    local quant_model_bit=${23}
+    local quant_embed_bit=${24}
 
-    cd ../HNeRV
-    local input_frames="data/${experiment_name}"
-    local weight_folder=$(get_last_created_directory "output/embrace/${experiment_name}")
-    local output_frames="embrace/experiments/${experiment_name}/decoded"
+    cd
+    local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
+    # Check if the output already exists
+    if [[ -d "$output_frames" ]]; then
+        echo "$output_frames already exists"
+        cd embrace
+        return 1
+    fi
+    cd HNeRV
+    local input_frames="data/${experiment_name}_${frame_type}"
+    local weight_folder=$(get_last_created_directory "output/embrace/${experiment_name}_${frame_type}")
+    local model_weights="${weight_folder}/model_latest.pth"
+    local quantized_weights="${weight_folder}/quant_vid.pth"
+    # encoding sizes
+    echo "Targeted encoding size: ${encoding_size}"
+    file_size=$(stat -c%s "$model_weights")
+    echo "Actual model size: ${file_size}"
+    file_size=$(stat -c%s "$quantized_weights")
+    echo "Actual quantized size: ${file_size}"
 
     # Use HNeRV to decode the video
     python train_nerv_all.py \
         --outf embrace \
         --data_path $input_frames \
-        --vid "$experiment_name" \
+        --vid "${experiment_name}_${frame_type}" \
         --crop_list "${shrunk_height}_${shrunk_width}" \
         --ks $ks \
         --enc_strds "${enc_strds[@]}" \
@@ -246,7 +272,7 @@ function decode_with_hnerv {
         --quant_model_bit "$quant_model_bit" \
         --quant_embed_bit "$quant_embed_bit" \
         --eval_only \
-        --weight "${weight_folder}/model_latest.pth" \
+        --weight $model_weights \
         --dump_images
 
     # Move frames back into the embrace folder and rename them
@@ -254,9 +280,9 @@ function decode_with_hnerv {
     mkdir -p $output_frames
     cp "HNeRV/${weight_folder}/visualize_model_quant"/* $output_frames/
     rename_and_cut_frames $output_frames
-    # clean HNeRV folders
+    # Clean HNeRV folders
     rm -r "HNeRV/${input_frames}"
-    rm -r "HNeRV/output/embrace/${experiment_name}"
+    rm -r "HNeRV/output/embrace/${experiment_name}_${frame_type}"
     cd embrace
 }
 
@@ -506,12 +532,12 @@ server_start_time=$(date +%s)
 
 # resize video based on experiment resolution, save into experiment folder
 experiment_folder="experiments/${experiment_name}"
-reference_frames="${experiment_folder}/reference"
-video_into_frames $video_path $reference_frames $width $height
+benchmark_frames="${experiment_folder}/benchmark"
+video_into_frames $video_path $benchmark_frames $width $height
 
 # get reference video from frames
 reference_video="${experiment_folder}/reference.mp4"
-frames_into_video $reference_frames $reference_video "lossless"
+frames_into_video $benchmark_frames $reference_video "lossless"
 
 # calculate scene complexities
 reference_raw="${experiment_folder}/reference.yuv"
@@ -528,20 +554,25 @@ shrunk_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height
 bitrate=$(python scripts/calculate_bitrate.py $shrunk_width $shrunk_height)
 export bitrate=$bitrate
 
-# get original video from frames TODO: do this for every long path, also maybe the original folder should be reference?
-original_video="${experiment_folder}/original.mp4"
-frames_into_video $reference_frames $original_video $bitrate
-
 # ENCODING
-
 shrunk_video="${experiment_folder}/shrunk.mp4"
 shrunk_frames="${experiment_folder}/shrunk"
-encoding_size=$(echo "scale=2; $(stat -c%s $original_video)/1024/1024" | bc)
+benchmark_video="${experiment_folder}/benchmark.mp4"
+# Get the duration of the reference video (in seconds)
+reference_video_duration=$(ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
+# Calculate encoding size based on duration and bitrate
+encoding_size=$(echo "scale=2; $reference_video_duration * $bitrate / 1024 / 1024" | bc)
 
 # Call the encoding function with HNeRV parameters if necessary
 if [[ $codec == "hnerv" ]]; then
-    encode_with_hnerv $experiment_name $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Encode the benchmark frames with HNeRV
+    encode_with_hnerv $experiment_name "benchmark" $width $height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Encode the shrunk frames with HNeRV
+    encode_with_hnerv $experiment_name "shrunk" $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
 elif [[ $codec == "avc" ]]; then
+    # Get encoded video from frames
+    frames_into_video $benchmark_frames $benchmark_video $bitrate
+    # Encode the shrunk frames with AVC
     frames_into_video $shrunk_frames $shrunk_video $bitrate
 fi
 
@@ -551,12 +582,20 @@ client_start_time=$(date +%s)
 
 # DECODING
 
-decoded_frames="${experiment_folder}/decoded"
+benchmark_decoded_frames="${experiment_folder}/benchmark_decoded"
+shrunk_decoded_frames="${experiment_folder}/shrunk_decoded"
+
 # Call the decoding function with HNeRV parameters if necessary
 if [[ $codec == "hnerv" ]]; then
-    decode_with_hnerv $experiment_name $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Decode the benchmark frames with HNeRV
+    decode_with_hnerv $experiment_name "benchmark" $width $height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Decode the shrunk frames with HNeRV
+    decode_with_hnerv $experiment_name "shrunk" $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Take frames and create benchmark_decoded on the client side
+    frames_into_video $benchmark_decoded_frames $benchmark_video "lossless"
 elif [[ $codec == "avc" ]]; then
-    video_into_frames $shrunk_video $decoded_frames
+    # Decode the shrunk video using AVC
+    video_into_frames $shrunk_video $shrunk_decoded_frames
 fi
 
 # STRETCHING
@@ -572,15 +611,15 @@ stretched_video="${experiment_folder}/stretched.mp4"
         frames_into_video "${experiment_folder}/stretched" $stretched_video "lossless"
     fi
 
-# QUALITY MEASUREMENT ORIGINAL
+# QUALITY MEASUREMENT benchmark
 
-# compare reference with original video
-original_metrics="${experiment_folder}/original_metrics.csv"
+# compare reference with benchmark video
+benchmark_metrics="${experiment_folder}/benchmark_metrics.csv"
 # Check if the output already exists, if not create it
-if [[ -f $original_metrics ]]; then
-    echo "${original_metrics} already exists"
+if [[ -f $benchmark_metrics ]]; then
+    echo "${benchmark_metrics} already exists"
 else
-    ffmpeg-quality-metrics $original_video $reference_video -m psnr ssim vmaf -of csv > "$original_metrics"
+    ffmpeg-quality-metrics $benchmark_video $reference_video -m psnr ssim vmaf -of csv > "$benchmark_metrics"
 fi
 
 # INPAINTING

@@ -153,7 +153,7 @@ def save_image(frame: np.array, output_folder: str, file_name: str) -> None:
 
 def process_frame_client_side(frame_name, experiment_folder, square_size):
 
-    frame = cv2.imread(f'{experiment_folder}/decoded/{frame_name}')
+    frame = cv2.imread(f'{experiment_folder}/shrunk_decoded/{frame_name}')
     frame_squares = split_image_into_squares(frame, square_size)
     mask = cv2.imread(f'{experiment_folder}/decoded_masks/{frame_name}')
     mask_squares = split_image_into_squares(mask, square_size)
@@ -179,7 +179,7 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     experiment_folder = f'experiments/{experiment_name}'
-    decoded_frames = f'{experiment_folder}/decoded'
+    decoded_frames = f'{experiment_folder}/shrunk_decoded'
     frame_names = [frame_name for frame_name in os.listdir(decoded_frames) if frame_name.endswith('.png')]
     compressed_masks = f'{experiment_folder}/masks.npz'
 

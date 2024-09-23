@@ -180,7 +180,7 @@ def save_mask(frame_number, binary_representation, csv_file):
 
 def process_frame_server_side(frame_name, experiment_folder, square_size, block_coords):
 
-    frame = cv2.imread(f'{experiment_folder}/reference/{frame_name}')
+    frame = cv2.imread(f'{experiment_folder}/benchmark/{frame_name}')
     frame_squares = split_image_into_squares(frame, square_size)
     shrunk_squares, mask = filter_squares(frame_squares, block_coords)
     shrunk_flat = flatten_squares_into_image(shrunk_squares)
@@ -229,7 +229,7 @@ if __name__ == '__main__':
     width = int(width)
     height = int(height)
     experiment_folder = f'experiments/{experiment_name}'
-    frame_names = [frame_name for frame_name in os.listdir(f'{experiment_folder}/reference') if frame_name.endswith('.png')]
+    frame_names = [frame_name for frame_name in os.listdir(f'{experiment_folder}/benchmark') if frame_name.endswith('.png')]
     temporal_file = f'{experiment_folder}/complexity/reference_TC_blocks.csv'
     spatial_file = f'{experiment_folder}/complexity/reference_SC_blocks.csv'
 

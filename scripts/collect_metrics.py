@@ -43,21 +43,21 @@ client_runtime = end_time - client_start_time
 # Read experiment metrics
 experiment_folder = f'experiments/{experiment_name}'
 inpainted_metrics = f'{experiment_folder}/inpainted_metrics.csv'
-original_metrics = f'{experiment_folder}/original_metrics.csv'
+benchmark_metrics = f'{experiment_folder}/benchmark_metrics.csv'
 
 # Check if files exist to avoid errors
-if os.path.isfile(inpainted_metrics) and os.path.isfile(original_metrics):
+if os.path.isfile(inpainted_metrics) and os.path.isfile(benchmark_metrics):
     inpainted_df = pd.read_csv(inpainted_metrics)
-    original_df = pd.read_csv(original_metrics)
+    benchmark_df = pd.read_csv(benchmark_metrics)
     
     # Calculate aggregates
     inpainted_means = inpainted_df.mean(axis=0, numeric_only=True)
     inpainted_stds = inpainted_df.std(axis=0, numeric_only=True)
-    original_means = original_df.mean(axis=0, numeric_only=True)
-    original_stds = original_df.std(axis=0, numeric_only=True)
+    benchmark_means = benchmark_df.mean(axis=0, numeric_only=True)
+    benchmark_stds = benchmark_df.std(axis=0, numeric_only=True)
 else:
     print("Metrics files do not exist.")
-    inpainted_means = inpainted_stds = original_means = original_stds = pd.Series()
+    inpainted_means = inpainted_stds = benchmark_means = benchmark_stds = pd.Series()
 
 # Initialize results dictionary with basic parameters
 results_dict = {
@@ -101,11 +101,11 @@ results_dict.update(codec_params)
 # Add inpainter parameters to the dictionary with the specific inpainter name
 results_dict.update(inpainter_params)
 
-# Add inpainted and original metrics
-results_dict['mse_ori_mean'] = original_means.get('mse_avg', None)
-results_dict['psnr_ori_mean'] = original_means.get('psnr_avg', None)
-results_dict['ssim_ori_mean'] = original_means.get('ssim_avg', None)
-results_dict['vmaf_ori_mean'] = original_means.get('vmaf', None)
+# Add inpainted and benchmark metrics
+results_dict['mse_ori_mean'] = benchmark_means.get('mse_avg', None)
+results_dict['psnr_ori_mean'] = benchmark_means.get('psnr_avg', None)
+results_dict['ssim_ori_mean'] = benchmark_means.get('ssim_avg', None)
+results_dict['vmaf_ori_mean'] = benchmark_means.get('vmaf', None)
 results_dict['mse_inp_mean'] = inpainted_means.get('mse_avg', None)
 results_dict['psnr_inp_mean'] = inpainted_means.get('psnr_avg', None)
 results_dict['ssim_inp_mean'] = inpainted_means.get('ssim_avg', None)
