@@ -94,6 +94,89 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
 
     return removed_values_coords
 
+def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, focused_folder, smoothing_factor=0.5):
+    # Load the CSV files into 2D NumPy arrays
+    temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
+    spatial_array = np.loadtxt(spatial_file, delimiter=',', skiprows=1)
+
+    num_blocks_x = width // square_size  # Number of horizontal blocks
+    num_blocks_y = height // square_size  # Number of vertical blocks
+    num_frames = temporal_array.shape[1]  # Number of frames (number of columns in CSV)
+
+    # Reshape the arrays to (num_frames, num_blocks_y, num_blocks_x)
+    temporal_3d_array = temporal_array.T.reshape(num_frames, num_blocks_y, num_blocks_x)
+    spatial_3d_array = spatial_array.T.reshape(num_frames, num_blocks_y, num_blocks_x)
+
+    # Normalize arrays
+    temporal_3d_array = normalize_array(temporal_3d_array)
+    spatial_3d_array = normalize_array(spatial_3d_array)
+
+    # Get the shape details
+    num_frames, num_blocks_y, num_blocks_x = spatial_3d_array.shape
+
+    # Initialize the importance array
+    importance = np.zeros((num_frames, num_blocks_y, num_blocks_x))
+
+    # Calculate the importance values (for the last frame, there is no successive temporal complexity, so we rely only on spatial)
+    for i in range(num_frames):
+        if i == num_frames - 1:
+            importance[i] = spatial_3d_array[i]
+        else:
+            importance[i] = alpha * spatial_3d_array[i] + (1 - alpha) * temporal_3d_array[i + 1]
+
+    # Initialize the list to store coordinates of the lowest values
+    removed_values_coords = []
+
+    # Load masks for each frame
+    masks = [cv2.imread(f"{focused_folder}/{i:05d}.png", cv2.IMREAD_GRAYSCALE) for i in range(num_frames)]
+    masks = [cv2.resize(mask, (num_blocks_x, num_blocks_y)) for mask in masks]
+
+    # to_remove can be a percentage, or a number of blocks
+    if to_remove < 1:
+        num_blocks_to_remove = int(to_remove * num_blocks_x)
+    else:
+        num_blocks_to_remove = int(to_remove)
+
+    # Initialize a previous_importance array for smoothing
+    previous_importance = None
+
+    # Loop through each frame
+    for i in range(num_frames):
+        frame_coords = []
+        # Loop through each row in the current frame
+        for j in range(num_blocks_y):
+            # Get the current row
+            current_row = importance[i, j, :]
+
+            # Apply smoothing with the previous frame's importance
+            if previous_importance is not None:
+                current_row = smoothing_factor * current_row + (1 - smoothing_factor) * previous_importance[j, :]
+
+            # Apply the mask: Only allow block removal if the corresponding mask region is black (background)
+            mask_row = masks[i][j, :]  # Get the mask row
+            background_indices = np.where(mask_row == 0)[0]  # Indices where mask is black (background)
+
+            # Restrict block removal to background areas
+            if len(background_indices) > num_blocks_to_remove:
+                indices_to_remove = background_indices[np.argsort(current_row[background_indices])[-num_blocks_to_remove:]]
+            else:
+                indices_to_remove = background_indices[np.argsort(current_row[background_indices])]
+
+            # Store the coordinates for column (frame and row given by indices)
+            row_coords = [k for k in indices_to_remove]
+            frame_coords.append(row_coords)
+
+            # Reduce the chance of these blocks to be removed from the next frame
+            if i < num_frames - 1:
+                importance[i + 1, j, indices_to_remove] /= 2
+
+        # Update previous_importance for the next iteration
+        previous_importance = importance[i]
+
+        removed_values_coords.append(frame_coords)
+
+    return removed_values_coords
+
 def split_image_into_squares(image: np.array, l: int) -> np.array:
     """
     Split an image into squares of a specific size.
@@ -232,8 +315,9 @@ if __name__ == '__main__':
     frame_names = [frame_name for frame_name in os.listdir(f'{experiment_folder}/benchmark') if frame_name.endswith('.png')]
     temporal_file = f'{experiment_folder}/complexity/reference_TC_blocks.csv'
     spatial_file = f'{experiment_folder}/complexity/reference_SC_blocks.csv'
+    focused_folder = f'{experiment_folder}/focus_masks'
 
-    removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, smoothing_factor)
+    removed_values_coords = get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, focused_folder, smoothing_factor)
 
     with ProcessPoolExecutor() as executor:
         results = []

@@ -1,6 +1,6 @@
 #!/bin/bash
 # source /etc/profile.d/opt-local.sh
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # SETUP
@@ -543,6 +543,18 @@ frames_into_video $benchmark_frames $reference_video "lossless"
 reference_raw="${experiment_folder}/reference.yuv"
 reference_complexity="${experiment_folder}/complexity/reference.csv"
 run_evca $reference_video $reference_raw $resolution $square_size $reference_complexity
+
+# generate focused masks to know what is the main object of a scene that needs to not be removed
+cd
+UFO_folder="datasets/embrace/image/${experiment_name}"
+mkdir -p UFO/${UFO_folder}
+cp -r embrace/${experiment_folder}/benchmark/* UFO/${UFO_folder}/
+cd UFO 
+python test.py --model=weights/video_best.pth --data_path=datasets/embrace/ --output_dir=VSOD_results/wo_optical_flow/embrace --task=VSOD
+# copy output folder back into embrace
+cd
+mv UFO/VSOD_results/wo_optical_flow/embrace/${experiment_name} embrace/${experiment_folder}/focus_masks
+cd embrace
 
 # run script to get smart masks and shrunk frames
 python scripts/shrink_frames.py

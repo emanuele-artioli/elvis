@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Define lists for each parameter
-videos=("bmx-bumps" "bmx-trees" "breakdance-flare") # ("bear" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare")
-widths=("1600") # ("640" "960" "1280" "1600")
-heights=("1280") # ("640" "960" "1280" "1600")
-square_sizes=("32") # ("16" "32" "64")
-to_remove=("10.0") # ("10.0" "20.0")
+videos=("bmx-trees") # ("bear" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare")
+widths=("1280") # ("640" "960" "1280" "1600")
+heights=("960") # ("640" "960" "1280" "1600")
+square_sizes=("16") # ("16" "32" "64")
+to_remove=("20.0") # ("10.0" "20.0")
 alpha=("0.5") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 smoothing_factor=("0.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 codecs=("hnerv") # ("avc" "hnerv")

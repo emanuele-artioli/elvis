@@ -1,7 +1,7 @@
 import numpy as np
 import sys
 
-# Dictionary representing the bitrate ladder (bitrate: pixels)
+# Dictionary representing the bitrate ladder (bitrate * fps_correction: width * height)
 bitrate_ladder = {
     0: 0,
     145 * 0.8: (240 * 4/3) * 240,
