@@ -1,15 +1,20 @@
 #!/bin/bash
 
 # Define lists for each parameter
-videos=("bmx-trees") # ("bear" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare")
-widths=("1280") # ("640" "960" "1280" "1600")
-heights=("960") # ("640" "960" "1280" "1600")
-square_sizes=("16") # ("16" "32" "64")
-to_remove=("20.0") # ("10.0" "20.0")
-alpha=("0.5") # ("0.0" "0.25" "0.5" "0.75" "1.0")
-smoothing_factor=("0.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
+videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare" "bus" "camel" "car-roundabout"
+        "car-turn" "cat-girl" "classic-car" "cows" "dog" "dog-gooses" "dogs-scale" "drift-chicane" "drift-straight"
+        "drift-turn" "drone" "elephant" "flamingo" "goat" "gold-fish" "hike" "hockey" "horsejump-high" "horsejump-low"
+        "india" "judo" "kid-football" "kite-surf" "kite-walk" "koala" "lab-coat" "lady-running" "libby" "lindy-hop"
+        "loading" "longboard" "lucia" "mallard-fly" "mallard-water" "mbike-trick" "miami-surf"
+)
+widths=("960" "1280" "1600") # ("960" "1280" "1600")
+heights=("640" "960" "1280") # ("640" "960" "1280")
+square_sizes=("16" "32" "64") # ("16" "32" "64")
+to_remove=("10.0") # ("10.0" "20.0")
+alpha=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
+smoothing_factor=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 codecs=("hnerv") # ("avc" "hnerv")
-inpainters=("e2fgvi") # ("propainter" "e2fgvi")
+inpainters=("propainter" "e2fgvi") # ("propainter" "e2fgvi")
 
 # Define parameters for each codec
 hnerv_params_ks=("0_3_3") # ("2_2_2" "0_3_3" "0_4_4")
@@ -22,25 +27,25 @@ hnerv_params_dec_strds=("5 4 4 2 2") # ("4 3 3 2" "5 4 4 2 2" "6 6 5 5 4 2")
 hnerv_params_conv_type=("convnext pshuffel") # ("convnext pshuffel")
 hnerv_params_norm=("none") # ("none" "bn" "in")
 hnerv_params_act=("relu") # ("relu" "leaky" "gelu")
-hnerv_params_workers=("8") # ("4" "8" "16" "32")
-hnerv_params_batchSize=("1") # ("1" "2" "4")
-hnerv_params_epochs=(100) # (10 30 100)
-hnerv_params_lr=(0.001) # (0.01 0.001 0.0001)
+hnerv_params_workers=(16) # ("4" "8" "16" "32")
+hnerv_params_batchSize=(2 4) # ("1" "2" "4")
+hnerv_params_epochs=(10 30 100) # (10 30 100)
+hnerv_params_lr=(0.01 0.001) # (0.01 0.001 0.0001)
 hnerv_params_loss=("Fusion6") # ("Fusion6" "L2")
 hnerv_params_out_bias=("tanh") # ("tanh")
-hnerv_params_eval_freq=(10) # (5 10)
-hnerv_params_quant_model_bit=(8) # (6 8)
-hnerv_params_quant_embed_bit=(6) # (6 8)
+hnerv_params_eval_freq=(1 3 10) # (5 10)
+hnerv_params_quant_model_bit=(8) # (6 8 10)
+hnerv_params_quant_embed_bit=(6) # (6)
 
 propainter_params_neighbor_length=(8 16 24) # (8 16 24)
 propainter_params_ref_stride=(2 4) # (2 4)
 propainter_params_subvideo_length=(24 48) # (24 48)
-propainter_params_mask_dilation=(0) # (0)
-propainter_params_raft_iter=(10 30 100) # (10 30 100)
+propainter_params_mask_dilation=(0 2 4) # (0)
+propainter_params_raft_iter=(3 10 30) # (10 30 100)
 
-e2fgvi_params_step=(10) # (5 10)
-e2fgvi_params_num_ref=(-1) # (-1 1 2 4)
-e2fgvi_params_neighbor_stride=(4) # (2 4)
+e2fgvi_params_step=(5 10) # (5 10)
+e2fgvi_params_num_ref=(-1 1) # (-1 1 2 4)
+e2fgvi_params_neighbor_stride=(2 4) # (2 4)
 e2fgvi_params_savefps=(24) # (24)
 
 # Randomly select codec and inpainter
@@ -172,13 +177,19 @@ fi
 # EXCEPTION RULES
 
 # Check if hnerv is chosen and the product of square_size and to_remove is a multiple of 320 (otherwise HNeRV does not work)
+# Ensure the product is also smaller than the initial width, or there will be no video to inpaint 
 product=$(echo "$square_size * $to_remove" | bc)
 if [[ "$codec" == "hnerv" ]]; then
     if ! (( $(echo "$product % 320 == 0" | bc) )); then
         echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is $product and is not a multiple of 320."
         exit 1
+    elif ! (( $(echo "$product < $width" | bc) )); then
+        echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is not smaller than video width $width."
+        exit 1
     fi
 fi
+
+
 
 # Check if propainter is chosen and ensure width and height are less than 1280
 if [[ "$inpainter" == "propainter" ]]; then
@@ -186,6 +197,13 @@ if [[ "$inpainter" == "propainter" ]]; then
         echo "Error: When using propainter, both width ($width) and height ($height) must be less than 1280."
         exit 1
     fi
+fi
+
+# check if experiment was already run
+experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remove}_alp_${alpha}_sf_${smoothing_factor}"
+if [[ -d "experiments/${experiment_name}" ]]; then
+    echo "experiment already run"
+    exit 1
 fi
 
 ./orchestrator.sh "${args[@]}"

@@ -19,81 +19,6 @@ def normalize_array(arr):
     normalized_arr = (arr - arr_min) / (arr_max - arr_min)
     return normalized_arr
 
-def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, smoothing_factor=0.5):
-    # Load the CSV files into 2D NumPy arrays
-    temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
-    spatial_array = np.loadtxt(spatial_file, delimiter=',', skiprows=1)
-
-    num_blocks_x = width // square_size  # Number of horizontal blocks
-    num_blocks_y = height // square_size  # Number of vertical blocks
-    num_frames = temporal_array.shape[1]  # Number of frames (number of columns in CSV)
-
-    # Reshape the arrays to (num_frames, num_blocks_y, num_blocks_x)
-    temporal_3d_array = temporal_array.T.reshape(num_frames, num_blocks_y, num_blocks_x)
-    spatial_3d_array = spatial_array.T.reshape(num_frames, num_blocks_y, num_blocks_x)
-
-    # Normalize arrays
-    temporal_3d_array = normalize_array(temporal_3d_array)
-    spatial_3d_array = normalize_array(spatial_3d_array)
-
-    # Get the shape details
-    num_frames, num_blocks_y, num_blocks_x = spatial_3d_array.shape
-
-    # Initialize the importance array
-    importance = np.zeros((num_frames, num_blocks_y, num_blocks_x))
-
-    # Calculate the importance values (for the last frame, there is no successive temporal complexity, so we rely only on spatial)
-    for i in range(num_frames):
-        if i == num_frames - 1:
-            importance[i] = spatial_3d_array[i]
-        else:
-            importance[i] = alpha * spatial_3d_array[i] + (1 - alpha) * temporal_3d_array[i + 1]
-
-    # Initialize the list to store coordinates of the lowest values
-    removed_values_coords = []
-
-    # to_remove can be a percentage, or a number of blocks
-    if to_remove < 1:
-        num_blocks_to_remove = int(to_remove * num_blocks_x)
-    else:
-        num_blocks_to_remove = int(to_remove)
-
-    # Initialize a previous_importance array for smoothing
-    previous_importance = None
-
-    # Loop through each frame
-    for i in range(num_frames):
-        frame_coords = []
-        # Loop through each row in the current frame
-        for j in range(num_blocks_y):
-            # Get the current row
-            current_row = importance[i, j, :]
-
-            # Apply smoothing with the previous frame's importance
-            if previous_importance is not None:
-                current_row = smoothing_factor * current_row + (1 - smoothing_factor) * previous_importance[j, :]
-
-            # Find the indices of the highest values in the current row based on the percentage
-            if len(current_row) > num_blocks_to_remove:
-                indices_to_remove = np.argsort(current_row)[-num_blocks_to_remove:]
-            else:
-                indices_to_remove = np.argsort(current_row)
-
-            # Store the coordinates for column (frame and row given by indices)
-            row_coords = [k for k in indices_to_remove]
-            frame_coords.append(row_coords)
-
-            # Reduce the chance of these blocks to be removed from the next frame
-            if i < num_frames - 1:
-                importance[i + 1, j, indices_to_remove] /= 2
-
-        # Update previous_importance for the next iteration
-        previous_importance = importance[i]
-
-        removed_values_coords.append(frame_coords)
-
-    return removed_values_coords
-
 def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square_size, alpha, to_remove, focused_folder, smoothing_factor=0.5):
     # Load the CSV files into 2D NumPy arrays
     temporal_array = np.loadtxt(temporal_file, delimiter=',', skiprows=1)
@@ -224,6 +149,7 @@ def filter_squares(squares: np.array, block_coords: list) -> tuple:
         new_squares.append(row_squares)
 
     # Convert new_squares list to numpy array
+    
     new_squares = np.array(new_squares)
 
     return new_squares, mask
