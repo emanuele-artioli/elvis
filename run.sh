@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# TODO: log which combinations go into error, so the parameters can be adjusted to avoid them
+
 # Define lists for each parameter
 videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare" "bus" "camel" "car-roundabout"
         "car-turn" "cat-girl" "classic-car" "cows" "dog" "dog-gooses" "dogs-scale" "drift-chicane" "drift-straight"
