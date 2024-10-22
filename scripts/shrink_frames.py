@@ -156,7 +156,7 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
             mask_row = masks[i][j, :]  # Get the mask row
             background_indices = np.where(mask_row == 0)[0]  # Indices where mask is black (background)
 
-            # Restrict block removal to background areas
+            # Restrict block removal to background areas TODO: instead of this, set their importance to a very high number, so they can still be removed but only after all the rest
             if len(background_indices) > num_blocks_to_remove:
                 indices_to_remove = background_indices[np.argsort(current_row[background_indices])[-num_blocks_to_remove:]]
             else:
@@ -166,7 +166,7 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
             row_coords = [k for k in indices_to_remove]
             frame_coords.append(row_coords)
 
-            # Reduce the chance of these blocks to be removed from the next frame
+            # Reduce the chance of these blocks to be removed from the next frame TODO: maybe remove this 
             if i < num_frames - 1:
                 importance[i + 1, j, indices_to_remove] /= 2
 

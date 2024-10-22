@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# TODO: log which combinations go into error, so the parameters can be adjusted to avoid them
+
 # Define lists for each parameter
 videos=("bmx-trees") # ("bear" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-flare")
 widths=("1280") # ("640" "960" "1280" "1600")
