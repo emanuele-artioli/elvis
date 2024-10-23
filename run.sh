@@ -9,10 +9,10 @@ videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-fl
         "india" "judo" "kid-football" "kite-surf" "kite-walk" "koala" "lab-coat" "lady-running" "libby" "lindy-hop"
         "loading" "longboard" "lucia" "mallard-fly" "mallard-water" "mbike-trick" "miami-surf"
 )
-widths=("960" "1280" "1600") # ("960" "1280" "1600")
-heights=("640" "960" "1280") # ("640" "960" "1280")
+widths=("960" "1280" "1600" "1920")
+heights=("540" "720" "900" "1080")
 square_sizes=("16" "32" "64") # ("16" "32" "64")
-to_remove=("10.0") # ("10.0" "20.0")
+to_remove=("0.25" "0.5" "10.0" "20.0") # ("10.0" "20.0")
 alpha=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 smoothing_factor=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 codecs=("hnerv") # ("avc" "hnerv")
@@ -31,7 +31,7 @@ hnerv_params_norm=("none") # ("none" "bn" "in")
 hnerv_params_act=("relu") # ("relu" "leaky" "gelu")
 hnerv_params_workers=(16) # ("4" "8" "16" "32")
 hnerv_params_batchSize=(2 4) # ("1" "2" "4")
-hnerv_params_epochs=(10 30 100) # (10 30 100)
+hnerv_params_epochs=(30 100 300) # (10 30 100)
 hnerv_params_lr=(0.01 0.001) # (0.01 0.001 0.0001)
 hnerv_params_loss=("Fusion6") # ("Fusion6" "L2")
 hnerv_params_out_bias=("tanh") # ("tanh")
@@ -56,7 +56,7 @@ inpainter=${inpainters[$RANDOM % ${#inpainters[@]}]}
 
 # Randomly select values for the parameters based on codec and inpainter
 video=${videos[$RANDOM % ${#videos[@]}]}
-video_path="videos/${video}/scene_1.mp4"
+raw_frames="Datasets/DAVIS/${video}"
 width=${widths[$RANDOM % ${#widths[@]}]}
 height=${heights[$RANDOM % ${#heights[@]}]}
 square_size=${square_sizes[$RANDOM % ${#square_sizes[@]}]}
@@ -69,7 +69,7 @@ args=()
 
 # Add common arguments
 args+=("$video")
-args+=("$video_path")
+args+=("$raw_frames")
 args+=("$width")
 args+=("$height")
 args+=("$square_size")
@@ -126,8 +126,8 @@ fi
 
 # Run the orchestrator with the dynamically constructed arguments
 echo "Chosen parameters:"
-echo "Video: $video"
-echo "Video Path: $video_path"
+echo "Video Name: $video"
+echo "Raw Frames Path: $raw_frames"
 echo "Width: $width"
 echo "Height: $height"
 echo "Square Size: $square_size"
@@ -178,34 +178,96 @@ fi
 
 # EXCEPTION RULES
 
-# Check if hnerv is chosen and the product of square_size and to_remove is a multiple of 320 (otherwise HNeRV does not work)
-# Ensure the product is also smaller than the initial width, or there will be no video to inpaint 
-product=$(echo "$square_size * $to_remove" | bc)
-if [[ "$codec" == "hnerv" ]]; then
-    if ! (( $(echo "$product % 320 == 0" | bc) )); then
-        echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is $product and is not a multiple of 320."
-        exit 1
-    elif ! (( $(echo "$product < $width" | bc) )); then
-        echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is not smaller than video width $width."
-        exit 1
-    fi
-fi
-
-
+# # Check if hnerv is chosen and the product of square_size and to_remove is a multiple of 320 (otherwise HNeRV does not work)
+# # Ensure the product is also smaller than the initial width, or there will be no video to inpaint 
+# product=$(echo "$square_size * $to_remove" | bc)
+# if [[ "$codec" == "hnerv" ]]; then
+#     if ! (( $(echo "$product % 320 == 0" | bc) )); then
+#         echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is $product and is not a multiple of 320."
+#         exit 1
+#     elif ! (( $(echo "$product < $width" | bc) )); then
+#         echo "Error: The product of square_size ($square_size) and to_remove ($to_remove) is not smaller than video width $width."
+#         exit 1
+#     fi
+# fi
 
 # Check if propainter is chosen and ensure width and height are less than 1280
+max_width=1920
+max_height=1080
 if [[ "$inpainter" == "propainter" ]]; then
-    if (( width >= 1280 || height >= 1280 )); then
-        echo "Error: When using propainter, both width ($width) and height ($height) must be less than 1280."
+    if (( width > 1920 || height > 1080 )); then
+        echo "Error: When using propainter, both width ($width) and height ($height) must be less than specified max values."
         exit 1
     fi
 fi
 
-# check if experiment was already run
-experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remove}_alp_${alpha}_sf_${smoothing_factor}"
-if [[ -d "experiments/${experiment_name}" ]]; then
-    echo "experiment already run"
-    exit 1
+# Run orchestrator.sh and capture the experiment_name
+experiment_name=$(./orchestrator.sh)
+
+# # CLEANING UP: if the inpainted video exists, it means the orchestrator ran successfully.
+# then delete everything about that experiment except inpainted video, 
+# otherwise keep everything for debugging.
+
+# Set paths
+EXPERIMENTS_DIR="embrace/experiments/${experiment_name}"
+HNeRV_DATA="../HneRV/data"
+HNeRV_OUTPUT="../HneRV/output/embrace"
+UFO_DATASETS="../UFO/datasets/embrace"
+UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
+
+# Check if inpainted.mp4 exists in the specific experiment folder
+if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
+  echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
+
+  # Remove everything except inpainted.mp4 in the experiments folder
+  find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
+
+  # Remove everything from the other specified folders
+  rm -rf "$HNeRV_DATA"/*
+  rm -rf "$HNeRV_OUTPUT"/*
+  rm -rf "$UFO_DATASETS"/*
+  rm -rf "$UFO_RESULTS"/*
+
+  echo "Cleanup complete."
+
+  # Launch run.sh once more
+  echo "Reaunching run.sh..."
+  ./run.sh
+else
+  echo "inpainted.mp4 not found in $experiment_name, stopping recursive execution."
 fi
 
-./orchestrator.sh "${args[@]}"
+
+
+
+#!/bin/bash
+
+# Set the paths
+EXPERIMENTS_DIR="embrace/experiments/$experiment_name"
+HNeRV_DATA="../HneRV/data"
+HNeRV_OUTPUT="../HneRV/output/embrace"
+UFO_DATASETS="../UFO/datasets/embrace"
+UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
+RUN_SCRIPT="../embrace/run.sh"
+
+# Check if inpainted.mp4 exists in the specific experiment folder
+if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
+  echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
+
+  # Remove everything except inpainted.mp4 in the experiments folder
+  find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
+
+  # Remove everything from the other specified folders
+  rm -rf "$HNeRV_DATA"/*
+  rm -rf "$HNeRV_OUTPUT"/*
+  rm -rf "$UFO_DATASETS"/*
+  rm -rf "$UFO_RESULTS"/*
+
+  echo "Cleanup complete."
+
+  # Launch run.sh once more
+  echo "Launching run.sh..."
+  $RUN_SCRIPT
+else
+  echo "inpainted.mp4 not found in $experiment_name, skipping cleanup and run.sh launch."
+fi

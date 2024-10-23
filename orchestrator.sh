@@ -23,16 +23,37 @@ function run_evca {
     local csv_path=$5
 
     # Get the number of frames in the input video using ffprobe
-    local frame_count=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$input_video_path")
+    local frame_count=$(ffprobe -v quiet -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$input_video_path")
 
-    if [[ -f $output_video_path ]]; then
-        echo "${output_video_path} already exists"
-    else
-        ffmpeg -loglevel error -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
-        cd ..
-        python3 EVCA/main.py -i "embrace/${output_video_path}" -r $resolution -b $square_size -f $frame_count -c "embrace/${csv_path}" -bi 1
-        cd embrace
-    fi
+    ffmpeg -hide_banner -loglevel error -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
+    cd ..
+    python3 EVCA/main.py -i "embrace/${output_video_path}" -r $resolution -b $square_size -f $frame_count -c "embrace/${csv_path}" -bi 1
+    cd embrace
+}
+
+scale_frames() {
+    input_folder=$1
+    width=$2
+    height=$3
+    output_folder=$4
+    
+    # Create the output folder if it doesn't exist
+    mkdir -p "$output_folder"
+
+    # Initialize a counter for renaming output frames
+    counter=0
+
+    # Loop over all image files in the input folder
+    for frame in "$input_folder"/*; do
+        formatted_counter=$(printf "%05d" "$counter") # Format the counter as 5-digit number (e.g., 00000, 00001, ...)
+        output_frame="${output_folder}/${formatted_counter}.png"  # Set output frame path with counter
+        
+        # Run ffmpeg to scale the frame and suppress console output
+        ffmpeg -hide_banner -loglevel error -i "$frame" -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" "$output_frame"
+        
+        # Increment the counter
+        counter=$((counter + 1))
+    done
 }
 
 function video_into_frames {
@@ -41,23 +62,17 @@ function video_into_frames {
     local width=$3
     local height=$4
 
-    # Check if the output directory already exists; if not, create it
-    if [[ -d "$output_dir" ]]; then
-        echo "$output_dir already exists"
-        return 1        
-    fi
-
     mkdir -p $output_dir
 
     # Construct the ffmpeg command
     if [[ -n $width && -n $height ]]; then
         # Apply scale and crop filters if width and height are provided
-        ffmpeg -loglevel error -i $input_file \
+        ffmpeg -hide_banner -loglevel error -i $input_file \
             -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" \
             -start_number 0 "$output_dir/%05d.png"
     else
         # No resizing, just extract frames
-        ffmpeg -loglevel error -i "$input_file" \
+        ffmpeg -hide_banner -loglevel error -i "$input_file" \
             -start_number 0 "$output_dir/%05d.png"
     fi
 }
@@ -67,19 +82,13 @@ function frames_into_video {
     local output_file=$2
     local bitrate=$3
 
-    # Check if the output already exists
-    if [[ -f "$output_file" ]]; then
-        echo "$output_file already exists"
-        return 1
-    fi
-
     # Determine if encoding should be lossless or not
     if [[ "$bitrate" == "lossless" ]]; then
         # Use HEVC (libx265) for lossless encoding
-        ffmpeg -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx265 -x265-params lossless=1 $output_file
+        ffmpeg -hide_banner -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -q:v 1 -pix_fmt yuv420p -c:v libx265 -x265-params lossless=1 $output_file
     else
         # Use AVC (libx264) for lossy encoding
-        ffmpeg -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -pix_fmt yuv420p -c:v libx264 -b:v $bitrate -bufsize $bitrate $output_file
+        ffmpeg -hide_banner -loglevel error -framerate 24 -i "${input_dir}/%05d.png" -pix_fmt yuv420p -c:v libx264 -b:v $bitrate -bufsize $bitrate $output_file
     fi
 }
 
@@ -160,12 +169,6 @@ function encode_with_hnerv {
     # Determine the input frames folder based on frame type
     local input_frames="data/${experiment_name}_${frame_type}"
     local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
-    # Check if the output already exists
-    if [[ -d "$output_frames" ]]; then
-        echo "$output_frames already exists"
-        cd embrace
-        return 1
-    fi
     mkdir -p "HNeRV/${input_frames}"
     cp "embrace/experiments/${experiment_name}/${frame_type}"/* "HNeRV/${input_frames}"/
     cd HNeRV
@@ -227,12 +230,6 @@ function decode_with_hnerv {
 
     cd
     local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
-    # Check if the output already exists
-    if [[ -d "$output_frames" ]]; then
-        echo "$output_frames already exists"
-        cd embrace
-        return 1
-    fi
     cd HNeRV
     local input_frames="data/${experiment_name}_${frame_type}"
     local weight_folder=$(get_last_created_directory "output/embrace/${experiment_name}_${frame_type}")
@@ -280,9 +277,6 @@ function decode_with_hnerv {
     mkdir -p $output_frames
     cp "HNeRV/${weight_folder}/visualize_model_quant"/* $output_frames/
     rename_and_cut_frames $output_frames
-    # Clean HNeRV folders
-    rm -r "HNeRV/${input_frames}"
-    rm -r "HNeRV/output/embrace/${experiment_name}_${frame_type}"
     cd embrace
 }
 
@@ -380,6 +374,7 @@ function inpaint_with_e2fgvi {
 # TODO: instead of checking the videos folder for any unprocessed videos, take as input a video path and check whether you already have its scene folder
 # TODO: we can also use image inpainting, since we have masked frames
 # TODO: to improve scene change detection, don't set a threshold but compute it by taking the rolling median of the differences in the first 2 seconds, then checking whether each new difference is much higher, if it is, that's a scene change, if not, add it to the rolling median and go on
+# TODO: silence ffmpeg
 
 # PARAMETERS
 codec_params=""
@@ -387,10 +382,14 @@ inpainter_params=""
 
 # Embrace
 video_name=$1
-video_path=$2
+raw_frames=$2
 width=$3
 height=$4
 square_size=$5
+# Check whether width and height are multiples of square_size, otherwise make them
+width=$(make_lower_multiple $width $square_size)
+height=$(make_lower_multiple $height $square_size)
+resolution="${width}x${height}"
 to_remove=$6
 alpha=$7
 smoothing_factor=$8
@@ -509,11 +508,14 @@ if [[ "$inpainter" == "e2fgvi" ]]; then
     shift 4
 fi
 
-# Check whether width and height are multiples of square_size, otherwise make them
-width=$(make_lower_multiple $width $square_size)
-height=$(make_lower_multiple $height $square_size)
+# Generate an MD5 hash and extract the first part as a shorter folder name
+experiment_name=$(echo -n "$experiment_name" | md5sum | awk '{print $1}')
 
-resolution="${width}x${height}"
+# check if experiment was already run TODO: set experiment name as an encoding to make it shorter, and add that encoding to the results.csv to be able to look it up
+if [[ -d "experiments/${experiment_name}" ]]; then
+    echo "experiment already run"
+    exit 1
+fi
 
 # Pass parameters to Python scripts
 export video_name=$video_name
@@ -533,7 +535,9 @@ server_start_time=$(date +%s)
 # resize video based on experiment resolution, save into experiment folder
 experiment_folder="experiments/${experiment_name}"
 benchmark_frames="${experiment_folder}/benchmark"
-video_into_frames $video_path $benchmark_frames $width $height
+cd ..
+scale_frames $raw_frames $width $height "embrace/${benchmark_frames}"
+cd embrace
 
 # get reference video from frames
 reference_video="${experiment_folder}/reference.mp4"
@@ -547,13 +551,13 @@ run_evca $reference_video $reference_raw $resolution $square_size $reference_com
 # generate focused masks to know what is the main object of a scene that needs to not be removed
 cd
 UFO_folder="datasets/embrace/image/${experiment_name}"
-mkdir -p UFO/${UFO_folder}
-cp -r embrace/${experiment_folder}/benchmark/* UFO/${UFO_folder}/
+mkdir -p "UFO/${UFO_folder}"
+cp -r "embrace/${experiment_folder}/benchmark"/* "UFO/${UFO_folder}"/
 cd UFO 
-python test.py --model=weights/video_best.pth --data_path=datasets/embrace/ --output_dir=VSOD_results/wo_optical_flow/embrace --task=VSOD
+python test.py --model="weights/video_best.pth" --data_path="datasets/embrace/" --output_dir="VSOD_results/wo_optical_flow/embrace" --task="VSOD"
 # copy output folder back into embrace
 cd
-mv UFO/VSOD_results/wo_optical_flow/embrace/${experiment_name} embrace/${experiment_folder}/focus_masks
+mv "UFO/VSOD_results/wo_optical_flow/embrace/${experiment_name}" "embrace/${experiment_folder}/focus_masks"
 cd embrace
 
 # run script to get smart masks and shrunk frames
@@ -561,8 +565,8 @@ python scripts/shrink_frames.py
 
 # get bitrate from shrunk size
 shrunk_frame="${experiment_folder}/shrunk/00000.png"
-shrunk_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 $shrunk_frame)
-shrunk_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 $shrunk_frame)
+shrunk_width=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=width -of csv=p=0 $shrunk_frame)
+shrunk_height=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=height -of csv=p=0 $shrunk_frame)
 bitrate=$(python scripts/calculate_bitrate.py $shrunk_width $shrunk_height)
 export bitrate=$bitrate
 
@@ -571,16 +575,30 @@ shrunk_video="${experiment_folder}/shrunk.mp4"
 shrunk_frames="${experiment_folder}/shrunk"
 benchmark_video="${experiment_folder}/benchmark.mp4"
 # Get the duration of the reference video (in seconds)
-reference_video_duration=$(ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
+reference_video_duration=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
 # Calculate encoding size based on duration and bitrate
 encoding_size=$(echo "scale=2; $reference_video_duration * $bitrate / 1024 / 1024" | bc)
 
-# Call the encoding function with HNeRV parameters if necessary
+# Add black bands (padding) if hnerv is chosen
 if [[ $codec == "hnerv" ]]; then
-    # Encode the benchmark frames with HNeRV
-    encode_with_hnerv $experiment_name "benchmark" $width $height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
-    # Encode the shrunk frames with HNeRV
-    encode_with_hnerv $experiment_name "shrunk" $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Calculate the padding required to make width and height multiples of 320 (HNeRV breaks for videos not multiple of 320x320)
+    # Calculate padding required for the width and height
+    pad_right=$(( ((width + 319) / 320) * 320 - width ))
+    pad_bottom=$(( ((height + 319) / 320) * 320 - height ))
+    shrunk_pad_right=$(( ((shrunk_width + 319) / 320) * 320 - shrunk_width ))
+    shrunk_pad_bottom=$(( ((shrunk_height + 319) / 320) * 320 - shrunk_height ))
+    # Ensure padded frames directories exist
+    mkdir -p "${experiment_folder}/benchmark_padded"
+    mkdir -p "${experiment_folder}/shrunk_padded"
+    # Pad all benchmark frames
+    ffmpeg -hide_banner -loglevel error -i "${benchmark_frames}/%05d.png" -vf "pad=iw+$pad_right:ih+$pad_bottom:0:0:black" -start_number 0 "${experiment_folder}/benchmark_padded/%05d.png"
+    # Pad all shrunk frames
+    ffmpeg -hide_banner -loglevel error -i "${shrunk_frames}/%05d.png" -vf "pad=iw+$shrunk_pad_right:ih+$shrunk_pad_bottom:0:0:black" -start_number 0 "${experiment_folder}/shrunk_padded/%05d.png"
+    # Encode the padded benchmark frames with HNeRV
+    encode_with_hnerv $experiment_name "benchmark_padded" $((width + pad_right)) $((height + pad_bottom)) $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Encode the padded shrunk frames with HNeRV
+    encode_with_hnerv $experiment_name "shrunk_padded" $((shrunk_width + shrunk_pad_right)) $((shrunk_height + shrunk_pad_bottom)) $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+
 elif [[ $codec == "avc" ]]; then
     # Get encoded video from frames
     frames_into_video $benchmark_frames $benchmark_video $bitrate
@@ -599,12 +617,21 @@ shrunk_decoded_frames="${experiment_folder}/shrunk_decoded"
 
 # Call the decoding function with HNeRV parameters if necessary
 if [[ $codec == "hnerv" ]]; then
-    # Decode the benchmark frames with HNeRV
-    decode_with_hnerv $experiment_name "benchmark" $width $height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
-    # Decode the shrunk frames with HNeRV
-    decode_with_hnerv $experiment_name "shrunk" $shrunk_width $shrunk_height $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
-    # Take frames and create benchmark_decoded on the client side
+    # Decode the benchmark NN into padded frames with HNeRV
+    decode_with_hnerv $experiment_name "benchmark_padded" $((width + pad_right)) $((height + pad_bottom)) $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+    # Decode the shrunk NN into padded frames with HNeRV
+    decode_with_hnerv $experiment_name "shrunk_padded" $((shrunk_width + shrunk_pad_right)) $((shrunk_height + shrunk_pad_bottom)) $encoding_size $ks "$enc_strds" $enc_dim $fc_hw $reduce $lower_width "$dec_strds" "$conv_type" $norm $act $workers $batchSize $epochs $lr $loss $out_bias $eval_freq $quant_model_bit $quant_embed_bit
+
+    # Ensure padded frames directories exist
+    mkdir -p $benchmark_decoded_frames
+    mkdir -p $shrunk_decoded_frames
+    # Remove black bands (crop back to original size... it would be required to send these values to the client, but we assume a real implementation would fix HNeRV and not need to pad it at all)
+    ffmpeg -hide_banner -loglevel error -i "${experiment_folder}/benchmark_padded_decoded/%05d.png" -vf "crop=${width}:${height}:0:0" -start_number 0 "${benchmark_decoded_frames}/%05d.png"
+    ffmpeg -hide_banner -loglevel error -i "${experiment_folder}/shrunk_padded_decoded/%05d.png" -vf "crop=${shrunk_width}:${shrunk_height}:0:0" -start_number 0 "${shrunk_decoded_frames}/%05d.png"
+
+    # Take frames and create benchmark video on the client side
     frames_into_video $benchmark_decoded_frames $benchmark_video "lossless"
+
 elif [[ $codec == "avc" ]]; then
     # Decode the shrunk video using AVC
     video_into_frames $shrunk_video $shrunk_decoded_frames
@@ -613,26 +640,19 @@ fi
 # STRETCHING
 
 stretched_video="${experiment_folder}/stretched.mp4"
-# Check if the stretched file already exists, if not create it
-    if [[ -f "${stretched_video}" ]]; then
-        echo "${stretched_video} already exists"
-    else
-        # run client script to get stretched frames
-        python scripts/stretch_frames.py
-        # get stretched video from frames
-        frames_into_video "${experiment_folder}/stretched" $stretched_video "lossless"
-    fi
+# run client script to get stretched frames
+python scripts/stretch_frames.py
+# get stretched video from frames
+frames_into_video "${experiment_folder}/stretched" $stretched_video "lossless"
 
 # QUALITY MEASUREMENT benchmark
 
 # compare reference with benchmark video
 benchmark_metrics="${experiment_folder}/benchmark_metrics.csv"
-# Check if the output already exists, if not create it
-if [[ -f $benchmark_metrics ]]; then
-    echo "${benchmark_metrics} already exists"
-else
-    ffmpeg-quality-metrics $benchmark_video $reference_video -m psnr ssim vmaf -of csv > "$benchmark_metrics"
-fi
+ffmpeg-quality-metrics $benchmark_video $reference_video -m psnr ssim vmaf -of csv > "$benchmark_metrics"
+
+# LPIPS
+python scripts/calculate_lpips.py "$reference_video" "$benchmark_video" "$benchmark_metrics"
 
 # INPAINTING
 
@@ -640,29 +660,23 @@ mask_frames="${experiment_folder}/decoded_masks"
 inpainted_frames="${experiment_folder}/inpainted"
 inpainted_video="${experiment_folder}/inpainted.mp4"
 
-if [[ -f "$inpainted_video" ]]; then
-    echo "$inpainted_video already exists"
-else
-    # Call the appropriate inpainting function
-    if [[ "$inpainter" == "propainter" ]]; then
-        # Call the propainter function
-        inpaint_with_propainter $stretched_video $mask_frames $inpainted_frames $inpainter_params
-    elif [[ "$inpainter" == "e2fgvi" ]]; then
-        # Call the e2fgvi function
-        inpaint_with_e2fgvi $stretched_video $mask_frames $inpainted_video $width $height $inpainter_params
-    fi
+# Call the appropriate inpainting function
+if [[ "$inpainter" == "propainter" ]]; then
+    # Call the propainter function
+    inpaint_with_propainter $stretched_video $mask_frames $inpainted_frames $inpainter_params
+elif [[ "$inpainter" == "e2fgvi" ]]; then
+    # Call the e2fgvi function
+    inpaint_with_e2fgvi $stretched_video $mask_frames $inpainted_video $width $height $inpainter_params
 fi
 
 # QUALITY MEASUREMENT INPAINTED
 
 # compare reference with inpainted video
 inpainted_metrics="${experiment_folder}/inpainted_metrics.csv"
-# Check if the output already exists, if not create it
-if [[ -f $inpainted_metrics ]]; then
-    echo "${inpainted_metrics} already exists"   
-else
-    ffmpeg-quality-metrics $inpainted_video $reference_video -m psnr ssim vmaf -of csv > "$inpainted_metrics"
-fi
+ffmpeg-quality-metrics $inpainted_video $reference_video -m psnr ssim vmaf -of csv > "$inpainted_metrics"
+
+# LPIPS
+python scripts/calculate_lpips.py "$reference_video" "$inpainted_video" "$inpainted_metrics"
 
 # calculate time elapsed
 end_time=$(date +%s)
@@ -672,11 +686,5 @@ export end_time=$end_time
 # run metrics script
 python scripts/collect_metrics.py
 
-# # CLEANING UP TODO: move to run.sh, we launch orchestrator directly only in development, so keeping this stuff is good, while in run.sh we run into storage limitation, and there we need this
-
-# # delete shrunk folder
-# rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/shrunk"
-# # delete stretched folder
-# rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/stretched"
-# # delete inpainted folder
-# rm -r "videos/${video_name}/scene_${scene_number}/"${width}x${height}"/$experiment_name/nei_${neighbor_length}_ref_${ref_stride}_sub_${subvideo_length}"
+# return experiment_name to run.sh for cleanup
+echo $experiment_name

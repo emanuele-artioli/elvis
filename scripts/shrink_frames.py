@@ -49,7 +49,7 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
         else:
             importance[i] = alpha * spatial_3d_array[i] + (1 - alpha) * temporal_3d_array[i + 1]
 
-    # Initialize the list to store coordinates of the lowest values
+    # Initialize the list to store coordinates of the highest values
     removed_values_coords = []
 
     # Load masks for each frame
@@ -68,32 +68,32 @@ def get_coordinates_to_remove(temporal_file, spatial_file, width, height, square
     # Loop through each frame
     for i in range(num_frames):
         frame_coords = []
+
+        # Adjust importance values based on the mask
+        for j in range(num_blocks_y):
+            for k in range(num_blocks_x):
+                if masks[i][j, k] == 0:
+                    # Increase importance for background blocks
+                    importance[i, j, k] *= 100
+
         # Loop through each row in the current frame
         for j in range(num_blocks_y):
-            # Get the current row
             current_row = importance[i, j, :]
 
             # Apply smoothing with the previous frame's importance
             if previous_importance is not None:
                 current_row = smoothing_factor * current_row + (1 - smoothing_factor) * previous_importance[j, :]
 
-            # Apply the mask: Only allow block removal if the corresponding mask region is black (background)
+            # Apply the mask: Only blocks that correspond to background can be easily selected based on adjusted importance
             mask_row = masks[i][j, :]  # Get the mask row
-            background_indices = np.where(mask_row == 0)[0]  # Indices where mask is black (background)
+            background_indices = np.arange(len(mask_row))  # Include all blocks in the selection
 
-            # Restrict block removal to background areas TODO: instead of this, set their importance to a very high number, so they can still be removed but only after all the rest
-            if len(background_indices) > num_blocks_to_remove:
-                indices_to_remove = background_indices[np.argsort(current_row[background_indices])[-num_blocks_to_remove:]]
-            else:
-                indices_to_remove = background_indices[np.argsort(current_row[background_indices])]
+            # Sort indices based on importance in descending order (high importance first)
+            indices_to_remove = background_indices[np.argsort(-current_row[background_indices])[:num_blocks_to_remove]]
 
             # Store the coordinates for column (frame and row given by indices)
             row_coords = [k for k in indices_to_remove]
             frame_coords.append(row_coords)
-
-            # Reduce the chance of these blocks to be removed from the next frame TODO: maybe remove this 
-            if i < num_frames - 1:
-                importance[i + 1, j, indices_to_remove] /= 2
 
         # Update previous_importance for the next iteration
         previous_importance = importance[i]

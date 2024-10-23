@@ -61,6 +61,7 @@ else:
 
 # Initialize results dictionary with basic parameters
 results_dict = {
+    'experiment_name': experiment_name,
     'video_name': video_name,
     'resolution': resolution,
     'square_size': square_size,
@@ -106,10 +107,12 @@ results_dict['mse_ori_mean'] = benchmark_means.get('mse_avg', None)
 results_dict['psnr_ori_mean'] = benchmark_means.get('psnr_avg', None)
 results_dict['ssim_ori_mean'] = benchmark_means.get('ssim_avg', None)
 results_dict['vmaf_ori_mean'] = benchmark_means.get('vmaf', None)
+results_dict['lpips_ori_mean'] = benchmark_means.get('LPIPS', None)
 results_dict['mse_inp_mean'] = inpainted_means.get('mse_avg', None)
 results_dict['psnr_inp_mean'] = inpainted_means.get('psnr_avg', None)
 results_dict['ssim_inp_mean'] = inpainted_means.get('ssim_avg', None)
 results_dict['vmaf_inp_mean'] = inpainted_means.get('vmaf', None)
+results_dict['lpips_inp_mean'] = inpainted_means.get('LPIPS', None)
 results_dict['empty'] = ''
 
 # Convert results to DataFrame

@@ -11,4 +11,4 @@ conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit
 pip install mmcv-full==1.6.2 -f https://download.openmmlab.com/mmcv/dist/cu116/torch1.12/index.html –no-cache-dir
 conda install pandas tqdm regex matplotlib
 conda install imageio tensorboard libstdcxx-ng timm
-pip install decord pytorch_msssim dahuffman pytorchvideo
+pip install decord pytorch_msssim dahuffman pytorchvideo lpips
