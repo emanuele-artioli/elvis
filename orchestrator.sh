@@ -574,13 +574,13 @@ export bitrate=$bitrate
 shrunk_video="${experiment_folder}/shrunk.mp4"
 shrunk_frames="${experiment_folder}/shrunk"
 benchmark_video="${experiment_folder}/benchmark.mp4"
-# Get the duration of the reference video (in seconds)
-reference_video_duration=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
-# Calculate encoding size based on duration and bitrate
-encoding_size=$(echo "scale=2; $reference_video_duration * $bitrate / 1024 / 1024" | bc)
 
 # Add black bands (padding) if hnerv is chosen
 if [[ $codec == "hnerv" ]]; then
+    # Get the duration of the reference video (in seconds)
+    reference_video_duration=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
+    # Calculate encoding size based on duration and bitrate
+    encoding_size=$(echo "scale=2; $reference_video_duration * $bitrate / 1024 / 1024" | bc)
     # Calculate the padding required to make width and height multiples of 320 (HNeRV breaks for videos not multiple of 320x320)
     # Calculate padding required for the width and height
     pad_right=$(( ((width + 319) / 320) * 320 - width ))
