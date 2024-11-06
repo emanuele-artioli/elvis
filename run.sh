@@ -9,10 +9,10 @@ videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-fl
         "india" "judo" "kid-football" "kite-surf" "kite-walk" "koala" "lab-coat" "lady-running" "libby" "lindy-hop"
         "loading" "longboard" "lucia" "mallard-fly" "mallard-water" "mbike-trick" "miami-surf"
 )
-widths=("960" "1280" "1600" "1920")
-heights=("540" "720" "900" "1080")
-square_sizes=("16" "32" "64") # ("16" "32" "64")
-to_remove=("0.25" "0.5" "10.0" "20.0") # ("10.0" "20.0")
+widths=("960" "1280" "1600")
+heights=("540" "720" "900")
+square_sizes=("8" "16" "32" "64") # ("16" "32" "64")
+to_remove=("0.25" "0.5" "0.75") # ("10.0" "20.0")
 alpha=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 smoothing_factor=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
 codecs=("hnerv") # ("avc" "hnerv")
@@ -217,57 +217,22 @@ UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
 
 # Check if inpainted.mp4 exists in the specific experiment folder
 if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
-  echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
+    echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
 
-  # Remove everything except inpainted.mp4 in the experiments folder
-  find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
+    # Remove everything except inpainted.mp4 in the experiments folder
+    find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
 
-  # Remove everything from the other specified folders
-  rm -rf "$HNeRV_DATA"/*
-  rm -rf "$HNeRV_OUTPUT"/*
-  rm -rf "$UFO_DATASETS"/*
-  rm -rf "$UFO_RESULTS"/*
+    # Remove everything from the other specified folders
+    rm -rf "$HNeRV_DATA"/*
+    rm -rf "$HNeRV_OUTPUT"/*
+    rm -rf "$UFO_DATASETS"/*
+    rm -rf "$UFO_RESULTS"/*
 
-  echo "Cleanup complete."
+    echo "Cleanup complete."
 
-  # Launch run.sh once more
-  echo "Reaunching run.sh..."
-  ./run.sh
+    # Launch run.sh once more
+    echo "Reaunching run.sh..."
+    ./run.sh
 else
-  echo "inpainted.mp4 not found in $experiment_name, stopping recursive execution."
-fi
-
-
-
-
-#!/bin/bash
-
-# Set the paths
-EXPERIMENTS_DIR="embrace/experiments/$experiment_name"
-HNeRV_DATA="../HneRV/data"
-HNeRV_OUTPUT="../HneRV/output/embrace"
-UFO_DATASETS="../UFO/datasets/embrace"
-UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
-RUN_SCRIPT="../embrace/run.sh"
-
-# Check if inpainted.mp4 exists in the specific experiment folder
-if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
-  echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
-
-  # Remove everything except inpainted.mp4 in the experiments folder
-  find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
-
-  # Remove everything from the other specified folders
-  rm -rf "$HNeRV_DATA"/*
-  rm -rf "$HNeRV_OUTPUT"/*
-  rm -rf "$UFO_DATASETS"/*
-  rm -rf "$UFO_RESULTS"/*
-
-  echo "Cleanup complete."
-
-  # Launch run.sh once more
-  echo "Launching run.sh..."
-  $RUN_SCRIPT
-else
-  echo "inpainted.mp4 not found in $experiment_name, skipping cleanup and run.sh launch."
+    echo "inpainted.mp4 not found in $experiment_name, stopping recursive execution."
 fi
