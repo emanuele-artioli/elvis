@@ -31,8 +31,8 @@ hnerv_params_norm=("none") # ("none" "bn" "in")
 hnerv_params_act=("relu") # ("relu" "leaky" "gelu")
 hnerv_params_workers=(16) # ("4" "8" "16" "32")
 hnerv_params_batchSize=(2 4) # ("1" "2" "4")
-hnerv_params_epochs=(30 100 300) # (10 30 100)
-hnerv_params_lr=(0.01 0.001) # (0.01 0.001 0.0001)
+hnerv_params_epochs=(50 75 100) # (10 30 100)
+hnerv_params_lr=(0.001) # (0.01 0.001 0.0001)
 hnerv_params_loss=("Fusion6") # ("Fusion6" "L2")
 hnerv_params_out_bias=("tanh") # ("tanh")
 hnerv_params_eval_freq=(1 3 10) # (5 10)
@@ -124,58 +124,6 @@ if [[ "$inpainter" == "e2fgvi" ]]; then
     args+=("$step" "$num_ref" "$neighbor_stride" "$savefps")
 fi
 
-# Run the orchestrator with the dynamically constructed arguments
-echo "Chosen parameters:"
-echo "Video Name: $video"
-echo "Raw Frames Path: $raw_frames"
-echo "Width: $width"
-echo "Height: $height"
-echo "Square Size: $square_size"
-echo "To Remove: $to_remove"
-echo "Alpha: $alpha"
-echo "Smoothing Factor: $smoothing_factor"
-echo "Codec: $codec"
-echo "Inpainter: $inpainter"
-
-# Print codec-specific parameters
-if [[ "$codec" == "hnerv" ]]; then
-    echo "ks: $ks"
-    echo "enc_strds: $enc_strds"
-    echo "enc_dim: $enc_dim"
-    echo "fc_hw: $fc_hw"
-    echo "reduce: $reduce"
-    echo "lower_width: $lower_width"
-    echo "dec_strds: $dec_strds"
-    echo "conv_type: $conv_type"
-    echo "norm: $norm"
-    echo "act: $act"
-    echo "workers: $workers"
-    echo "batchSize: $batchSize"
-    echo "epochs: $epochs"
-    echo "lr: $lr"
-    echo "loss: $loss"
-    echo "out_bias: $out_bias"
-    echo "eval_freq: $eval_freq"
-    echo "quant_model_bit: $quant_model_bit"
-    echo "quant_embed_bit: $quant_embed_bit"
-fi
-
-# Print inpainter-specific parameters
-if [[ "$inpainter" == "propainter" ]]; then
-    echo "Neighbor Length: $neighbor_length"
-    echo "Ref Stride: $ref_stride"
-    echo "Subvideo Length: $subvideo_length"
-    echo "Mask Dilation: $mask_dilation"
-    echo "Raft Iter: $raft_iter"
-fi
-
-if [[ "$inpainter" == "e2fgvi" ]]; then
-    echo "Step: $step"
-    echo "Num Ref: $num_ref"
-    echo "Neighbor Stride: $neighbor_stride"
-    echo "Save FPS: $savefps"
-fi
-
 # EXCEPTION RULES
 
 # # Check if hnerv is chosen and the product of square_size and to_remove is a multiple of 320 (otherwise HNeRV does not work)
@@ -202,16 +150,19 @@ if [[ "$inpainter" == "propainter" ]]; then
 fi
 
 # Run orchestrator.sh and capture the experiment_name
-experiment_name=$(./orchestrator.sh)
+./orchestrator.sh "${args[@]}"
+# Capture experiment_name from the file
+experiment_name=$(cat experiment_name.txt)
+rm experiment_name.txt  # Clean up the temporary file
 
 # # CLEANING UP: if the inpainted video exists, it means the orchestrator ran successfully.
 # then delete everything about that experiment except inpainted video, 
 # otherwise keep everything for debugging.
 
 # Set paths
-EXPERIMENTS_DIR="embrace/experiments/${experiment_name}"
-HNeRV_DATA="../HneRV/data"
-HNeRV_OUTPUT="../HneRV/output/embrace"
+EXPERIMENTS_DIR="experiments/${experiment_name}"
+HNeRV_DATA="../HNeRV/data"
+HNeRV_OUTPUT="../HNeRV/output/embrace"
 UFO_DATASETS="../UFO/datasets/embrace"
 UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
 
@@ -219,8 +170,8 @@ UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
 if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
     echo "inpainted.mp4 exists in $experiment_name, cleaning up..."
 
-    # Remove everything except inpainted.mp4 in the experiments folder
-    find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' -exec rm -rf {} +
+    # Remove everything except inpainted.mp4 and benchmark.mp4 in the experiments folder
+    find "$EXPERIMENTS_DIR" -mindepth 1 ! -name 'inpainted.mp4' ! -name 'benchmark.mp4' -exec rm -rf {} +
 
     # Remove everything from the other specified folders
     rm -rf "$HNeRV_DATA"/*
@@ -231,8 +182,8 @@ if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
     echo "Cleanup complete."
 
     # Launch run.sh once more
-    echo "Reaunching run.sh..."
+    echo "Relaunching run.sh..."
     ./run.sh
 else
-    echo "inpainted.mp4 not found in $experiment_name, stopping recursive execution."
+    echo "inpainted.mp4 not found in ${experiment_name}, stopping recursive execution."
 fi

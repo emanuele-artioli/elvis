@@ -1,6 +1,6 @@
 #!/bin/bash
 # source /etc/profile.d/opt-local.sh
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # SETUP
@@ -23,7 +23,7 @@ function run_evca {
     local csv_path=$5
 
     # Get the number of frames in the input video using ffprobe
-    local frame_count=$(ffprobe -v quiet -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$input_video_path")
+    local frame_count=$(ffprobe -hide_banner -loglevel error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$input_video_path")
 
     ffmpeg -hide_banner -loglevel error -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
     cd ..
@@ -367,13 +367,9 @@ function inpaint_with_e2fgvi {
 
 # TODO: drop simple frames by passing full masks, so there is also some frame interpolation
 # TODO: those different ways of calculating the mask, could be good to make into alternatives and compare them
-# TODO: add LPIPS from tests into the pipeline
-# TODO: implement row and column block selection
-# TODO: implement HNeRV as inpainter
+# TODO: implement column block selection
 # TODO: instead of server and client time, collect inpainting time
-# TODO: instead of checking the videos folder for any unprocessed videos, take as input a video path and check whether you already have its scene folder
 # TODO: we can also use image inpainting, since we have masked frames
-# TODO: to improve scene change detection, don't set a threshold but compute it by taking the rolling median of the differences in the first 2 seconds, then checking whether each new difference is much higher, if it is, that's a scene change, if not, add it to the rolling median and go on
 # TODO: silence ffmpeg
 
 # PARAMETERS
@@ -401,12 +397,12 @@ experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remo
 shift 10
 
 # avc
-if [[ "$codec" == "avc" ]]; then
+if [[ "${codec}" == "avc" ]]; then
     experiment_name+="_avc"
 fi
 
 # hnerv
-if [[ "$codec" == "hnerv" ]]; then
+if [[ "${codec}" == "hnerv" ]]; then
     ks=$1
     enc_strds=$2
     enc_dim=$3
@@ -461,7 +457,7 @@ if [[ "$codec" == "hnerv" ]]; then
 fi
 
 # propainter
-if [[ "$inpainter" == "propainter" ]]; then
+if [[ "${inpainter}" == "propainter" ]]; then
     neighbor_length=$1
     ref_stride=$2
     subvideo_length=$3
@@ -486,7 +482,7 @@ if [[ "$inpainter" == "propainter" ]]; then
 fi
 
 # e2fgvi
-if [[ "$inpainter" == "e2fgvi" ]]; then
+if [[ "${inpainter}" == "e2fgvi" ]]; then
     step=$1
     num_ref=$2
     neighbor_stride=$3
@@ -517,6 +513,59 @@ if [[ -d "experiments/${experiment_name}" ]]; then
     exit 1
 fi
 
+# Print embrace-speecific parameters
+echo "Running EMBRACE with parameters:"
+echo "Video Name: ${video_name}"
+echo "Raw Frames Path: ${raw_frame}"
+echo "Resolution: ${resolution}"
+echo "Square Size: ${square_size}"
+echo "To Remove: ${to_remove}"
+echo "Alpha: ${alpha}"
+echo "Smoothing Factor: ${smoothing_factor}"
+echo "Codec: ${codec}"
+echo "Inpainter: ${inpainter}"
+echo "Experiment name: ${experiment_name}"
+
+# Print hnerv-specific parameters
+if [[ "$codec" == "hnerv" ]]; then
+    echo "ks: ${ks}"
+    echo "enc_strds: ${enc_strds}"
+    echo "enc_dim: ${enc_dim}"
+    echo "fc_hw: ${fc_hw}"
+    echo "reduce: ${reduce}"
+    echo "lower_width: ${lower_width}"
+    echo "dec_strds: ${dec_strds}"
+    echo "conv_type: ${conv_type}"
+    echo "norm: ${norm}"
+    echo "act: ${act}"
+    echo "workers: ${workers}"
+    echo "batchSize: ${batchSize}"
+    echo "epochs: ${epochs}"
+    echo "lr: ${lr}"
+    echo "loss: ${loss}"
+    echo "out_bias: ${out_bias}"
+    echo "eval_freq: ${eval_freq}"
+    echo "quant_model_bit: ${quant_model_bit}"
+    echo "quant_embed_bit: ${quant_embed_bit}"
+fi
+
+# Print propainter-specific parameters
+if [[ "$inpainter" == "propainter" ]]; then
+    echo "Neighbor Length: ${neighbor_length}"
+    echo "Ref Stride: ${ref_stride}"
+    echo "Subvideo Length: ${subvideo_length}"
+    echo "Mask Dilation: ${mask_dilation}"
+    echo "Raft Iter: ${raft_iter}"
+fi
+
+# Print e2fgvi-specific parameters
+if [[ "$inpainter" == "e2fgvi" ]]; then
+    echo "Step: ${step}"
+    echo "Num Ref: ${num_ref}"
+    echo "Neighbor Stride: ${neighbor_stride}"
+    echo "Save FPS: ${savefps}"
+fi
+
 # Pass parameters to Python scripts
 export video_name=$video_name
 export resolution=$resolution
@@ -533,22 +582,39 @@ export inpainter=$inpainter
 server_start_time=$(date +%s)
 
 # resize video based on experiment resolution, save into experiment folder
+echo "Scaling frames to required resolution..."
+# task_start_time=$(date +%s)
 experiment_folder="experiments/${experiment_name}"
 benchmark_frames="${experiment_folder}/benchmark"
 cd ..
 scale_frames $raw_frames $width $height "embrace/${benchmark_frames}"
 cd embrace
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # get reference video from frames
+echo "Encoding reference video..."
+# task_start_time=$(date +%s)
 reference_video="${experiment_folder}/reference.mp4"
 frames_into_video $benchmark_frames $reference_video "lossless"
+# task_end_time=$(date +%s)
+# # task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # calculate scene complexities
+echo "Calculating scene complexity with EVCA..."
+# task_start_time=$(date +%s)
 reference_raw="${experiment_folder}/reference.yuv"
 reference_complexity="${experiment_folder}/complexity/reference.csv"
 run_evca $reference_video $reference_raw $resolution $square_size $reference_complexity
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # generate focused masks to know what is the main object of a scene that needs to not be removed
+echo "Generating focus masks with UFO..."
+# task_start_time=$(date +%s)
 cd
 UFO_folder="datasets/embrace/image/${experiment_name}"
 mkdir -p "UFO/${UFO_folder}"
@@ -559,9 +625,17 @@ python test.py --model="weights/video_best.pth" --data_path="datasets/embrace/" 
 cd
 mv "UFO/VSOD_results/wo_optical_flow/embrace/${experiment_name}" "embrace/${experiment_folder}/focus_masks"
 cd embrace
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # run script to get smart masks and shrunk frames
+echo "Shrinking frames..."
+# task_start_time=$(date +%s)
 python scripts/shrink_frames.py
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # get bitrate from shrunk size
 shrunk_frame="${experiment_folder}/shrunk/00000.png"
@@ -571,11 +645,13 @@ bitrate=$(python scripts/calculate_bitrate.py $shrunk_width $shrunk_height)
 export bitrate=$bitrate
 
 # ENCODING
+echo "Encoding video with ${codec}..."
+# task_start_time=$(date +%s)
+
 shrunk_video="${experiment_folder}/shrunk.mp4"
 shrunk_frames="${experiment_folder}/shrunk"
 benchmark_video="${experiment_folder}/benchmark.mp4"
 
-# Add black bands (padding) if hnerv is chosen
 if [[ $codec == "hnerv" ]]; then
     # Get the duration of the reference video (in seconds)
     reference_video_duration=$(ffprobe -hide_banner -loglevel error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 $reference_video)
@@ -606,11 +682,18 @@ elif [[ $codec == "avc" ]]; then
     frames_into_video $shrunk_frames $shrunk_video $bitrate
 fi
 
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
+
 # CLIENT SIDE
 
 client_start_time=$(date +%s)
 
 # DECODING
+
+echo "Decoding video with ${codec}..."
+# task_start_time=$(date +%s)
 
 benchmark_decoded_frames="${experiment_folder}/benchmark_decoded"
 shrunk_decoded_frames="${experiment_folder}/shrunk_decoded"
@@ -637,13 +720,24 @@ elif [[ $codec == "avc" ]]; then
     video_into_frames $shrunk_video $shrunk_decoded_frames
 fi
 
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
+
 # STRETCHING
+
+echo "Stretching frames..."
+# task_start_time=$(date +%s)
 
 stretched_video="${experiment_folder}/stretched.mp4"
 # run client script to get stretched frames
 python scripts/stretch_frames.py
 # get stretched video from frames
 frames_into_video "${experiment_folder}/stretched" $stretched_video "lossless"
+
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # QUALITY MEASUREMENT benchmark
 
@@ -655,6 +749,9 @@ ffmpeg-quality-metrics $benchmark_video $reference_video -m psnr ssim vmaf -of c
 python scripts/calculate_lpips.py "$reference_video" "$benchmark_video" "$benchmark_metrics"
 
 # INPAINTING
+
+echo "Inpainting videos with ${inpainter}..."
+# task_start_time=$(date +%s)
 
 mask_frames="${experiment_folder}/decoded_masks"
 inpainted_frames="${experiment_folder}/inpainted"
@@ -669,7 +766,14 @@ elif [[ "$inpainter" == "e2fgvi" ]]; then
     inpaint_with_e2fgvi $stretched_video $mask_frames $inpainted_video $width $height $inpainter_params
 fi
 
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
+
 # QUALITY MEASUREMENT INPAINTED
+
+echo "Evaluating video quality..."
+# task_start_time=$(date +%s)
 
 # compare reference with inpainted video
 inpainted_metrics="${experiment_folder}/inpainted_metrics.csv"
@@ -677,6 +781,10 @@ ffmpeg-quality-metrics $inpainted_video $reference_video -m psnr ssim vmaf -of c
 
 # LPIPS
 python scripts/calculate_lpips.py "$reference_video" "$inpainted_video" "$inpainted_metrics"
+
+# task_end_time=$(date +%s)
+# task_duration=$(( task_end_time - task_start_time ))
+# echo "Task completed in ${task_duration} seconds."
 
 # calculate time elapsed
 end_time=$(date +%s)
@@ -687,4 +795,5 @@ export end_time=$end_time
 python scripts/collect_metrics.py
 
 # return experiment_name to run.sh for cleanup
-echo $experiment_name
+echo "$experiment_name" > experiment_name.txt
+echo "Experiment completed."
