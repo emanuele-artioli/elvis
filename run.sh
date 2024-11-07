@@ -9,8 +9,8 @@ videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-fl
         "india" "judo" "kid-football" "kite-surf" "kite-walk" "koala" "lab-coat" "lady-running" "libby" "lindy-hop"
         "loading" "longboard" "lucia" "mallard-fly" "mallard-water" "mbike-trick" "miami-surf"
 )
-widths=("960" "1280" "1600")
-heights=("540" "720" "900")
+widths=("640" "960" "1280" "1600")
+heights=("360" "540" "720" "900")
 square_sizes=("8" "16" "32" "64") # ("16" "32" "64")
 to_remove=("0.25" "0.5" "0.75") # ("10.0" "20.0")
 alpha=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
@@ -35,7 +35,7 @@ hnerv_params_epochs=(50 75 100) # (10 30 100)
 hnerv_params_lr=(0.001) # (0.01 0.001 0.0001)
 hnerv_params_loss=("Fusion6") # ("Fusion6" "L2")
 hnerv_params_out_bias=("tanh") # ("tanh")
-hnerv_params_eval_freq=(1 3 10) # (5 10)
+hnerv_params_eval_freq=(5 10 25) # (5 10)
 hnerv_params_quant_model_bit=(8) # (6 8 10)
 hnerv_params_quant_embed_bit=(6) # (6)
 
