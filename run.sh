@@ -9,13 +9,13 @@ videos=("bear" "bike-packing" "blackswan" "bmx-bumps" "bmx-trees" "breakdance-fl
         "india" "judo" "kid-football" "kite-surf" "kite-walk" "koala" "lab-coat" "lady-running" "libby" "lindy-hop"
         "loading" "longboard" "lucia" "mallard-fly" "mallard-water" "mbike-trick" "miami-surf"
 )
-widths=("640" "960" "1280" "1600")
-heights=("360" "540" "720" "900")
-square_sizes=("16" "32") # ("16" "32" "64")
-to_remove=("0.25" "0.5" "10.0" "20.0") # ("10.0" "20.0")
-alpha=("0.25" "0.5" "0.75") # ("0.0" "0.25" "0.5" "0.75" "1.0")
-smoothing_factor=("0.25" "0.5" "0.75") # ("0.0" "0.25" "0.5" "0.75" "1.0")
-codecs=("avc" "hnerv") # ("avc" "hnerv")
+widths=("960" "1280" "1600")
+heights=("540" "720" "900")
+square_sizes=("8" "16" "32" "64") # ("16" "32" "64")
+to_remove=("0.25" "0.5" "0.75") # ("10.0" "20.0")
+alpha=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
+smoothing_factor=("0.0" "0.5" "1.0") # ("0.0" "0.25" "0.5" "0.75" "1.0")
+codecs=("hnerv") # ("avc" "hnerv")
 inpainters=("propainter" "e2fgvi") # ("propainter" "e2fgvi")
 
 # Define parameters for each codec
@@ -42,7 +42,7 @@ hnerv_params_quant_embed_bit=(6) # (6)
 propainter_params_neighbor_length=(8 16 24) # (8 16 24)
 propainter_params_ref_stride=(2 4) # (2 4)
 propainter_params_subvideo_length=(24 48) # (24 48)
-propainter_params_mask_dilation=(0 2 4) # (0)
+propainter_params_mask_dilation=(0 4 8) # (0)
 propainter_params_raft_iter=(3 10 30) # (10 30 100)
 
 e2fgvi_params_step=(5 10) # (5 10)
