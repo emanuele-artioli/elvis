@@ -42,7 +42,7 @@ hnerv_params_quant_embed_bit=(6) # (6)
 propainter_params_neighbor_length=(8 16 24) # (8 16 24)
 propainter_params_ref_stride=(2 4) # (2 4)
 propainter_params_subvideo_length=(24 48) # (24 48)
-propainter_params_mask_dilation=(0 2 4) # (0)
+propainter_params_mask_dilation=(0 4 8) # (0)
 propainter_params_raft_iter=(3 10 30) # (10 30 100)
 
 e2fgvi_params_step=(5 10) # (5 10)
