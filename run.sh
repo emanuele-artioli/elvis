@@ -162,9 +162,9 @@ rm experiment_name.txt  # Clean up the temporary file
 # Set paths
 EXPERIMENTS_DIR="experiments/${experiment_name}"
 HNeRV_DATA="../HNeRV/data"
-HNeRV_OUTPUT="../HNeRV/output/embrace"
-UFO_DATASETS="../UFO/datasets/embrace"
-UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/embrace"
+HNeRV_OUTPUT="../HNeRV/output/elvis"
+UFO_DATASETS="../UFO/datasets/elvis"
+UFO_RESULTS="../UFO/VSOD_results/wo_optical_flow/elvis"
 
 # Check if inpainted.mp4 exists in the specific experiment folder
 if [ -f "$EXPERIMENTS_DIR/inpainted.mp4" ]; then
