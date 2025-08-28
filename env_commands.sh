@@ -3,8 +3,8 @@
 
 conda clean –all
 pip cache purge
-conda create -n embrace python=3.8
-conda activate embrace
+conda create -n elvis python=3.8
+conda activate elvis
 conda clean –all
 pip cache purge
 conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 -c pytorch -c conda-forge

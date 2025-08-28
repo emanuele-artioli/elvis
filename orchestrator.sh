@@ -27,8 +27,8 @@ function run_evca {
 
     ffmpeg -hide_banner -loglevel error -i $input_video_path -c:v rawvideo -pix_fmt yuv420p $output_video_path
     cd ..
-    python3 EVCA/main.py -i "embrace/${output_video_path}" -r $resolution -b $square_size -f $frame_count -c "embrace/${csv_path}" -bi 1
-    cd embrace
+    python3 EVCA/main.py -i "elvis/${output_video_path}" -r $resolution -b $square_size -f $frame_count -c "elvis/${csv_path}" -bi 1
+    cd elvis
 }
 
 scale_frames() {
@@ -168,14 +168,14 @@ function encode_with_hnerv {
     cd ..
     # Determine the input frames folder based on frame type
     local input_frames="data/${experiment_name}_${frame_type}"
-    local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
+    local output_frames="elvis/experiments/${experiment_name}/${frame_type}_decoded"
     mkdir -p "HNeRV/${input_frames}"
-    cp "embrace/experiments/${experiment_name}/${frame_type}"/* "HNeRV/${input_frames}"/
+    cp "elvis/experiments/${experiment_name}/${frame_type}"/* "HNeRV/${input_frames}"/
     cd HNeRV
 
     # Use HNeRV to encode the video
     python train_nerv_all.py \
-        --outf embrace \
+        --outf elvis \
         --data_path $input_frames \
         --vid "${experiment_name}_${frame_type}" \
         --crop_list "${shrunk_height}_${shrunk_width}" \
@@ -199,7 +199,7 @@ function encode_with_hnerv {
         --eval_freq $eval_freq \
         --overwrite
 
-    cd ../embrace
+    cd ../elvis
 }
 
 function decode_with_hnerv {
@@ -229,10 +229,10 @@ function decode_with_hnerv {
     local quant_embed_bit=${24}
 
     cd
-    local output_frames="embrace/experiments/${experiment_name}/${frame_type}_decoded"
+    local output_frames="elvis/experiments/${experiment_name}/${frame_type}_decoded"
     cd HNeRV
     local input_frames="data/${experiment_name}_${frame_type}"
-    local weight_folder=$(get_last_created_directory "output/embrace/${experiment_name}_${frame_type}")
+    local weight_folder=$(get_last_created_directory "output/elvis/${experiment_name}_${frame_type}")
     local model_weights="${weight_folder}/model_latest.pth"
     local quantized_weights="${weight_folder}/quant_vid.pth"
     # encoding sizes
@@ -244,7 +244,7 @@ function decode_with_hnerv {
 
     # Use HNeRV to decode the video
     python train_nerv_all.py \
-        --outf embrace \
+        --outf elvis \
         --data_path $input_frames \
         --vid "${experiment_name}_${frame_type}" \
         --crop_list "${shrunk_height}_${shrunk_width}" \
@@ -272,12 +272,12 @@ function decode_with_hnerv {
         --weight $model_weights \
         --dump_images
 
-    # Move frames back into the embrace folder and rename them
+    # Move frames back into the elvis folder and rename them
     cd ..
     mkdir -p $output_frames
     cp "HNeRV/${weight_folder}/visualize_model_quant"/* $output_frames/
     rename_and_cut_frames $output_frames
-    cd embrace
+    cd elvis
 }
 
 function inpaint_with_propainter {
@@ -290,9 +290,9 @@ function inpaint_with_propainter {
     local mask_dilation=$7
     local raft_iter=$8
 
-    local stretched_video="embrace/${stretched_video}"
-    local mask_frames="embrace/${mask_frames}/"
-    local inpainted_frames="embrace/${inpainted_frames}"
+    local stretched_video="elvis/${stretched_video}"
+    local mask_frames="elvis/${mask_frames}/"
+    local inpainted_frames="elvis/${inpainted_frames}"
 
     cd ..
     cp $stretched_video "ProPainter/inputs/video_completion/stretched.mp4"
@@ -320,7 +320,7 @@ function inpaint_with_propainter {
 
     # Get inpainted video from frames
     frames_into_video $inpainted_frames "${inpainted_frames}.mp4" "lossless"
-    cd embrace
+    cd elvis
 }
 
 function inpaint_with_e2fgvi {
@@ -334,9 +334,9 @@ function inpaint_with_e2fgvi {
     local neighbor_stride=$8
     local savefps=$9
 
-    local stretched_video="embrace/${stretched_video}"
-    local mask_frames="embrace/${mask_frames}"
-    local inpainted_video="embrace/${inpainted_video}"
+    local stretched_video="elvis/${stretched_video}"
+    local mask_frames="elvis/${mask_frames}"
+    local inpainted_video="elvis/${inpainted_video}"
 
     cd ..
     cp $stretched_video "E2FGVI/examples/stretched.mp4"
@@ -362,7 +362,7 @@ function inpaint_with_e2fgvi {
     mv -f "E2FGVI/results/stretched_results.mp4" $inpainted_video
     rm "E2FGVI/examples/stretched.mp4"
     rm -r "E2FGVI/examples/stretched_masks/"
-    cd embrace
+    cd elvis
 }
 
 # TODO: drop simple frames by passing full masks, so there is also some frame interpolation
@@ -376,7 +376,7 @@ function inpaint_with_e2fgvi {
 codec_params=""
 inpainter_params=""
 
-# Embrace
+# ELVIS
 video_name=$1
 raw_frames=$2
 width=$3
@@ -393,7 +393,7 @@ codec=$9
 inpainter=${10}
 # Initialize the experiment_name with common parameters
 experiment_name="${video_name}_${width}x${height}_ss_${square_size}_tr_${to_remove}_alp_${alpha}_sf_${smoothing_factor}"
-# Shift off embrace's parameters
+# Shift off elvis's parameters
 shift 10
 
 # avc
@@ -513,8 +513,8 @@ if [[ -d "experiments/${experiment_name}" ]]; then
     exit 1
 fi
 
-# Print embrace-speecific parameters
-echo "Running EMBRACE with parameters:"
+# Print elvis-speecific parameters
+echo "Running ELVIS with parameters:"
 echo "Video Name: ${video_name}"
 echo "Raw Frames Path: ${raw_frame}"
 echo "Resolution: ${resolution}"
@@ -587,8 +587,8 @@ echo "Scaling frames to required resolution..."
 experiment_folder="experiments/${experiment_name}"
 benchmark_frames="${experiment_folder}/benchmark"
 cd ..
-scale_frames $raw_frames $width $height "embrace/${benchmark_frames}"
-cd embrace
+scale_frames $raw_frames $width $height "elvis/${benchmark_frames}"
+cd elvis
 # task_end_time=$(date +%s)
 # task_duration=$(( task_end_time - task_start_time ))
 # echo "Task completed in ${task_duration} seconds."
@@ -616,15 +616,15 @@ run_evca $reference_video $reference_raw $resolution $square_size $reference_com
 echo "Generating focus masks with UFO..."
 # task_start_time=$(date +%s)
 cd
-UFO_folder="datasets/embrace/image/${experiment_name}"
+UFO_folder="datasets/elvis/image/${experiment_name}"
 mkdir -p "UFO/${UFO_folder}"
-cp -r "embrace/${experiment_folder}/benchmark"/* "UFO/${UFO_folder}"/
+cp -r "elvis/${experiment_folder}/benchmark"/* "UFO/${UFO_folder}"/
 cd UFO 
-python test.py --model="weights/video_best.pth" --data_path="datasets/embrace/" --output_dir="VSOD_results/wo_optical_flow/embrace" --task="VSOD"
-# copy output folder back into embrace
+python test.py --model="weights/video_best.pth" --data_path="datasets/elvis/" --output_dir="VSOD_results/wo_optical_flow/elvis" --task="VSOD"
+# copy output folder back into elvis
 cd
-mv "UFO/VSOD_results/wo_optical_flow/embrace/${experiment_name}" "embrace/${experiment_folder}/focus_masks"
-cd embrace
+mv "UFO/VSOD_results/wo_optical_flow/elvis/${experiment_name}" "elvis/${experiment_folder}/focus_masks"
+cd elvis
 # task_end_time=$(date +%s)
 # task_duration=$(( task_end_time - task_start_time ))
 # echo "Task completed in ${task_duration} seconds."
