@@ -1,0 +1,38 @@
+# cd elvis && conda env create -f environment.yml && conda activate elvis2 && mim install mmcv==2.1.0 mmdet==3.2.0 mmpose==1.3.2 mmpretrain
+name: elvis2
+channels:
+  - nvidia/label/cuda-12.4.0
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # Core
+  - python=3.10
+  - pip
+
+  # Pytorch and CUDA (Using 12.4 for better compatibility)
+  - pytorch>=2.6.0
+  - torchvision>=0.21.0
+  - torchaudio>=2.6.0
+  - pytorch-cuda=12.4
+  - cuda
+  - cudatoolkit
+
+  - pandas 
+  - tqdm 
+  - regex 
+  - matplotlib
+  - imageio
+  - tensorboard
+  - libstdcxx-ng
+  - timm
+  - openmim
+  - pywavelets
+
+  - pip:
+    - decord 
+    - pytorch_msssim
+    - dahuffman
+    - pytorchvideo
+    - lpips

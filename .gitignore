@@ -165,3 +165,6 @@ old/
 tests/
 results.csv
 experiments/
+reference*
+evca*/
+UFO*/
