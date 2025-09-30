@@ -783,9 +783,386 @@ def parse_ssim_from_output(output: str) -> float:
     except (ValueError, IndexError):
         return 0.0
 
-def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, framerate: float, width: int, height: int, temp_dir: str) -> None:
+def calculate_blockwise_ssim(ref_frame: np.ndarray, test_frame: np.ndarray, block_size: int) -> np.ndarray:
+    """
+    Calculate SSIM for each block in a frame.
+    
+    Args:
+        ref_frame: Reference frame (H, W, C)
+        test_frame: Test frame (H, W, C)
+        block_size: Size of each block
+        
+    Returns:
+        2D array of SSIM values for each block
+    """
+    from skimage.metrics import structural_similarity as ssim
+    
+    height, width = ref_frame.shape[:2]
+    num_blocks_y = height // block_size
+    num_blocks_x = width // block_size
+    
+    ssim_blocks = np.zeros((num_blocks_y, num_blocks_x))
+    
+    for i in range(num_blocks_y):
+        for j in range(num_blocks_x):
+            y1 = i * block_size
+            x1 = j * block_size
+            y2 = min(y1 + block_size, height)
+            x2 = min(x1 + block_size, width)
+            
+            ref_block = ref_frame[y1:y2, x1:x2]
+            test_block = test_frame[y1:y2, x1:x2]
+            
+            # Convert to grayscale if needed
+            if len(ref_block.shape) == 3:
+                ref_block = cv2.cvtColor(ref_block, cv2.COLOR_BGR2GRAY)
+                test_block = cv2.cvtColor(test_block, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate SSIM for this block
+            try:
+                ssim_value = ssim(ref_block, test_block, data_range=255)
+                ssim_blocks[i, j] = ssim_value
+            except:
+                ssim_blocks[i, j] = 0.0
+    
+    return ssim_blocks
+
+def calculate_blockwise_psnr(ref_frame: np.ndarray, test_frame: np.ndarray, block_size: int) -> np.ndarray:
+    """
+    Calculate PSNR for each block in a frame.
+    
+    Args:
+        ref_frame: Reference frame (H, W, C)
+        test_frame: Test frame (H, W, C)
+        block_size: Size of each block
+        
+    Returns:
+        2D array of PSNR values for each block
+    """
+    height, width = ref_frame.shape[:2]
+    num_blocks_y = height // block_size
+    num_blocks_x = width // block_size
+    
+    psnr_blocks = np.zeros((num_blocks_y, num_blocks_x))
+    
+    for i in range(num_blocks_y):
+        for j in range(num_blocks_x):
+            y1 = i * block_size
+            x1 = j * block_size
+            y2 = min(y1 + block_size, height)
+            x2 = min(x1 + block_size, width)
+            
+            ref_block = ref_frame[y1:y2, x1:x2].astype(np.float64)
+            test_block = test_frame[y1:y2, x1:x2].astype(np.float64)
+            
+            # Calculate MSE
+            mse = np.mean((ref_block - test_block) ** 2)
+            
+            if mse == 0:
+                psnr_blocks[i, j] = 100.0  # Cap at 100 dB instead of infinity
+            elif mse < 1e-10:  # Very small MSE
+                psnr_blocks[i, j] = 100.0
+            else:
+                psnr_value = 20 * np.log10(255.0 / np.sqrt(mse))
+                psnr_blocks[i, j] = min(psnr_value, 100.0)  # Cap at 100 dB
+    
+    return psnr_blocks
+
+def create_quality_heatmaps(reference_frames_dir: str, encoded_videos: dict, masks_dir: str, 
+                           square_size: int, width: int, height: int, temp_dir: str, 
+                           sample_frames: List[int] = [0, 20, 40]) -> None:
+    """
+    Create heatmaps showing quality differences across frames for visualization.
+    
+    Args:
+        reference_frames_dir: Directory containing reference frames
+        encoded_videos: Dictionary mapping video names to file paths
+        masks_dir: Directory containing UFO masks
+        square_size: Size of blocks used for analysis
+        width: Video width
+        height: Video height
+        temp_dir: Temporary directory for intermediate files
+        sample_frames: List of frame indices to analyze
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        
+        print(f"\nCreating quality heatmaps for sample frames: {sample_frames}")
+        
+        # Create heatmaps directory
+        heatmaps_dir = os.path.join(temp_dir, "quality_heatmaps")
+        os.makedirs(heatmaps_dir, exist_ok=True)
+        
+        # Create temporary directories for decoded frames
+        decoded_frames_dir = os.path.join(temp_dir, "decoded_frames")
+        
+        for video_name, video_path in encoded_videos.items():
+            if not os.path.exists(video_path):
+                continue
+                
+            # Create directory for this video's decoded frames
+            video_decoded_dir = os.path.join(decoded_frames_dir, video_name.replace(" ", "_"))
+            os.makedirs(video_decoded_dir, exist_ok=True)
+            
+            # Decode video to frames
+            decode_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-i", video_path,
+                "-q:v", "2",
+                "-y", f"{video_decoded_dir}/%05d.jpg"
+            ]
+            
+            subprocess.run(decode_cmd, capture_output=True, text=True)
+            
+            # Process sample frames
+            for frame_idx in sample_frames:
+                try:
+                    # Load reference and decoded frames
+                    ref_frame_path = os.path.join(reference_frames_dir, f"{frame_idx+1:05d}.jpg")
+                    decoded_frame_path = os.path.join(video_decoded_dir, f"{frame_idx+1:05d}.jpg")
+                    
+                    if not os.path.exists(ref_frame_path) or not os.path.exists(decoded_frame_path):
+                        continue
+                        
+                    ref_frame = cv2.imread(ref_frame_path)
+                    decoded_frame = cv2.imread(decoded_frame_path)
+                    ref_frame = cv2.resize(ref_frame, (width, height))
+                    decoded_frame = cv2.resize(decoded_frame, (width, height))
+                    
+                    # Load UFO mask
+                    mask_path = os.path.join(masks_dir, f"{frame_idx+1:05d}.png")
+                    if not os.path.exists(mask_path):
+                        continue
+                        
+                    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Calculate block-wise quality metrics
+                    ssim_blocks = calculate_blockwise_ssim(ref_frame, decoded_frame, square_size)
+                    psnr_blocks = calculate_blockwise_psnr(ref_frame, decoded_frame, square_size)
+                    
+                    # Create visualization
+                    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+                    fig.suptitle(f'{video_name} - Frame {frame_idx+1}', fontsize=16)
+                    
+                    # Original frame
+                    axes[0, 0].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
+                    axes[0, 0].set_title('Reference Frame')
+                    axes[0, 0].axis('off')
+                    
+                    # Decoded frame
+                    axes[0, 1].imshow(cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2RGB))
+                    axes[0, 1].set_title('Encoded Frame')
+                    axes[0, 1].axis('off')
+                    
+                    # UFO mask overlay
+                    mask_colored = np.zeros((height, width, 3), dtype=np.uint8)
+                    mask_colored[mask > 128] = [255, 0, 0]  # Red for foreground
+                    mask_colored[mask <= 128] = [0, 0, 255]  # Blue for background
+                    
+                    overlay = cv2.addWeighted(ref_frame, 0.7, mask_colored, 0.3, 0)
+                    axes[0, 2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+                    axes[0, 2].set_title('UFO Mask (Red=FG, Blue=BG)')
+                    axes[0, 2].axis('off')
+                    
+                    # SSIM heatmap
+                    im1 = axes[1, 0].imshow(ssim_blocks, cmap='viridis', vmin=0, vmax=1)
+                    axes[1, 0].set_title(f'SSIM Blocks (Mean: {np.mean(ssim_blocks):.3f})')
+                    plt.colorbar(im1, ax=axes[1, 0])
+                    
+                    # PSNR heatmap (cap very high values for visualization)
+                    psnr_capped = np.clip(psnr_blocks, 0, 50)
+                    im2 = axes[1, 1].imshow(psnr_capped, cmap='viridis', vmin=0, vmax=50)
+                    axes[1, 1].set_title(f'PSNR Blocks (Mean: {np.mean(psnr_blocks[np.isfinite(psnr_blocks)]):.1f} dB)')
+                    plt.colorbar(im2, ax=axes[1, 1])
+                    
+                    # Quality difference overlay on original
+                    num_blocks_y, num_blocks_x = ssim_blocks.shape
+                    axes[1, 2].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
+                    
+                    # Overlay quality blocks with transparency
+                    for i in range(num_blocks_y):
+                        for j in range(num_blocks_x):
+                            y1 = i * square_size
+                            x1 = j * square_size
+                            y2 = min(y1 + square_size, height)
+                            x2 = min(x1 + square_size, width)
+                            
+                            ssim_val = ssim_blocks[i, j]
+                            if ssim_val < 0.5:  # Poor quality
+                                color = 'red'
+                                alpha = 0.6
+                            elif ssim_val < 0.7:  # Medium quality
+                                color = 'yellow'
+                                alpha = 0.4
+                            else:  # Good quality
+                                continue  # Don't highlight good quality blocks
+                                
+                            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                                   linewidth=0, edgecolor='none', 
+                                                   facecolor=color, alpha=alpha)
+                            axes[1, 2].add_patch(rect)
+                    
+                    axes[1, 2].set_title('Quality Overlay (Red=Poor, Yellow=Medium)')
+                    axes[1, 2].axis('off')
+                    
+                    # Save the figure
+                    safe_video_name = video_name.replace(" ", "_").replace("/", "_")
+                    output_path = os.path.join(heatmaps_dir, f'{safe_video_name}_frame_{frame_idx+1:03d}.png')
+                    plt.savefig(output_path, dpi=1500, bbox_inches='tight')
+                    plt.close()
+                    
+                except Exception as e:
+                    print(f"Error creating heatmap for {video_name} frame {frame_idx+1}: {e}")
+                    continue
+        
+        print(f"Quality heatmaps saved to: {heatmaps_dir}")
+        
+        # Clean up decoded frames
+        shutil.rmtree(decoded_frames_dir, ignore_errors=True)
+        
+    except ImportError:
+        print("Matplotlib not available - skipping quality heatmap generation")
+    except Exception as e:
+        print(f"Error creating quality heatmaps: {e}")
+
+def analyze_foreground_background_quality(reference_frames_dir: str, encoded_videos: dict, masks_dir: str, 
+                                         square_size: int, width: int, height: int, temp_dir: str) -> dict:
+    """
+    Analyze video quality separately for foreground and background regions using UFO masks.
+    
+    Args:
+        reference_frames_dir: Directory containing reference frames
+        encoded_videos: Dictionary mapping video names to file paths
+        masks_dir: Directory containing UFO masks
+        square_size: Size of blocks used for analysis
+        width: Video width
+        height: Video height
+        temp_dir: Temporary directory for intermediate files
+        
+    Returns:
+        Dictionary containing detailed quality analysis results
+    """
+    print(f"\nAnalyzing foreground/background quality separately...")
+    
+    results = {}
+    
+    # Create temporary directories for decoded frames
+    decoded_frames_dir = os.path.join(temp_dir, "decoded_frames")
+    
+    for video_name, video_path in encoded_videos.items():
+        if not os.path.exists(video_path):
+            print(f"Warning: Video file not found: {video_path}")
+            continue
+            
+        print(f"Processing {video_name}...")
+        
+        # Create directory for this video's decoded frames
+        video_decoded_dir = os.path.join(decoded_frames_dir, video_name.replace(" ", "_"))
+        os.makedirs(video_decoded_dir, exist_ok=True)
+        
+        # Decode video to frames
+        decode_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-i", video_path,
+            "-q:v", "2",
+            "-y", f"{video_decoded_dir}/%05d.jpg"
+        ]
+        
+        result = subprocess.run(decode_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Failed to decode {video_name}: {result.stderr}")
+            continue
+        
+        # Get list of reference and decoded frames
+        ref_frames = sorted([f for f in os.listdir(reference_frames_dir) if f.endswith('.jpg')])
+        decoded_frames = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.jpg')])
+        
+        num_frames = min(len(ref_frames), len(decoded_frames))
+        
+        # Initialize quality metrics storage
+        fg_ssim_values = []
+        bg_ssim_values = []
+        fg_psnr_values = []
+        bg_psnr_values = []
+        
+        num_blocks_y = height // square_size
+        num_blocks_x = width // square_size
+        
+        for frame_idx in range(num_frames):
+            # Load reference and decoded frames
+            ref_frame_path = os.path.join(reference_frames_dir, ref_frames[frame_idx])
+            decoded_frame_path = os.path.join(video_decoded_dir, decoded_frames[frame_idx])
+            
+            ref_frame = cv2.imread(ref_frame_path)
+            decoded_frame = cv2.imread(decoded_frame_path)
+            
+            if ref_frame is None or decoded_frame is None:
+                continue
+                
+            # Resize frames to ensure consistent dimensions
+            ref_frame = cv2.resize(ref_frame, (width, height))
+            decoded_frame = cv2.resize(decoded_frame, (width, height))
+            
+            # Load corresponding UFO mask
+            mask_path = os.path.join(masks_dir, f"{frame_idx+1:05d}.png")
+            if not os.path.exists(mask_path):
+                print(f"Warning: Mask not found for frame {frame_idx+1}")
+                continue
+                
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            
+            # Downsample mask to block resolution
+            block_mask = cv2.resize(mask, (num_blocks_x, num_blocks_y), interpolation=cv2.INTER_NEAREST)
+            
+            # Calculate block-wise quality metrics
+            ssim_blocks = calculate_blockwise_ssim(ref_frame, decoded_frame, square_size)
+            psnr_blocks = calculate_blockwise_psnr(ref_frame, decoded_frame, square_size)
+            
+            # Separate foreground and background blocks
+            # UFO mask: 255 = foreground, 0 = background
+            fg_mask = block_mask > 128  # Foreground blocks
+            bg_mask = block_mask <= 128  # Background blocks
+            
+            # Extract quality values for foreground and background
+            if np.any(fg_mask):
+                fg_ssim_values.extend(ssim_blocks[fg_mask].flatten())
+                fg_psnr_values.extend(psnr_blocks[fg_mask].flatten())
+            
+            if np.any(bg_mask):
+                bg_ssim_values.extend(ssim_blocks[bg_mask].flatten())
+                bg_psnr_values.extend(psnr_blocks[bg_mask].flatten())
+        
+        # Calculate statistics
+        results[video_name] = {
+            'foreground': {
+                'ssim_mean': np.mean(fg_ssim_values) if fg_ssim_values else 0.0,
+                'ssim_std': np.std(fg_ssim_values) if fg_ssim_values else 0.0,
+                'psnr_mean': np.mean([p for p in fg_psnr_values if np.isfinite(p)]) if fg_psnr_values else 0.0,
+                'psnr_std': np.std([p for p in fg_psnr_values if np.isfinite(p)]) if fg_psnr_values else 0.0,
+                'block_count': len(fg_ssim_values)
+            },
+            'background': {
+                'ssim_mean': np.mean(bg_ssim_values) if bg_ssim_values else 0.0,
+                'ssim_std': np.std(bg_ssim_values) if bg_ssim_values else 0.0,
+                'psnr_mean': np.mean([p for p in bg_psnr_values if np.isfinite(p)]) if bg_psnr_values else 0.0,
+                'psnr_std': np.std([p for p in bg_psnr_values if np.isfinite(p)]) if bg_psnr_values else 0.0,
+                'block_count': len(bg_ssim_values)
+            },
+            'file_size_mb': os.path.getsize(video_path) / (1024 * 1024)
+        }
+    
+    # Clean up decoded frames
+    shutil.rmtree(decoded_frames_dir, ignore_errors=True)
+    
+    return results
+
+def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, framerate: float, width: int, height: int, temp_dir: str, square_size: int = 16) -> None:
     """
     Compare quality metrics between multiple encoded videos and display results.
+    Now includes foreground/background analysis.
     
     Args:
         reference_frames_dir: Directory containing reference frames
@@ -794,10 +1171,11 @@ def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, fr
         width: Video width
         height: Video height
         temp_dir: Temporary directory for intermediate files
+        square_size: Size of blocks for foreground/background analysis
     """
     print(f"\nCalculating quality metrics for all encoding approaches...")
     
-    # Calculate quality metrics for all videos
+    # Calculate overall quality metrics for all videos
     quality_results = {}
     file_sizes = {}
     
@@ -817,10 +1195,10 @@ def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, fr
             print(f"Warning: Video file not found: {video_path}")
             quality_results[video_name] = {"psnr": 0.0, "ssim": 0.0}
             file_sizes[video_name] = 0.0
-    
-    # Display comparison results
+
+    # Display overall comparison results
     print(f"\n{'='*80}")
-    print(f"{'ENCODING QUALITY COMPARISON':^80}")
+    print(f"{'OVERALL ENCODING QUALITY COMPARISON':^80}")
     print(f"{'='*80}")
     
     # Header
@@ -849,9 +1227,254 @@ def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, fr
     
     print(f"{'-'*80}")
     
-    # Show detailed comparisons between methods
+    # Foreground/Background Analysis
+    masks_dir = os.path.join(temp_dir, "UFO_masks")
+    if os.path.exists(masks_dir) and os.listdir(masks_dir):
+        print(f"\nPerforming foreground/background quality analysis...")
+        
+        # Get number of frames for heatmap generation
+        ref_frames = [f for f in os.listdir(reference_frames_dir) if f.endswith('.jpg')]
+        num_frames = len(ref_frames)
+        
+        try:
+            # Check if scikit-image is available for SSIM calculation
+            import_result = subprocess.run(["python", "-c", "from skimage.metrics import structural_similarity"], 
+                                         capture_output=True, text=True)
+            if import_result.returncode != 0:
+                print("Installing scikit-image for block-wise SSIM calculation...")
+                subprocess.run(["pip", "install", "scikit-image"], check=True)
+            
+            fg_bg_results = analyze_foreground_background_quality(
+                reference_frames_dir=reference_frames_dir,
+                encoded_videos=encoded_videos,
+                masks_dir=masks_dir,
+                square_size=square_size,
+                width=width,
+                height=height,
+                temp_dir=temp_dir
+            )
+            
+            # Create quality heatmaps for visual analysis
+            create_quality_heatmaps(
+                reference_frames_dir=reference_frames_dir,
+                encoded_videos=encoded_videos,
+                masks_dir=masks_dir,
+                square_size=square_size,
+                width=width,
+                height=height,
+                temp_dir=temp_dir,
+                sample_frames=[0, num_frames//4, num_frames//2, 3*num_frames//4, num_frames-1] if num_frames > 5 else [0, num_frames//2, num_frames-1]
+            )
+            
+            # Display foreground/background results
+            print(f"\n{'='*100}")
+            print(f"{'FOREGROUND / BACKGROUND QUALITY ANALYSIS':^100}")
+            print(f"{'='*100}")
+            
+            print(f"{'Method':<20} {'Region':<12} {'SSIM':<12} {'PSNR (dB)':<12} {'Blocks':<10} {'Quality/MB':<12}")
+            print(f"{'-'*100}")
+            
+            for video_name, results in fg_bg_results.items():
+                fg_data = results['foreground']
+                bg_data = results['background']
+                file_size = results['file_size_mb']
+                
+                # Foreground metrics
+                fg_quality_per_mb = fg_data['ssim_mean'] / file_size if file_size > 0 else 0
+                print(f"{video_name:<20} {'Foreground':<12} {fg_data['ssim_mean']:<12.4f} {fg_data['psnr_mean']:<12.2f} {fg_data['block_count']:<10} {fg_quality_per_mb:<12.4f}")
+                
+                # Background metrics
+                bg_quality_per_mb = bg_data['ssim_mean'] / file_size if file_size > 0 else 0
+                print(f"{'':<20} {'Background':<12} {bg_data['ssim_mean']:<12.4f} {bg_data['psnr_mean']:<12.2f} {bg_data['block_count']:<10} {bg_quality_per_mb:<12.4f}")
+                print(f"{'-'*100}")
+            
+            # Calculate and display relative improvements
+            if len(fg_bg_results) > 1:
+                baseline_name = list(fg_bg_results.keys())[0]
+                baseline_fg = fg_bg_results[baseline_name]['foreground']
+                baseline_bg = fg_bg_results[baseline_name]['background']
+                
+                print(f"\nFOREGROUND / BACKGROUND TRADE-OFF ANALYSIS:")
+                print(f"{'='*80}")
+                
+                for video_name in list(fg_bg_results.keys())[1:]:
+                    results = fg_bg_results[video_name]
+                    fg_data = results['foreground']
+                    bg_data = results['background']
+                    
+                    # Calculate relative changes
+                    fg_ssim_change = ((fg_data['ssim_mean'] / baseline_fg['ssim_mean']) - 1) * 100 if baseline_fg['ssim_mean'] > 0 else 0
+                    bg_ssim_change = ((bg_data['ssim_mean'] / baseline_bg['ssim_mean']) - 1) * 100 if baseline_bg['ssim_mean'] > 0 else 0
+                    fg_psnr_change = fg_data['psnr_mean'] - baseline_fg['psnr_mean']
+                    bg_psnr_change = bg_data['psnr_mean'] - baseline_bg['psnr_mean']
+                    
+                    print(f"\n{video_name} vs {baseline_name}:")
+                    print(f"  Foreground SSIM change: {fg_ssim_change:+.2f}%")
+                    print(f"  Background SSIM change: {bg_ssim_change:+.2f}%")
+                    print(f"  Foreground PSNR change: {fg_psnr_change:+.2f} dB")
+                    print(f"  Background PSNR change: {bg_psnr_change:+.2f} dB")
+                    
+                    # Determine if trade-off is favorable
+                    if fg_ssim_change > 0 and bg_ssim_change < 0:
+                        trade_off_ratio = abs(fg_ssim_change) / abs(bg_ssim_change) if bg_ssim_change != 0 else float('inf')
+                        print(f"  Trade-off ratio (FG gain / BG loss): {trade_off_ratio:.2f}")
+                        if trade_off_ratio > 1.0:
+                            print(f"  ✓ Favorable trade-off: Foreground improvement outweighs background degradation")
+                        else:
+                            print(f"  ✗ Unfavorable trade-off: Background degradation outweighs foreground improvement")
+                    elif fg_ssim_change > 0 and bg_ssim_change >= 0:
+                        print(f"  ✓ Ideal result: Both foreground and background improved")
+                    elif fg_ssim_change <= 0 and bg_ssim_change < 0:
+                        print(f"  ✗ Poor result: Both foreground and background degraded")
+                    else:
+                        print(f"  ? Mixed result: Foreground degraded but background improved")
+        
+        except Exception as e:
+            print(f"Error in foreground/background analysis: {e}")
+            print("Continuing with overall quality analysis only...")
+    else:
+        print("UFO masks not found - skipping foreground/background analysis")
+
+def print_comprehensive_summary(fg_bg_results: dict, overall_results: dict, file_sizes: dict) -> None:
+    """
+    Print a comprehensive summary and recommendations based on the analysis.
+    
+    Args:
+        fg_bg_results: Results from foreground/background analysis
+        overall_results: Overall quality results
+        file_sizes: File sizes in MB
+    """
+    print(f"\n{'='*100}")
+    print(f"{'COMPREHENSIVE ANALYSIS SUMMARY AND RECOMMENDATIONS':^100}")
+    print(f"{'='*100}")
+    
+    if len(fg_bg_results) < 2:
+        print("Insufficient data for comparison.")
+        return
+        
+    baseline_name = list(fg_bg_results.keys())[0]
+    adaptive_name = list(fg_bg_results.keys())[1]
+    
+    baseline_fg = fg_bg_results[baseline_name]['foreground']
+    baseline_bg = fg_bg_results[baseline_name]['background']
+    adaptive_fg = fg_bg_results[adaptive_name]['foreground']
+    adaptive_bg = fg_bg_results[adaptive_name]['background']
+    
+    baseline_size = file_sizes[baseline_name]
+    adaptive_size = file_sizes[adaptive_name]
+    
+    # Calculate metrics
+    fg_ssim_improvement = ((adaptive_fg['ssim_mean'] / baseline_fg['ssim_mean']) - 1) * 100
+    bg_ssim_degradation = ((adaptive_bg['ssim_mean'] / baseline_bg['ssim_mean']) - 1) * 100
+    fg_psnr_improvement = adaptive_fg['psnr_mean'] - baseline_fg['psnr_mean']
+    bg_psnr_degradation = adaptive_bg['psnr_mean'] - baseline_bg['psnr_mean']
+    size_increase = ((adaptive_size / baseline_size) - 1) * 100
+    
+    # Overall quality change
+    overall_psnr_change = overall_results[adaptive_name]['psnr'] - overall_results[baseline_name]['psnr']
+    overall_ssim_change = overall_results[adaptive_name]['ssim'] - overall_results[baseline_name]['ssim']
+    
+    print(f"\n📊 KEY METRICS COMPARISON:")
+    print(f"   • File Size: {baseline_size:.2f} MB → {adaptive_size:.2f} MB ({size_increase:+.1f}%)")
+    print(f"   • Overall PSNR: {overall_results[baseline_name]['psnr']:.2f} dB → {overall_results[adaptive_name]['psnr']:.2f} dB ({overall_psnr_change:+.2f} dB)")
+    print(f"   • Overall SSIM: {overall_results[baseline_name]['ssim']:.4f} → {overall_results[adaptive_name]['ssim']:.4f} ({overall_ssim_change:+.4f})")
+    
+    print(f"\n🎯 FOREGROUND (IMPORTANT OBJECTS) ANALYSIS:")
+    print(f"   • SSIM: {baseline_fg['ssim_mean']:.4f} → {adaptive_fg['ssim_mean']:.4f} ({fg_ssim_improvement:+.1f}%)")
+    print(f"   • PSNR: {baseline_fg['psnr_mean']:.2f} dB → {adaptive_fg['psnr_mean']:.2f} dB ({fg_psnr_improvement:+.2f} dB)")
+    print(f"   • Block Count: {baseline_fg['block_count']:,} blocks")
+    
+    print(f"\n🌅 BACKGROUND ANALYSIS:")
+    print(f"   • SSIM: {baseline_bg['ssim_mean']:.4f} → {adaptive_bg['ssim_mean']:.4f} ({bg_ssim_degradation:+.1f}%)")
+    print(f"   • PSNR: {baseline_bg['psnr_mean']:.2f} dB → {adaptive_bg['psnr_mean']:.2f} dB ({bg_psnr_degradation:+.2f} dB)")
+    print(f"   • Block Count: {baseline_bg['block_count']:,} blocks")
+    
+    # Calculate perceptual weights (foreground is typically more important)
+    fg_weight = 0.7  # 70% weight for foreground
+    bg_weight = 0.3  # 30% weight for background
+    
+    weighted_ssim_change = (fg_ssim_improvement * fg_weight) + (bg_ssim_degradation * bg_weight)
+    weighted_psnr_change = (fg_psnr_improvement * fg_weight) + (bg_psnr_degradation * bg_weight)
+    
+    print(f"\n⚖️  PERCEPTUAL TRADE-OFF ANALYSIS (FG:70%, BG:30%):")
+    print(f"   • Weighted SSIM Change: {weighted_ssim_change:+.2f}%")
+    print(f"   • Weighted PSNR Change: {weighted_psnr_change:+.2f} dB")
+    
+    # Efficiency analysis
+    fg_blocks_ratio = baseline_fg['block_count'] / (baseline_fg['block_count'] + baseline_bg['block_count'])
+    bg_blocks_ratio = baseline_bg['block_count'] / (baseline_fg['block_count'] + baseline_bg['block_count'])
+    
+    print(f"\n📈 EFFICIENCY ANALYSIS:")
+    print(f"   • Foreground Coverage: {fg_blocks_ratio*100:.1f}% of total blocks")
+    print(f"   • Background Coverage: {bg_blocks_ratio*100:.1f}% of total blocks")
+    print(f"   • Bitrate Allocation: {size_increase:+.1f}% increase for {fg_ssim_improvement:+.1f}% FG improvement")
+    
+    # Recommendations
+    print(f"\n💡 RECOMMENDATIONS:")
+    
+    if weighted_ssim_change > 0:
+        print(f"   ✅ POSITIVE: The adaptive encoding provides a net perceptual benefit")
+        if fg_ssim_improvement > 15:
+            print(f"   ✅ EXCELLENT: Foreground improvement ({fg_ssim_improvement:+.1f}%) is substantial")
+        elif fg_ssim_improvement > 5:
+            print(f"   ✅ GOOD: Foreground improvement ({fg_ssim_improvement:+.1f}%) is meaningful")
+        else:
+            print(f"   ⚠️  MODEST: Foreground improvement ({fg_ssim_improvement:+.1f}%) is small")
+    else:
+        print(f"   ❌ NEGATIVE: The adaptive encoding reduces overall perceptual quality")
+    
+    if abs(bg_ssim_degradation) < 10:
+        print(f"   ✅ ACCEPTABLE: Background degradation ({bg_ssim_degradation:+.1f}%) is minimal")
+    elif abs(bg_ssim_degradation) < 20:
+        print(f"   ⚠️  MODERATE: Background degradation ({bg_ssim_degradation:+.1f}%) is noticeable")
+    else:
+        print(f"   ❌ SIGNIFICANT: Background degradation ({bg_ssim_degradation:+.1f}%) is substantial")
+    
+    if size_increase < 5:
+        print(f"   ✅ EFFICIENT: Bitrate increase ({size_increase:+.1f}%) is minimal")
+    elif size_increase < 15:
+        print(f"   ⚠️  MODERATE: Bitrate increase ({size_increase:+.1f}%) is acceptable")
+    else:
+        print(f"   ❌ EXPENSIVE: Bitrate increase ({size_increase:+.1f}%) is significant")
+    
+    # Overall recommendation
+    print(f"\n🏆 OVERALL RECOMMENDATION:")
+    
+    if weighted_ssim_change > 5 and size_increase < 15:
+        print(f"   🌟 HIGHLY RECOMMENDED: Adaptive encoding provides excellent quality/bitrate trade-off")
+    elif weighted_ssim_change > 0 and size_increase < 25:
+        print(f"   ✅ RECOMMENDED: Adaptive encoding provides good perceptual benefits")
+    elif weighted_ssim_change > -5:
+        print(f"   ⚠️  CONDITIONAL: Consider adaptive encoding only if foreground quality is critical")
+    else:
+        print(f"   ❌ NOT RECOMMENDED: Adaptive encoding degrades overall quality too much")
+    
+    # Technical suggestions
+    print(f"\n🔧 TECHNICAL SUGGESTIONS:")
+    if fg_ssim_improvement < 10:
+        print(f"   • Consider increasing ROI quantization contrast (higher qoffset range)")
+        print(f"   • Verify UFO mask accuracy - low foreground improvement may indicate poor object detection")
+    
+    if abs(bg_ssim_degradation) > 25:
+        print(f"   • Reduce background quantization penalty to limit quality loss")
+        print(f"   • Consider selective background filtering instead of aggressive quantization")
+    
+    if size_increase > 20:
+        print(f"   • Reduce target bitrate or adjust rate control parameters")
+        print(f"   • Implement more aggressive background compression")
+    
+    print(f"\n📁 ANALYSIS ARTIFACTS:")
+    print(f"   • Quality heatmaps: experiment/quality_heatmaps/")
+    print(f"   • UFO masks: experiment/UFO_masks/")
+    print(f"   • Encoded videos: experiment/*.mp4")
+    
+    print(f"\n{'='*100}")
+
+    # Show detailed overall comparisons between methods
     if len(encoded_videos) > 1:
-        print(f"\nDetailed Comparisons (vs {reference_name}):")
+        print(f"\n{'='*80}")
+        print(f"DETAILED OVERALL COMPARISONS (vs {reference_name}):")
+        print(f"{'='*80}")
         ref_psnr = quality_results[reference_name]["psnr"]
         ref_ssim = quality_results[reference_name]["ssim"]
         ref_size = file_sizes[reference_name]
@@ -871,6 +1494,10 @@ def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, fr
             print(f"  SSIM difference: {ssim_diff:+.4f}")
             print(f"  Size ratio: {size_ratio:.2f}x")
             print(f"  Size change: {-size_reduction:+.1f}%")
+    
+    # Print comprehensive summary if foreground/background analysis was performed
+    if 'fg_bg_results' in locals():
+        print_comprehensive_summary(fg_bg_results, quality_results, file_sizes)
     
     print(f"\n{'='*80}")
 
@@ -1043,9 +1670,10 @@ compare_encoding_quality(
     framerate=framerate,
     width=width,
     height=height,
-    temp_dir=experiment_dir
+    temp_dir=experiment_dir,
+    square_size=square_size
 )
 
 end = time.time()
-print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
+print(f"Quality comparison completed in {end - start:.2f} seconds.\n")
 

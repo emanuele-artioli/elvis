@@ -33,6 +33,7 @@ dependencies:
   - conda-forge::openmim
   - conda-forge::pywavelets
   - conda-forge::opencv
+  - conda-forge::matplotlib
 
   - pip:
     - decord 
