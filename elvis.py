@@ -470,27 +470,37 @@ def encode_with_av1_qp_maps(input_frames_dir: str, output_video: str, qp_map_fil
     """
     print("Encoding with AV1 using proper QP maps...")
     
-    # Try SVT-AV1 first (best AV1 encoder with QP map support)
+    # Try SVT-AV1 first (more advanced QP control)
     try:
-        # Create QP delta file for SVT-AV1
-        qp_delta_file = os.path.join(os.path.dirname(output_video), "qp_deltas.txt")
+        print("Trying SVT-AV1 with adaptive QP...")
         
-        with open(qp_delta_file, 'w') as f:
-            for frame_idx, qp_map_file in enumerate(qp_map_files):
-                qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-                avg_qp = int(np.mean(qp_map))
-                qp_delta = avg_qp - 32  # Relative to base QP
-                f.write(f"{frame_idx} {qp_delta}\n")
+        # Calculate frame-level QP values from QP maps
+        frame_qps = []
+        for qp_map_file in qp_map_files:
+            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+            avg_qp = int(np.mean(qp_map))
+            # Clamp to valid range for SVT-AV1
+            avg_qp = max(15, min(50, avg_qp))
+            frame_qps.append(avg_qp)
         
-        # Use SVT-AV1 with adaptive quantization
+        # Create QP file for SVT-AV1
+        qp_file = os.path.join(os.path.dirname(output_video), "svt_qp_values.txt")
+        with open(qp_file, 'w') as f:
+            for frame_idx, qp in enumerate(frame_qps):
+                f.write(f"{frame_idx}\t{qp}\n")
+        
+        # Use SVT-AV1 with frame-level QP control
+        base_qp = int(np.mean(frame_qps))
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
             "-framerate", str(framerate),
             "-i", f"{input_frames_dir}/%05d.jpg",
             "-c:v", "libsvtav1",
-            "-crf", "32",
+            "-rc", "cqp",
+            "-qp", str(base_qp),
             "-preset", "6",
             "-g", "240",
+            "-keyint_min", "23",
             "-y", output_video
         ]
         
@@ -504,25 +514,31 @@ def encode_with_av1_qp_maps(input_frames_dir: str, output_video: str, qp_map_fil
     except Exception as e:
         print(f"SVT-AV1 encoding failed: {e}")
     
-    # Fallback to aomenc (libaom-av1) with simpler approach
+    # Fallback to libaom-av1 with adaptive quantization
     try:
         print("Trying libaom-av1 with adaptive quantization...")
         
-        # Calculate adaptive CRF based on average QP
-        first_qp_map = np.fromfile(qp_map_files[0], dtype=np.float32).reshape(height, width)
-        avg_qp = int(np.mean(first_qp_map))
-        adaptive_crf = max(20, min(50, avg_qp))
+        # Calculate adaptive CRF based on QP distribution
+        all_qps = []
+        for qp_map_file in qp_map_files:
+            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+            all_qps.extend(qp_map.flatten())
         
-        # Use AV1 with adaptive CRF and strong AQ
+        # Use median QP as CRF and enable strong adaptive quantization
+        median_qp = int(np.median(all_qps))
+        adaptive_crf = max(20, min(50, median_qp))
+        
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
             "-framerate", str(framerate),
             "-i", f"{input_frames_dir}/%05d.jpg",
             "-c:v", "libaom-av1",
             "-crf", str(adaptive_crf),
+            "-aq-mode", "3",  # Enable variance-based adaptive quantization
             "-cpu-used", "4",
             "-row-mt", "1",
             "-tiles", "2x2",
+            "-g", "240",
             "-y", output_video
         ]
         
@@ -538,186 +554,14 @@ def encode_with_av1_qp_maps(input_frames_dir: str, output_video: str, qp_map_fil
         print(f"AV1 encoding completely failed: {e}")
         raise
 
-def encode_with_vvc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
-    """
-    Encode video with VVC (H.266) using QP maps.
-    
-    Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        qp_map_files: List of QP map file paths
-        framerate: Video framerate
-        width: Video width
-        height: Video height
-    """
-    print("Encoding with VVC (H.266) using QP maps...")
-    
-    # Try VVenC (Fraunhofer VVC encoder)
-    try:
-        # Create QP file for VVenC
-        qp_file = os.path.join(os.path.dirname(output_video), "vvc_qp_values.txt")
-        
-        with open(qp_file, 'w') as f:
-            for frame_idx, qp_map_file in enumerate(qp_map_files):
-                qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-                avg_qp = int(np.mean(qp_map))
-                f.write(f"{frame_idx} {avg_qp}\n")
-        
-        # Use VVenC with QP file
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-framerate", str(framerate),
-            "-i", f"{input_frames_dir}/%05d.jpg",
-            "-c:v", "libvvenc",
-            "-qp", "32",
-            "-preset", "medium",
-            "-y", output_video
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print("VVenC encoding with QP maps completed successfully")
-            return
-        else:
-            print(f"VVenC failed: {result.stderr}")
-            raise RuntimeError("VVC encoding failed")
-    
-    except Exception as e:
-        print(f"VVC encoding failed: {e}")
-        raise
 
-def encode_with_vp9_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
-    """
-    Encode video with VP9 using proper segmentation-based QP maps.
-    
-    Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        qp_map_files: List of QP map file paths
-        framerate: Video framerate
-        width: Video width
-        height: Video height
-    """
-    print("Encoding with VP9 using segmentation-based QP control...")
-    
-    # VP9 supports up to 8 segments with different QP deltas
-    first_qp_map = np.fromfile(qp_map_files[0], dtype=np.float32).reshape(height, width)
-    qp_levels = np.linspace(np.min(first_qp_map), np.max(first_qp_map), 8)
-    
-    # Calculate QP deltas for segments
-    base_qp = 32
-    qp_deltas = [int(qp - base_qp) for qp in qp_levels]
-    
-    # Create segment map
-    segment_map = np.digitize(first_qp_map, qp_levels) - 1
-    segment_map = np.clip(segment_map, 0, 7)
-    
-    # Use VP9 with segmentation
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(framerate),
-        "-i", f"{input_frames_dir}/%05d.jpg",
-        "-c:v", "libvpx-vp9",
-        "-crf", "32",
-        "-b:v", "0",
-        "-aq-mode", "3",
-        "-speed", "2",
-        "-y", output_video
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        print("VP9 encoding with segmentation completed successfully")
-    else:
-        print(f"VP9 encoding failed: {result.stderr}")
-        raise RuntimeError("VP9 encoding failed")
 
-def encode_with_hevc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
-    """
-    Encode video with HEVC (H.265) using QP maps.
-    
-    Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        qp_map_files: List of QP map file paths
-        framerate: Video framerate
-        width: Video width
-        height: Video height
-    """
-    print("Encoding with HEVC using QP maps...")
-    
-    # Create QP file for x265
-    qp_file = os.path.join(os.path.dirname(output_video), "hevc_qp_values.txt")
-    
-    with open(qp_file, 'w') as f:
-        for frame_idx, qp_map_file in enumerate(qp_map_files):
-            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-            avg_qp = int(np.mean(qp_map))
-            f.write(f"{frame_idx} {avg_qp}\n")
-    
-    # Use x265 with QP file and adaptive quantization
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(framerate),
-        "-i", f"{input_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-x265-params", f"qpfile={qp_file}:aq-mode=3:aq-strength=1.5:qp-adaptation-range=20",
-        "-preset", "medium",
-        "-y", output_video
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        print("x265 HEVC encoding with QP maps completed successfully")
-    else:
-        print(f"HEVC encoding failed: {result.stderr}")
-        raise RuntimeError("HEVC encoding failed")
 
-def encode_with_avc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
-    """
-    Encode video with AVC (H.264) using QP maps.
-    
-    Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        qp_map_files: List of QP map file paths
-        framerate: Video framerate
-        width: Video width
-        height: Video height
-    """
-    print("Encoding with AVC using QP maps...")
-    
-    # Create QP file for x264
-    qp_file = os.path.join(os.path.dirname(output_video), "avc_qp_values.txt")
-    
-    with open(qp_file, 'w') as f:
-        for frame_idx, qp_map_file in enumerate(qp_map_files):
-            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-            avg_qp = int(np.mean(qp_map))
-            f.write(f"{frame_idx} {avg_qp}\n")
-    
-    # Use x264 with QP file
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(framerate),
-        "-i", f"{input_frames_dir}/%05d.jpg",
-        "-c:v", "libx264",
-        "-qpfile", qp_file,
-        "-preset", "medium",
-        "-y", output_video
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        print("x264 AVC encoding with QP maps completed successfully")
-    else:
-        print(f"AVC encoding failed: {result.stderr}")
-        raise RuntimeError("AVC encoding failed")
+
 
 def encode_with_adaptive_qp(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, temp_dir: str = ".") -> None:
     """
-    Encode video with adaptive QP using proper QP maps.
-    Priority order: AV1 → VVC → VP9 → HEVC → AVC
+    Encode video with adaptive QP using AV1.
     
     Args:
         input_frames_dir: Directory containing input frames
@@ -749,29 +593,9 @@ def encode_with_adaptive_qp(input_frames_dir: str, output_video: str, removabili
     
     print(f"Saved {len(qp_map_files)} QP map files")
     
-    # Try encoding with codecs in priority order: AV1 → VVC → VP9 → HEVC → AVC
-    codecs_to_try = [
-        ("AV1", encode_with_av1_qp_maps),
-        ("VVC", encode_with_vvc_qp_maps),
-        ("VP9", encode_with_vp9_qp_maps),
-        ("HEVC", encode_with_hevc_qp_maps),
-        ("AVC", encode_with_avc_qp_maps)
-    ]
-    
-    for codec_name, encode_func in codecs_to_try:
-        try:
-            print(f"Attempting encoding with {codec_name}...")
-            encode_func(input_frames_dir, output_video, qp_map_files, framerate, width, height)
-            print(f"Successfully encoded with {codec_name}")
-            break
-        except Exception as e:
-            print(f"{codec_name} encoding failed: {e}")
-            if codec_name == "AVC":  # Last codec in the list
-                print("All encoding methods failed!")
-                raise RuntimeError("No codec was able to encode with QP maps")
-            else:
-                print(f"Falling back to next codec...")
-                continue
+    # Encode with AV1
+    encode_with_av1_qp_maps(input_frames_dir, output_video, qp_map_files, framerate, width, height)
+    print("Successfully encoded with AV1")
     
     # Clean up QP map files
     shutil.rmtree(qp_maps_dir, ignore_errors=True)
