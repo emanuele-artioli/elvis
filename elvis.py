@@ -122,7 +122,7 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
 
         # Load masks and adjust removability scores
         for i in range(num_frames):
-            mask_path = os.path.join(ufo_masks_abs, f"{i:05d}.png")
+            mask_path = os.path.join(ufo_masks_abs, f"{i+1:05d}.png")
             if os.path.exists(mask_path):
                 mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                 # Resize mask to match the block grid dimensions
