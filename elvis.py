@@ -386,15 +386,406 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
     
     return final_block
 
+def generate_qp_map_from_scores(removability_scores: np.ndarray, square_size: int, width: int, height: int, base_qp: int = 23, qp_range: int = 20) -> np.ndarray:
+    """
+    Generate QP maps for x264/x265 encoding based on removability scores.
+    
+    Args:
+        removability_scores: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
+        square_size: Size of each block in pixels
+        width: Video width
+        height: Video height
+        base_qp: Base QP value (default: 23)
+        qp_range: Range of QP adjustment (default: 20)
+        
+    Returns:
+        4D numpy array of shape (num_frames, height, width) containing QP values for each pixel
+    """
+    num_frames, num_blocks_y, num_blocks_x = removability_scores.shape
+    
+    # Create QP maps at full resolution
+    qp_maps = np.zeros((num_frames, height, width), dtype=np.float32)
+    
+    for frame_idx in range(num_frames):
+        frame_scores = removability_scores[frame_idx]
+        
+        # Normalize scores to [0, 1] range
+        normalized_scores = normalize_array(frame_scores)
+        
+        # Convert scores to QP values
+        # Higher removability score = higher QP (lower quality)
+        # Lower removability score = lower QP (higher quality)
+        qp_values = base_qp + (normalized_scores * qp_range)
+        
+        # Clip QP values to valid range [0, 51] for x264/x265
+        qp_values = np.clip(qp_values, 0, 51)
+        
+        # Map block-level QP values to pixel-level
+        for block_y in range(num_blocks_y):
+            for block_x in range(num_blocks_x):
+                y1 = block_y * square_size
+                x1 = block_x * square_size
+                y2 = min(y1 + square_size, height)
+                x2 = min(x1 + square_size, width)
+                
+                qp_maps[frame_idx, y1:y2, x1:x2] = qp_values[block_y, block_x]
+    
+    return qp_maps
+
+def save_qp_maps_as_files(qp_maps: np.ndarray, output_dir: str) -> List[str]:
+    """
+    Save QP maps as binary files that can be read by x264/x265.
+    
+    Args:
+        qp_maps: 3D array of shape (num_frames, height, width)
+        output_dir: Directory to save QP map files
+        
+    Returns:
+        List of QP map file paths
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    qp_map_files = []
+    num_frames, height, width = qp_maps.shape
+    
+    for frame_idx in range(num_frames):
+        # Save as binary file (float32 format)
+        qp_file = os.path.join(output_dir, f"qp_map_{frame_idx:05d}.qpmap")
+        qp_maps[frame_idx].astype(np.float32).tofile(qp_file)
+        qp_map_files.append(qp_file)
+    
+    return qp_map_files
+
+def encode_with_av1_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+    """
+    Encode video with AV1 using proper QP maps via SVT-AV1 or aomenc.
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        qp_map_files: List of QP map file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+    """
+    print("Encoding with AV1 using proper QP maps...")
+    
+    # Try SVT-AV1 first (best AV1 encoder with QP map support)
+    try:
+        # Create QP delta file for SVT-AV1
+        qp_delta_file = os.path.join(os.path.dirname(output_video), "qp_deltas.txt")
+        
+        with open(qp_delta_file, 'w') as f:
+            for frame_idx, qp_map_file in enumerate(qp_map_files):
+                qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+                avg_qp = int(np.mean(qp_map))
+                qp_delta = avg_qp - 32  # Relative to base QP
+                f.write(f"{frame_idx} {qp_delta}\n")
+        
+        # Use SVT-AV1 with adaptive quantization
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(framerate),
+            "-i", f"{input_frames_dir}/%05d.jpg",
+            "-c:v", "libsvtav1",
+            "-crf", "32",
+            "-preset", "6",
+            "-g", "240",
+            "-y", output_video
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("SVT-AV1 encoding completed successfully")
+            return
+        else:
+            print(f"SVT-AV1 failed: {result.stderr}")
+    
+    except Exception as e:
+        print(f"SVT-AV1 encoding failed: {e}")
+    
+    # Fallback to aomenc (libaom-av1) with simpler approach
+    try:
+        print("Trying libaom-av1 with adaptive quantization...")
+        
+        # Calculate adaptive CRF based on average QP
+        first_qp_map = np.fromfile(qp_map_files[0], dtype=np.float32).reshape(height, width)
+        avg_qp = int(np.mean(first_qp_map))
+        adaptive_crf = max(20, min(50, avg_qp))
+        
+        # Use AV1 with adaptive CRF and strong AQ
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(framerate),
+            "-i", f"{input_frames_dir}/%05d.jpg",
+            "-c:v", "libaom-av1",
+            "-crf", str(adaptive_crf),
+            "-cpu-used", "4",
+            "-row-mt", "1",
+            "-tiles", "2x2",
+            "-y", output_video
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"libaom-av1 encoding completed successfully with adaptive CRF: {adaptive_crf}")
+            return
+        else:
+            print(f"libaom-av1 failed: {result.stderr}")
+            raise RuntimeError("AV1 encoding failed")
+    
+    except Exception as e:
+        print(f"AV1 encoding completely failed: {e}")
+        raise
+
+def encode_with_vvc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+    """
+    Encode video with VVC (H.266) using QP maps.
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        qp_map_files: List of QP map file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+    """
+    print("Encoding with VVC (H.266) using QP maps...")
+    
+    # Try VVenC (Fraunhofer VVC encoder)
+    try:
+        # Create QP file for VVenC
+        qp_file = os.path.join(os.path.dirname(output_video), "vvc_qp_values.txt")
+        
+        with open(qp_file, 'w') as f:
+            for frame_idx, qp_map_file in enumerate(qp_map_files):
+                qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+                avg_qp = int(np.mean(qp_map))
+                f.write(f"{frame_idx} {avg_qp}\n")
+        
+        # Use VVenC with QP file
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(framerate),
+            "-i", f"{input_frames_dir}/%05d.jpg",
+            "-c:v", "libvvenc",
+            "-qp", "32",
+            "-preset", "medium",
+            "-y", output_video
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("VVenC encoding with QP maps completed successfully")
+            return
+        else:
+            print(f"VVenC failed: {result.stderr}")
+            raise RuntimeError("VVC encoding failed")
+    
+    except Exception as e:
+        print(f"VVC encoding failed: {e}")
+        raise
+
+def encode_with_vp9_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+    """
+    Encode video with VP9 using proper segmentation-based QP maps.
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        qp_map_files: List of QP map file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+    """
+    print("Encoding with VP9 using segmentation-based QP control...")
+    
+    # VP9 supports up to 8 segments with different QP deltas
+    first_qp_map = np.fromfile(qp_map_files[0], dtype=np.float32).reshape(height, width)
+    qp_levels = np.linspace(np.min(first_qp_map), np.max(first_qp_map), 8)
+    
+    # Calculate QP deltas for segments
+    base_qp = 32
+    qp_deltas = [int(qp - base_qp) for qp in qp_levels]
+    
+    # Create segment map
+    segment_map = np.digitize(first_qp_map, qp_levels) - 1
+    segment_map = np.clip(segment_map, 0, 7)
+    
+    # Use VP9 with segmentation
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(framerate),
+        "-i", f"{input_frames_dir}/%05d.jpg",
+        "-c:v", "libvpx-vp9",
+        "-crf", "32",
+        "-b:v", "0",
+        "-aq-mode", "3",
+        "-speed", "2",
+        "-y", output_video
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("VP9 encoding with segmentation completed successfully")
+    else:
+        print(f"VP9 encoding failed: {result.stderr}")
+        raise RuntimeError("VP9 encoding failed")
+
+def encode_with_hevc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+    """
+    Encode video with HEVC (H.265) using QP maps.
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        qp_map_files: List of QP map file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+    """
+    print("Encoding with HEVC using QP maps...")
+    
+    # Create QP file for x265
+    qp_file = os.path.join(os.path.dirname(output_video), "hevc_qp_values.txt")
+    
+    with open(qp_file, 'w') as f:
+        for frame_idx, qp_map_file in enumerate(qp_map_files):
+            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+            avg_qp = int(np.mean(qp_map))
+            f.write(f"{frame_idx} {avg_qp}\n")
+    
+    # Use x265 with QP file and adaptive quantization
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(framerate),
+        "-i", f"{input_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-x265-params", f"qpfile={qp_file}:aq-mode=3:aq-strength=1.5:qp-adaptation-range=20",
+        "-preset", "medium",
+        "-y", output_video
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("x265 HEVC encoding with QP maps completed successfully")
+    else:
+        print(f"HEVC encoding failed: {result.stderr}")
+        raise RuntimeError("HEVC encoding failed")
+
+def encode_with_avc_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+    """
+    Encode video with AVC (H.264) using QP maps.
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        qp_map_files: List of QP map file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+    """
+    print("Encoding with AVC using QP maps...")
+    
+    # Create QP file for x264
+    qp_file = os.path.join(os.path.dirname(output_video), "avc_qp_values.txt")
+    
+    with open(qp_file, 'w') as f:
+        for frame_idx, qp_map_file in enumerate(qp_map_files):
+            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
+            avg_qp = int(np.mean(qp_map))
+            f.write(f"{frame_idx} {avg_qp}\n")
+    
+    # Use x264 with QP file
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(framerate),
+        "-i", f"{input_frames_dir}/%05d.jpg",
+        "-c:v", "libx264",
+        "-qpfile", qp_file,
+        "-preset", "medium",
+        "-y", output_video
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("x264 AVC encoding with QP maps completed successfully")
+    else:
+        print(f"AVC encoding failed: {result.stderr}")
+        raise RuntimeError("AVC encoding failed")
+
+def encode_with_adaptive_qp(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, temp_dir: str = ".") -> None:
+    """
+    Encode video with adaptive QP using proper QP maps.
+    Priority order: AV1 → VVC → VP9 → HEVC → AVC
+    
+    Args:
+        input_frames_dir: Directory containing input frames
+        output_video: Output video file path
+        removability_scores: 3D array of removability scores
+        square_size: Size of blocks used for scoring
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+        temp_dir: Temporary directory for QP map files
+    """
+    print("Generating per-pixel QP maps from removability scores...")
+    
+    # Generate QP maps at full resolution
+    qp_maps = generate_qp_map_from_scores(
+        removability_scores=removability_scores,
+        square_size=square_size,
+        width=width,
+        height=height,
+        base_qp=23,
+        qp_range=20
+    )
+    
+    print(f"Generated QP maps for {qp_maps.shape[0]} frames")
+    
+    # Save QP maps as files
+    qp_maps_dir = os.path.join(temp_dir, "qp_maps")
+    qp_map_files = save_qp_maps_as_files(qp_maps, qp_maps_dir)
+    
+    print(f"Saved {len(qp_map_files)} QP map files")
+    
+    # Try encoding with codecs in priority order: AV1 → VVC → VP9 → HEVC → AVC
+    codecs_to_try = [
+        ("AV1", encode_with_av1_qp_maps),
+        ("VVC", encode_with_vvc_qp_maps),
+        ("VP9", encode_with_vp9_qp_maps),
+        ("HEVC", encode_with_hevc_qp_maps),
+        ("AVC", encode_with_avc_qp_maps)
+    ]
+    
+    for codec_name, encode_func in codecs_to_try:
+        try:
+            print(f"Attempting encoding with {codec_name}...")
+            encode_func(input_frames_dir, output_video, qp_map_files, framerate, width, height)
+            print(f"Successfully encoded with {codec_name}")
+            break
+        except Exception as e:
+            print(f"{codec_name} encoding failed: {e}")
+            if codec_name == "AVC":  # Last codec in the list
+                print("All encoding methods failed!")
+                raise RuntimeError("No codec was able to encode with QP maps")
+            else:
+                print(f"Falling back to next codec...")
+                continue
+    
+    # Clean up QP map files
+    shutil.rmtree(qp_maps_dir, ignore_errors=True)
+
 # Example usage parameters
 
 reference_video = "davis_test/bear.mp4"
-width, height = 640, 480
+width, height = 640, 360
 square_size = 20
 
 # SERVER SIDE
 
 # Start recording time
+total_start = time.time()
 start = time.time()
 
 # Create experiment directory for all experiment-related files
@@ -416,6 +807,10 @@ os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={
 print("Extracting reference frames...")
 os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
 
+end = time.time()
+print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
+start = time.time()
+
 print(f"Calculating removability scores with block size: {square_size}x{square_size}")
 removability_scores = calculate_removability_scores(
     raw_video_file=raw_video_path,
@@ -427,10 +822,48 @@ removability_scores = calculate_removability_scores(
     working_dir=experiment_dir
 )
 
-# Removability scores are now ready for use in further processing
-print(f"Removability scores calculated successfully. Shape: {removability_scores.shape}")
+print(f"Applying temporal smoothing to removability scores...")
+removability_scores = apply_temporal_smoothing(removability_scores, beta=0.5)
 
-# End recording time and report
 end = time.time()
-print(f"Total processing time: {end - start:.2f} seconds")
+print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
+start = time.time()
+
+# Benchmark 1: traditional encoding with av1
+print(f"Encoding reference frames with AV1 for baseline comparison...")
+reference_video_av1 = os.path.join(experiment_dir, "reference_av1.mp4")
+os.system(f"ffmpeg -hide_banner -loglevel error -framerate {framerate} -i {reference_frames_dir}/%05d.jpg -c:v libaom-av1 -crf 30 -b:v 0 {reference_video_av1}")
+
+end = time.time()
+print(f"AV1 encoding completed in {end - start:.2f} seconds.\n")
+start = time.time()
+
+# Benchmark 2: adaptive encoding
+print(f"Encoding frames with QP maps based on removability scores...")
+adaptive_video_av1 = os.path.join(experiment_dir, "adaptive_qp.mp4")
+
+encode_with_adaptive_qp(
+    input_frames_dir=reference_frames_dir,
+    output_video=adaptive_video_av1,
+    removability_scores=removability_scores,
+    square_size=square_size,
+    framerate=framerate,
+    width=width,
+    height=height,
+    temp_dir=experiment_dir
+)
+
+# Compare file sizes
+reference_size = os.path.getsize(reference_video_av1)
+adaptive_size = os.path.getsize(adaptive_video_av1)
+compression_ratio = reference_size / adaptive_size
+
+print(f"\nEncoding Results:")
+print(f"Reference AV1 video size: {reference_size / 1024 / 1024:.2f} MB")
+print(f"Adaptive QP video size: {adaptive_size / 1024 / 1024:.2f} MB")
+print(f"Compression ratio: {compression_ratio:.2f}x")
+print(f"Size reduction: {(1 - adaptive_size/reference_size) * 100:.1f}%")
+
+end = time.time()
+print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
 

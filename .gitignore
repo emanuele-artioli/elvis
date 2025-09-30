@@ -160,11 +160,5 @@ cython_debug/
 #.idea/
 
 # project files
-videos/
-old/
-tests/
-results.csv
-experiments/
-reference*
-evca*/
-UFO*/
+experiment/
+*test*/
