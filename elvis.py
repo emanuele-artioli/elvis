@@ -456,112 +456,56 @@ def save_qp_maps_as_files(qp_maps: np.ndarray, output_dir: str) -> List[str]:
     
     return qp_map_files
 
-def encode_with_av1_qp_maps(input_frames_dir: str, output_video: str, qp_map_files: List[str], framerate: float, width: int, height: int) -> None:
+def generate_roi_filter_string_from_scores(frame_scores: np.ndarray, square_size: int, width: int, height: int) -> str:
     """
-    Encode video with AV1 using proper QP maps via SVT-AV1 or aomenc.
+    Generate addroi filter string from 2D frame scores.
     
     Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        qp_map_files: List of QP map file paths
-        framerate: Video framerate
+        frame_scores: 2D array of scores for a single frame
+        square_size: Size of each block in pixels
         width: Video width
         height: Video height
+        
+    Returns:
+        String containing chained addroi filters
     """
-    print("Encoding with AV1 using proper QP maps...")
+    num_blocks_y, num_blocks_x = frame_scores.shape
     
-    # Try SVT-AV1 first (more advanced QP control)
-    try:
-        print("Trying SVT-AV1 with adaptive QP...")
-        
-        # Calculate frame-level QP values from QP maps
-        frame_qps = []
-        for qp_map_file in qp_map_files:
-            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-            avg_qp = int(np.mean(qp_map))
-            # Clamp to valid range for SVT-AV1
-            avg_qp = max(15, min(50, avg_qp))
-            frame_qps.append(avg_qp)
-        
-        # Create QP file for SVT-AV1
-        qp_file = os.path.join(os.path.dirname(output_video), "svt_qp_values.txt")
-        with open(qp_file, 'w') as f:
-            for frame_idx, qp in enumerate(frame_qps):
-                f.write(f"{frame_idx}\t{qp}\n")
-        
-        # Use SVT-AV1 with frame-level QP control
-        base_qp = int(np.mean(frame_qps))
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-framerate", str(framerate),
-            "-i", f"{input_frames_dir}/%05d.jpg",
-            "-c:v", "libsvtav1",
-            "-rc", "cqp",
-            "-qp", str(base_qp),
-            "-preset", "6",
-            "-g", "240",
-            "-keyint_min", "23",
-            "-y", output_video
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print("SVT-AV1 encoding completed successfully")
-            return
-        else:
-            print(f"SVT-AV1 failed: {result.stderr}")
+    # Normalize scores to [0, 1] range
+    normalized_scores = normalize_array(frame_scores)
     
-    except Exception as e:
-        print(f"SVT-AV1 encoding failed: {e}")
+    # Create ROI filter string
+    roi_filters = []
     
-    # Fallback to libaom-av1 with adaptive quantization
-    try:
-        print("Trying libaom-av1 with adaptive quantization...")
-        
-        # Calculate adaptive CRF based on QP distribution
-        all_qps = []
-        for qp_map_file in qp_map_files:
-            qp_map = np.fromfile(qp_map_file, dtype=np.float32).reshape(height, width)
-            all_qps.extend(qp_map.flatten())
-        
-        # Use median QP as CRF and enable strong adaptive quantization
-        median_qp = int(np.median(all_qps))
-        adaptive_crf = max(20, min(50, median_qp))
-        
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-framerate", str(framerate),
-            "-i", f"{input_frames_dir}/%05d.jpg",
-            "-c:v", "libaom-av1",
-            "-crf", str(adaptive_crf),
-            "-aq-mode", "3",  # Enable variance-based adaptive quantization
-            "-cpu-used", "4",
-            "-row-mt", "1",
-            "-tiles", "2x2",
-            "-g", "240",
-            "-y", output_video
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f"libaom-av1 encoding completed successfully with adaptive CRF: {adaptive_crf}")
-            return
-        else:
-            print(f"libaom-av1 failed: {result.stderr}")
-            raise RuntimeError("AV1 encoding failed")
+    for block_y in range(num_blocks_y):
+        for block_x in range(num_blocks_x):
+            score = normalized_scores[block_y, block_x]
+            
+            # Calculate block boundaries
+            x1 = block_x * square_size
+            y1 = block_y * square_size
+            x2 = min(x1 + square_size, width)
+            y2 = min(y1 + square_size, height)
+            
+            # Convert removability score to quantization offset
+            # High removability (background) -> positive offset (lower quality)
+            # Low removability (important) -> negative offset (higher quality)
+            qoffset = (score - 0.5) * 2.0  # Maps [0,1] to [-1,1]
+            
+            # Only add ROI if the offset is significant
+            if abs(qoffset) > 0.1:
+                roi_filter = f"addroi=x={x1}:y={y1}:w={x2-x1}:h={y2-y1}:qoffset={qoffset:.2f}"
+                roi_filters.append(roi_filter)
     
-    except Exception as e:
-        print(f"AV1 encoding completely failed: {e}")
-        raise
+    # Chain multiple addroi filters
+    if roi_filters:
+        return ",".join(roi_filters)
+    else:
+        return ""
 
-
-
-
-
-
-def encode_with_adaptive_qp(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, temp_dir: str = ".") -> None:
+def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, segment_size: int = 30, base_crf: int = 30) -> None:
     """
-    Encode video with adaptive QP using AV1.
+    Encode video with H.265 using per-frame ROI-based quantization.
     
     Args:
         input_frames_dir: Directory containing input frames
@@ -571,40 +515,338 @@ def encode_with_adaptive_qp(input_frames_dir: str, output_video: str, removabili
         framerate: Video framerate
         width: Video width
         height: Video height
-        temp_dir: Temporary directory for QP map files
+        segment_size: Number of frames per segment for processing
+        base_crf: Base CRF value for encoding
     """
-    print("Generating per-pixel QP maps from removability scores...")
+    print("Encoding with H.265 using per-frame ROI-based quantization...")
     
-    # Generate QP maps at full resolution
-    qp_maps = generate_qp_map_from_scores(
-        removability_scores=removability_scores,
-        square_size=square_size,
-        width=width,
-        height=height,
-        base_qp=23,
-        qp_range=20
-    )
+    num_frames = removability_scores.shape[0]
+    temp_dir = os.path.dirname(output_video)
+    segments_dir = os.path.join(temp_dir, "segments")
+    os.makedirs(segments_dir, exist_ok=True)
     
-    print(f"Generated QP maps for {qp_maps.shape[0]} frames")
+    # Process frames in segments for better efficiency
+    segment_files = []
     
-    # Save QP maps as files
-    qp_maps_dir = os.path.join(temp_dir, "qp_maps")
-    qp_map_files = save_qp_maps_as_files(qp_maps, qp_maps_dir)
+    try:
+        for segment_start in range(0, num_frames, segment_size):
+            segment_end = min(segment_start + segment_size, num_frames)
+            segment_idx = segment_start // segment_size
+            
+            print(f"Processing segment {segment_idx + 1} (frames {segment_start}-{segment_end-1})")
+            
+            # Calculate average ROI for this segment
+            segment_scores = removability_scores[segment_start:segment_end]
+            avg_segment_scores = np.mean(segment_scores, axis=0)
+            
+            # Generate ROI filter for this segment
+            roi_filter = generate_roi_filter_string_from_scores(avg_segment_scores, square_size, width, height)
+            
+            # Create segment video file
+            segment_file = os.path.join(segments_dir, f"segment_{segment_idx:03d}.mp4")
+            
+            # Build FFmpeg command for this segment
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-start_number", str(segment_start + 1),  # ffmpeg frames are 1-indexed
+                "-framerate", str(framerate),
+                "-i", f"{input_frames_dir}/%05d.jpg",
+                "-frames:v", str(segment_end - segment_start),
+            ]
+            
+            # Add ROI filter if available
+            if roi_filter:
+                cmd.extend(["-vf", roi_filter])
+            
+            # Try libx265 first (better ROI support)
+            cmd.extend([
+                "-c:v", "libx265",
+                "-crf", str(base_crf),
+                "-preset", "medium",
+                "-g", "1",  # Shorter GOP for segments
+                "-y", segment_file
+            ])
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"libx265 failed for segment: {result.stderr}")
+                raise RuntimeError(f"libx265 failed for segment: {result.stderr}")
+            
+            segment_files.append(segment_file)
+        
+        # Concatenate all segments into final video
+        print(f"Concatenating {len(segment_files)} segments into final video...")
+        concat_segments(segment_files, output_video)
+        
+        print("Per-frame ROI encoding completed successfully")
+        
+    finally:
+        # Clean up segment files
+        shutil.rmtree(segments_dir, ignore_errors=True)
+
+def calculate_video_quality_metrics(reference_frames_dir: str, encoded_video: str, framerate: float, width: int, height: int, temp_dir: str) -> Tuple[float, float]:
+    """
+    Calculate PSNR and SSIM between reference frames and encoded video using FFmpeg.
     
-    print(f"Saved {len(qp_map_files)} QP map files")
+    Args:
+        reference_frames_dir: Directory containing reference frames
+        encoded_video: Path to encoded video file
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+        temp_dir: Temporary directory for intermediate files
+        
+    Returns:
+        Tuple of (average_psnr, average_ssim)
+    """
+    print(f"Calculating quality metrics for {os.path.basename(encoded_video)}...")
     
-    # Encode with AV1
-    encode_with_av1_qp_maps(input_frames_dir, output_video, qp_map_files, framerate, width, height)
-    print("Successfully encoded with AV1")
+    # Create lossless reference video from frames for comparison
+    reference_video_lossless = os.path.join(temp_dir, "reference_lossless.mp4")
     
-    # Clean up QP map files
-    shutil.rmtree(qp_maps_dir, ignore_errors=True)
+    try:
+        # Create lossless reference video if it doesn't exist
+        if not os.path.exists(reference_video_lossless):
+            print("Creating lossless reference video for quality comparison...")
+            ref_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                "-framerate", str(framerate),
+                "-i", f"{reference_frames_dir}/%05d.jpg",
+                "-c:v", "libx265",  # Use lossless encoding for reference
+                "-crf", "0",        # Lossless
+                "-y", reference_video_lossless
+            ]
+            
+            result = subprocess.run(ref_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Failed to create lossless reference video: {result.stderr}")
+                return 0.0, 0.0
+        
+        # Calculate PSNR using FFmpeg
+        psnr_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-i", reference_video_lossless,
+            "-i", encoded_video,
+            "-lavfi", "psnr=stats_file=-",
+            "-f", "null", "-"
+        ]
+        
+        psnr_result = subprocess.run(psnr_cmd, capture_output=True, text=True)
+        if psnr_result.returncode != 0:
+            print(f"PSNR calculation failed: {psnr_result.stderr}")
+            psnr_avg = 0.0
+        else:
+            # Parse PSNR from stderr output
+            psnr_avg = parse_psnr_from_output(psnr_result.stderr)
+        
+        # Calculate SSIM using FFmpeg
+        ssim_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-i", reference_video_lossless,
+            "-i", encoded_video,
+            "-lavfi", "ssim=stats_file=-",
+            "-f", "null", "-"
+        ]
+        
+        ssim_result = subprocess.run(ssim_cmd, capture_output=True, text=True)
+        if ssim_result.returncode != 0:
+            print(f"SSIM calculation failed: {ssim_result.stderr}")
+            ssim_avg = 0.0
+        else:
+            # Parse SSIM from stderr output
+            ssim_avg = parse_ssim_from_output(ssim_result.stderr)
+        
+        print(f"Quality metrics - PSNR: {psnr_avg:.2f} dB, SSIM: {ssim_avg:.4f}")
+        return psnr_avg, ssim_avg
+        
+    except Exception as e:
+        print(f"Error calculating quality metrics: {e}")
+        return 0.0, 0.0
+
+def parse_psnr_from_output(output: str) -> float:
+    """
+    Parse average PSNR value from FFmpeg psnr filter output.
+    
+    Args:
+        output: FFmpeg stderr output containing PSNR stats
+        
+    Returns:
+        Average PSNR value in dB
+    """
+    try:
+        # Look for the PSNR summary line
+        lines = output.strip().split('\n')
+        for line in lines:
+            if '[Parsed_psnr_' in line and 'average:' in line:
+                # Extract PSNR value from line like: "[Parsed_psnr_0 @ 0x...] PSNR y:... u:... v:... average:28.884716 min:... max:..."
+                parts = line.split('average:')
+                if len(parts) > 1:
+                    avg_part = parts[1].split()[0]
+                    return float(avg_part)
+                    
+        return 0.0
+    except (ValueError, IndexError):
+        return 0.0
+
+def parse_ssim_from_output(output: str) -> float:
+    """
+    Parse average SSIM value from FFmpeg ssim filter output.
+    
+    Args:
+        output: FFmpeg stderr output containing SSIM stats
+        
+    Returns:
+        Average SSIM value (0-1)
+    """
+    try:
+        # Look for the SSIM summary line
+        lines = output.strip().split('\n')
+        for line in lines:
+            if '[Parsed_ssim_' in line and 'All:' in line:
+                # Extract SSIM value from line like: "[Parsed_ssim_0 @ 0x...] SSIM Y:... U:... V:... All:0.873911 (...)"
+                parts = line.split('All:')
+                if len(parts) > 1:
+                    all_part = parts[1].split()[0]
+                    return float(all_part)
+                    
+        return 0.0
+    except (ValueError, IndexError):
+        return 0.0
+
+def compare_encoding_quality(reference_frames_dir: str, encoded_videos: dict, framerate: float, width: int, height: int, temp_dir: str) -> None:
+    """
+    Compare quality metrics between multiple encoded videos and display results.
+    
+    Args:
+        reference_frames_dir: Directory containing reference frames
+        encoded_videos: Dictionary mapping video names to file paths
+        framerate: Video framerate
+        width: Video width
+        height: Video height
+        temp_dir: Temporary directory for intermediate files
+    """
+    print(f"\nCalculating quality metrics for all encoding approaches...")
+    
+    # Calculate quality metrics for all videos
+    quality_results = {}
+    file_sizes = {}
+    
+    for video_name, video_path in encoded_videos.items():
+        if os.path.exists(video_path):
+            psnr, ssim = calculate_video_quality_metrics(
+                reference_frames_dir=reference_frames_dir,
+                encoded_video=video_path,
+                framerate=framerate,
+                width=width,
+                height=height,
+                temp_dir=temp_dir
+            )
+            quality_results[video_name] = {"psnr": psnr, "ssim": ssim}
+            file_sizes[video_name] = os.path.getsize(video_path) / (1024 * 1024)  # Size in MB
+        else:
+            print(f"Warning: Video file not found: {video_path}")
+            quality_results[video_name] = {"psnr": 0.0, "ssim": 0.0}
+            file_sizes[video_name] = 0.0
+    
+    # Display comparison results
+    print(f"\n{'='*80}")
+    print(f"{'ENCODING QUALITY COMPARISON':^80}")
+    print(f"{'='*80}")
+    
+    # Header
+    print(f"{'Method':<20} {'Size (MB)':<12} {'PSNR (dB)':<12} {'SSIM':<8} {'PSNR/MB':<12} {'Efficiency':<12}")
+    print(f"{'-'*80}")
+    
+    # Get reference for comparison (first video in the list)
+    reference_name = list(encoded_videos.keys())[0]
+    ref_psnr_per_mb = quality_results[reference_name]["psnr"] / file_sizes[reference_name] if file_sizes[reference_name] > 0 else 0
+    
+    # Display results for each video
+    for video_name, video_path in encoded_videos.items():
+        psnr = quality_results[video_name]["psnr"]
+        ssim = quality_results[video_name]["ssim"]
+        size_mb = file_sizes[video_name]
+        psnr_per_mb = psnr / size_mb if size_mb > 0 else 0
+        
+        # Calculate efficiency improvement relative to reference
+        if ref_psnr_per_mb > 0 and video_name != reference_name:
+            efficiency_improvement = ((psnr_per_mb / ref_psnr_per_mb) - 1) * 100
+            efficiency_str = f"{efficiency_improvement:+.1f}%"
+        else:
+            efficiency_str = "baseline"
+        
+        print(f"{video_name:<20} {size_mb:<12.2f} {psnr:<12.2f} {ssim:<8.4f} {psnr_per_mb:<12.2f} {efficiency_str:<12}")
+    
+    print(f"{'-'*80}")
+    
+    # Show detailed comparisons between methods
+    if len(encoded_videos) > 1:
+        print(f"\nDetailed Comparisons (vs {reference_name}):")
+        ref_psnr = quality_results[reference_name]["psnr"]
+        ref_ssim = quality_results[reference_name]["ssim"]
+        ref_size = file_sizes[reference_name]
+        
+        for video_name in list(encoded_videos.keys())[1:]:
+            psnr = quality_results[video_name]["psnr"]
+            ssim = quality_results[video_name]["ssim"]
+            size_mb = file_sizes[video_name]
+            
+            psnr_diff = psnr - ref_psnr
+            ssim_diff = ssim - ref_ssim
+            size_ratio = size_mb / ref_size if ref_size > 0 else 0
+            size_reduction = (1 - size_ratio) * 100
+            
+            print(f"\n{video_name}:")
+            print(f"  PSNR difference: {psnr_diff:+.2f} dB")
+            print(f"  SSIM difference: {ssim_diff:+.4f}")
+            print(f"  Size ratio: {size_ratio:.2f}x")
+            print(f"  Size change: {-size_reduction:+.1f}%")
+    
+    print(f"\n{'='*80}")
+
+def concat_segments(segment_files: List[str], output_video: str) -> None:
+    """
+    Concatenate video segments into a single video file.
+    
+    Args:
+        segment_files: List of segment file paths
+        output_video: Output video file path
+    """
+    # Create a temporary file list for ffmpeg concat
+    temp_dir = os.path.dirname(output_video)
+    filelist_path = os.path.join(temp_dir, "segments_list.txt")
+    
+    try:
+        with open(filelist_path, 'w') as f:
+            for segment_file in segment_files:
+                f.write(f"file '{os.path.abspath(segment_file)}'\n")
+        
+        # Concatenate using ffmpeg
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", filelist_path,
+            "-c", "copy",
+            "-y", output_video
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Concatenation failed: {result.stderr}")
+            
+    finally:
+        # Clean up temporary file list
+        if os.path.exists(filelist_path):
+            os.remove(filelist_path)
 
 # Example usage parameters
 
 reference_video = "davis_test/bear.mp4"
-width, height = 640, 360
-square_size = 20
+width, height = 640, 368
+square_size = 16
+segment_size = 30  # Number of frames per segment for processing
+base_crf = 30  # Base CRF value for encoding
 
 # SERVER SIDE
 
@@ -629,7 +871,7 @@ raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
 os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
 print("Extracting reference frames...")
-os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
+os.system(f"ffmpeg -hide_banner -loglevel warning -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
 
 end = time.time()
 print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
@@ -653,40 +895,79 @@ end = time.time()
 print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
 start = time.time()
 
-# Benchmark 1: traditional encoding with av1
-print(f"Encoding reference frames with AV1 for baseline comparison...")
-reference_video_av1 = os.path.join(experiment_dir, "reference_av1.mp4")
-os.system(f"ffmpeg -hide_banner -loglevel error -framerate {framerate} -i {reference_frames_dir}/%05d.jpg -c:v libaom-av1 -crf 30 -b:v 0 {reference_video_av1}")
+# Benchmark 1: traditional encoding with H.265
+print(f"Encoding reference frames with H.265 for baseline comparison...")
+baseline_video_h265 = os.path.join(experiment_dir, "baseline.mp4")
+
+# Use subprocess for better control and consistency with adaptive encoding
+baseline_cmd = [
+    "ffmpeg", "-hide_banner", "-loglevel", "warning",
+    "-framerate", str(framerate),
+    "-i", f"{reference_frames_dir}/%05d.jpg",
+    "-c:v", "libx265",
+    "-crf", str(base_crf),
+    "-preset", "medium",
+    "-g", "1",
+    "-y", baseline_video_h265
+]
+
+result = subprocess.run(baseline_cmd, capture_output=True, text=True)
+if result.returncode != 0:
+    print(f"Baseline encoding failed: {result.stderr}")
+    raise RuntimeError(f"Baseline encoding failed: {result.stderr}")
+else:
+    print("Baseline encoding completed successfully")
 
 end = time.time()
-print(f"AV1 encoding completed in {end - start:.2f} seconds.\n")
+print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
 start = time.time()
 
 # Benchmark 2: adaptive encoding
-print(f"Encoding frames with QP maps based on removability scores...")
-adaptive_video_av1 = os.path.join(experiment_dir, "adaptive_qp.mp4")
+print(f"Encoding frames with ROI-based adaptive quantization...")
+adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
 
-encode_with_adaptive_qp(
+# Use same encoder parameters as adaptive encoding for fair comparison
+encode_with_h265_roi(
     input_frames_dir=reference_frames_dir,
-    output_video=adaptive_video_av1,
+    output_video=adaptive_video_h265,
     removability_scores=removability_scores,
     square_size=square_size,
     framerate=framerate,
     width=width,
     height=height,
-    temp_dir=experiment_dir
+    segment_size=segment_size,
+    base_crf=base_crf
 )
 
-# Compare file sizes
-reference_size = os.path.getsize(reference_video_av1)
-adaptive_size = os.path.getsize(adaptive_video_av1)
-compression_ratio = reference_size / adaptive_size
+end = time.time()
+print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
+start = time.time()
+
+# Compare file sizes and quality metrics
+baseline_size = os.path.getsize(baseline_video_h265)
+adaptive_size = os.path.getsize(adaptive_video_h265)
+compression_ratio = baseline_size / adaptive_size
 
 print(f"\nEncoding Results:")
-print(f"Reference AV1 video size: {reference_size / 1024 / 1024:.2f} MB")
+print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
 print(f"Adaptive QP video size: {adaptive_size / 1024 / 1024:.2f} MB")
 print(f"Compression ratio: {compression_ratio:.2f}x")
-print(f"Size reduction: {(1 - adaptive_size/reference_size) * 100:.1f}%")
+print(f"Size reduction: {(1 - adaptive_size/baseline_size) * 100:.1f}%")
+
+# Comprehensive quality comparison
+encoded_videos = {
+    "Baseline H.265": baseline_video_h265,
+    "Adaptive ROI": adaptive_video_h265
+}
+
+compare_encoding_quality(
+    reference_frames_dir=reference_frames_dir,
+    encoded_videos=encoded_videos,
+    framerate=framerate,
+    width=width,
+    height=height,
+    temp_dir=experiment_dir
+)
 
 end = time.time()
 print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
