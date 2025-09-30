@@ -9,6 +9,59 @@ from typing import List, Callable, Tuple
 
 # Utility functions
 
+def calculate_bitrate_with_factor(bitrate_str: str, factor: float) -> str:
+    """
+    Calculate a bitrate with a multiplier factor.
+    
+    Args:
+        bitrate_str: Bitrate string like "1M" or "500k"
+        factor: Multiplier factor (e.g., 0.9, 1.1)
+        
+    Returns:
+        New bitrate string with factor applied
+    """
+    if bitrate_str.endswith('M'):
+        value = int(bitrate_str[:-1]) * 1_000_000
+    elif bitrate_str.endswith('k'):
+        value = int(bitrate_str[:-1]) * 1_000
+    else:
+        value = int(bitrate_str)
+    
+    new_value = int(value * factor)
+    
+    if new_value >= 1_000_000:
+        return f"{new_value // 1_000_000}M"
+    else:
+        return f"{new_value // 1_000}k"
+
+def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> str:
+    """
+    Calculate an appropriate target bitrate based on video characteristics.
+    
+    Args:
+        width: Video width
+        height: Video height  
+        framerate: Video framerate
+        quality_factor: Quality multiplier (1.0 = standard, higher = better quality)
+        
+    Returns:
+        Bitrate string (e.g., "1M", "500k")
+    """
+    # Basic bitrate calculation: pixels per second * bits per pixel
+    pixels_per_second = width * height * framerate
+    
+    # Base bits per pixel for H.265 (typically 0.1-0.2 for good quality)
+    bits_per_pixel = 0.3 * quality_factor
+    
+    # Calculate target bitrate in bps
+    target_bps = int(pixels_per_second * bits_per_pixel)
+    
+    # Convert to human-readable format
+    if target_bps >= 1_000_000:
+        return f"{target_bps // 1_000_000}M"
+    else:
+        return f"{target_bps // 1_000}k"
+
 def normalize_array(arr: np.ndarray) -> np.ndarray:
     """Normalizes a NumPy array to the range [0, 1]."""
     min_val = arr.min()
@@ -503,7 +556,7 @@ def generate_roi_filter_string_from_scores(frame_scores: np.ndarray, square_size
     else:
         return ""
 
-def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, segment_size: int = 30, base_crf: int = 30) -> None:
+def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: str = "1M") -> None:
     """
     Encode video with H.265 using per-frame ROI-based quantization.
     
@@ -516,7 +569,7 @@ def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_
         width: Video width
         height: Video height
         segment_size: Number of frames per segment for processing
-        base_crf: Base CRF value for encoding
+        target_bitrate: Target bitrate (e.g., "1M", "500k", "2M")
     """
     print("Encoding with H.265 using per-frame ROI-based quantization...")
     
@@ -558,10 +611,12 @@ def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_
             if roi_filter:
                 cmd.extend(["-vf", roi_filter])
             
-            # Try libx265 first (better ROI support)
             cmd.extend([
                 "-c:v", "libx265",
-                "-crf", str(base_crf),
+                "-b:v", target_bitrate,
+                "-minrate", calculate_bitrate_with_factor(target_bitrate, 0.9),
+                "-maxrate", calculate_bitrate_with_factor(target_bitrate, 1.1),
+                "-bufsize", target_bitrate,  # Small buffer for strict bitrate control
                 "-preset", "medium",
                 "-g", "1",  # Shorter GOP for segments
                 "-y", segment_file
@@ -612,8 +667,9 @@ def calculate_video_quality_metrics(reference_frames_dir: str, encoded_video: st
                 "ffmpeg", "-hide_banner", "-loglevel", "warning",
                 "-framerate", str(framerate),
                 "-i", f"{reference_frames_dir}/%05d.jpg",
-                "-c:v", "libx265",  # Use lossless encoding for reference
+                "-c:v", "libx265",
                 "-crf", "0",        # Lossless
+                "-pix_fmt", "yuv420p",
                 "-y", reference_video_lossless
             ]
             
@@ -622,12 +678,12 @@ def calculate_video_quality_metrics(reference_frames_dir: str, encoded_video: st
                 print(f"Failed to create lossless reference video: {result.stderr}")
                 return 0.0, 0.0
         
-        # Calculate PSNR using FFmpeg
+        # Calculate PSNR using FFmpeg with more verbose output
         psnr_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "ffmpeg", "-hide_banner", "-loglevel", "info",
             "-i", reference_video_lossless,
             "-i", encoded_video,
-            "-lavfi", "psnr=stats_file=-",
+            "-lavfi", "psnr",
             "-f", "null", "-"
         ]
         
@@ -638,13 +694,13 @@ def calculate_video_quality_metrics(reference_frames_dir: str, encoded_video: st
         else:
             # Parse PSNR from stderr output
             psnr_avg = parse_psnr_from_output(psnr_result.stderr)
-        
-        # Calculate SSIM using FFmpeg
+
+        # Calculate SSIM using FFmpeg with more verbose output
         ssim_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "ffmpeg", "-hide_banner", "-loglevel", "info",
             "-i", reference_video_lossless,
             "-i", encoded_video,
-            "-lavfi", "ssim=stats_file=-",
+            "-lavfi", "ssim",
             "-f", "null", "-"
         ]
         
@@ -677,9 +733,16 @@ def parse_psnr_from_output(output: str) -> float:
         # Look for the PSNR summary line
         lines = output.strip().split('\n')
         for line in lines:
-            if '[Parsed_psnr_' in line and 'average:' in line:
+            # Look for different possible PSNR output formats
+            if 'PSNR' in line and 'average:' in line:
                 # Extract PSNR value from line like: "[Parsed_psnr_0 @ 0x...] PSNR y:... u:... v:... average:28.884716 min:... max:..."
                 parts = line.split('average:')
+                if len(parts) > 1:
+                    avg_part = parts[1].split()[0]
+                    return float(avg_part)
+            elif 'PSNR' in line and 'avg:' in line:
+                # Alternative format: "PSNR ... avg:28.88"
+                parts = line.split('avg:')
                 if len(parts) > 1:
                     avg_part = parts[1].split()[0]
                     return float(avg_part)
@@ -702,12 +765,19 @@ def parse_ssim_from_output(output: str) -> float:
         # Look for the SSIM summary line
         lines = output.strip().split('\n')
         for line in lines:
-            if '[Parsed_ssim_' in line and 'All:' in line:
+            # Look for different possible SSIM output formats
+            if 'SSIM' in line and 'All:' in line:
                 # Extract SSIM value from line like: "[Parsed_ssim_0 @ 0x...] SSIM Y:... U:... V:... All:0.873911 (...)"
                 parts = line.split('All:')
                 if len(parts) > 1:
                     all_part = parts[1].split()[0]
                     return float(all_part)
+            elif 'SSIM' in line and 'avg:' in line:
+                # Alternative format: "SSIM ... avg:0.8739"
+                parts = line.split('avg:')
+                if len(parts) > 1:
+                    avg_part = parts[1].split()[0]
+                    return float(avg_part)
                     
         return 0.0
     except (ValueError, IndexError):
@@ -846,7 +916,11 @@ reference_video = "davis_test/bear.mp4"
 width, height = 640, 368
 square_size = 16
 segment_size = 30  # Number of frames per segment for processing
-base_crf = 30  # Base CRF value for encoding
+
+# Calculate appropriate target bitrate based on video characteristics
+framerate = cv2.VideoCapture(reference_video).get(cv2.CAP_PROP_FPS)
+target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
+print(f"Calculated target bitrate: {target_bitrate} for {width}x{height}@{framerate:.1f}fps")
 
 # SERVER SIDE
 
@@ -861,8 +935,8 @@ os.makedirs(experiment_dir, exist_ok=True)
 # resize video based on required resolution, save raw and frames for reference
 print(f"Processing video: {reference_video}")
 print(f"Target resolution: {width}x{height}")
+print(f"Calculated target bitrate: {target_bitrate} for {width}x{height}@{framerate:.1f}fps")
 
-framerate = cv2.VideoCapture(reference_video).get(cv2.CAP_PROP_FPS)
 reference_frames_dir = os.path.join(experiment_dir, "reference_frames")
 os.makedirs(reference_frames_dir, exist_ok=True)
 
@@ -871,7 +945,7 @@ raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
 os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
 print("Extracting reference frames...")
-os.system(f"ffmpeg -hide_banner -loglevel warning -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
+os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
 
 end = time.time()
 print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
@@ -905,7 +979,10 @@ baseline_cmd = [
     "-framerate", str(framerate),
     "-i", f"{reference_frames_dir}/%05d.jpg",
     "-c:v", "libx265",
-    "-crf", str(base_crf),
+    "-b:v", target_bitrate,
+    "-minrate", calculate_bitrate_with_factor(target_bitrate, 0.9),
+    "-maxrate", calculate_bitrate_with_factor(target_bitrate, 1.1),
+    "-bufsize", target_bitrate,  # Small buffer for strict bitrate control
     "-preset", "medium",
     "-g", "1",
     "-y", baseline_video_h265
@@ -926,7 +1003,7 @@ start = time.time()
 print(f"Encoding frames with ROI-based adaptive quantization...")
 adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
 
-# Use same encoder parameters as adaptive encoding for fair comparison
+# Use same encoder parameters as baseline encoding for fair comparison
 encode_with_h265_roi(
     input_frames_dir=reference_frames_dir,
     output_video=adaptive_video_h265,
@@ -936,7 +1013,7 @@ encode_with_h265_roi(
     width=width,
     height=height,
     segment_size=segment_size,
-    base_crf=base_crf
+    target_bitrate=target_bitrate
 )
 
 end = time.time()
@@ -948,11 +1025,11 @@ baseline_size = os.path.getsize(baseline_video_h265)
 adaptive_size = os.path.getsize(adaptive_video_h265)
 compression_ratio = baseline_size / adaptive_size
 
-print(f"\nEncoding Results:")
+print(f"\nEncoding Results (Target Bitrate: {target_bitrate}):")
 print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
-print(f"Adaptive QP video size: {adaptive_size / 1024 / 1024:.2f} MB")
-print(f"Compression ratio: {compression_ratio:.2f}x")
-print(f"Size reduction: {(1 - adaptive_size/baseline_size) * 100:.1f}%")
+print(f"Adaptive ROI video size: {adaptive_size / 1024 / 1024:.2f} MB")
+print(f"Size ratio: {adaptive_size / baseline_size:.2f}x")
+print(f"Size difference: {(adaptive_size - baseline_size) / baseline_size * 100:+.1f}%")
 
 # Comprehensive quality comparison
 encoded_videos = {
