@@ -82,8 +82,9 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
     try:
         # Calculate scene complexity with EVCA
         print("Running EVCA for complexity analysis...")
-        os.chdir(os.path.dirname(original_dir))  # Go to parent directory where EVCA is located
-        evca_cmd = f"python EVCA/main.py -i {raw_video_abs} -r {width}x{height} -b {block_size} -f {frame_count} -c {evca_csv_path} -bi 1"
+        # Use the internal EVCA repository within elvis
+        evca_path = os.path.join(original_dir, "EVCA", "main.py")
+        evca_cmd = f"python {evca_path} -i {raw_video_abs} -r {width}x{height} -b {block_size} -f {frame_count} -c {evca_csv_path} -bi 1"
         result = subprocess.run(evca_cmd, shell=True, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"EVCA command failed: {result.stderr}")
@@ -94,20 +95,25 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         
         # Calculate ROI with UFO
         print("Running UFO for object detection...")
-        UFO_folder = "UFO/datasets/elvis/image/reference_frames"
-        if os.path.exists(UFO_folder):
-            shutil.rmtree(UFO_folder)
-        shutil.copytree(reference_frames_abs, UFO_folder)
+        # Use the internal UFO repository within elvis
+        # UFO expects a class subdirectory structure
+        UFO_class_folder = os.path.join(original_dir, "UFO", "datasets", "elvis", "image", "reference_frames")
+        if os.path.exists(UFO_class_folder):
+            shutil.rmtree(UFO_class_folder)
+        os.makedirs(os.path.dirname(UFO_class_folder), exist_ok=True)
+        shutil.copytree(reference_frames_abs, UFO_class_folder)
         
-        os.chdir("UFO")
-        ufo_cmd = "python test.py --model='weights/video_best.pth' --data_path='datasets/elvis' --output_dir='VSOD_results/wo_optical_flow/elvis' --task='VSOD'"
+        # Change to the internal UFO directory
+        ufo_dir = os.path.join(original_dir, "UFO")
+        os.chdir(ufo_dir)
+        ufo_cmd = "python custom_ufo_test.py --model='weights/video_best.pth' --data_path='datasets/elvis' --output_dir='VSOD_results/wo_optical_flow/elvis' --task='VSOD'"
         result = subprocess.run(ufo_cmd, shell=True, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"UFO command failed: {result.stderr}")
             raise RuntimeError(f"UFO execution failed: {result.stderr}")
         
         # Move UFO masks to working directory
-        mask_source = "VSOD_results/wo_optical_flow/elvis/reference_frames"
+        mask_source = os.path.join(ufo_dir, "VSOD_results", "wo_optical_flow", "elvis", "reference_frames")
         if os.path.exists(mask_source):
             for mask_file in os.listdir(mask_source):
                 src_path = os.path.join(mask_source, mask_file)
@@ -186,86 +192,86 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         # Always return to original directory
         os.chdir(original_dir)
 
-def select_frames_to_drop(removability_scores: np.ndarray, drop_ratio: float = 0.1, validate_with_optical_flow: bool = True, video_path: str = None, motion_threshold: float = 2.0) -> list[int]:
-    """
-    Selects frames to drop using a "uniformity score" (mean/variance) and an
-    optional optical flow validation step.
+# def select_frames_to_drop(removability_scores: np.ndarray, drop_ratio: float = 0.1, validate_with_optical_flow: bool = True, video_path: str = None, motion_threshold: float = 2.0) -> list[int]:
+#     """
+#     Selects frames to drop using a "uniformity score" (mean/variance) and an
+#     optional optical flow validation step.
 
-    Args:
-        removability_scores: Your 3D array of per-block scores.
-        drop_ratio: The target fraction of frames to drop.
-        validate_with_optical_flow: If True, uses optical flow as a final check.
-        video_path: Path to the video file (required if validation is enabled).
-        motion_threshold: Max allowed motion magnitude for a drop to be confirmed.
+#     Args:
+#         removability_scores: Your 3D array of per-block scores.
+#         drop_ratio: The target fraction of frames to drop.
+#         validate_with_optical_flow: If True, uses optical flow as a final check.
+#         video_path: Path to the video file (required if validation is enabled).
+#         motion_threshold: Max allowed motion magnitude for a drop to be confirmed.
 
-    Returns:
-        A final list of frame indices to be dropped.
-    """
-    if validate_with_optical_flow and not video_path:
-        raise ValueError("video_path must be provided if validate_with_optical_flow is True.")
+#     Returns:
+#         A final list of frame indices to be dropped.
+#     """
+#     if validate_with_optical_flow and not video_path:
+#         raise ValueError("video_path must be provided if validate_with_optical_flow is True.")
 
-    # 1. Calculate frame uniformity scores (mean/variance) - integrated from calculate_frame_uniformity_scores
-    print("Calculating frame uniformity scores (mean/variance)...")
+#     # 1. Calculate frame uniformity scores (mean/variance) - integrated from calculate_frame_uniformity_scores
+#     print("Calculating frame uniformity scores (mean/variance)...")
     
-    if removability_scores.ndim != 3:
-        raise ValueError("Input must be a 3D array of shape (frames, height, width)")
+#     if removability_scores.ndim != 3:
+#         raise ValueError("Input must be a 3D array of shape (frames, height, width)")
 
-    # Calculate mean and variance across all blocks for each frame
-    mean_scores = np.mean(removability_scores, axis=(1, 2))
-    variance_scores = np.var(removability_scores, axis=(1, 2))
+#     # Calculate mean and variance across all blocks for each frame
+#     mean_scores = np.mean(removability_scores, axis=(1, 2))
+#     variance_scores = np.var(removability_scores, axis=(1, 2))
 
-    # Normalize both to prevent scale issues
-    normalized_mean = normalize_array(mean_scores)
-    normalized_variance = normalize_array(variance_scores)
+#     # Normalize both to prevent scale issues
+#     normalized_mean = normalize_array(mean_scores)
+#     normalized_variance = normalize_array(variance_scores)
 
-    # Combine them. We want high mean and low variance.
-    # Add a small epsilon to the denominator to avoid division by zero.
-    epsilon = 1e-6
-    frame_scores = normalized_mean / (normalized_variance + epsilon)
+#     # Combine them. We want high mean and low variance.
+#     # Add a small epsilon to the denominator to avoid division by zero.
+#     epsilon = 1e-6
+#     frame_scores = normalized_mean / (normalized_variance + epsilon)
     
-    # Final normalization of the combined score
-    frame_scores = normalize_array(frame_scores)
+#     # Final normalization of the combined score
+#     frame_scores = normalize_array(frame_scores)
     
-    # We assume scene changes are already handled, so we don't mark any frames as forbidden.
+#     # We assume scene changes are already handled, so we don't mark any frames as forbidden.
 
-    # 2. Get initial candidates based on the uniformity score
-    num_frames = len(frame_scores)
-    num_to_drop_target = int(num_frames * drop_ratio)
+#     # 2. Get initial candidates based on the uniformity score
+#     num_frames = len(frame_scores)
+#     num_to_drop_target = int(num_frames * drop_ratio)
     
-    # Get indices sorted by score (high score = good candidate)
-    sorted_indices = np.argsort(frame_scores)[::-1]
+#     # Get indices sorted by score (high score = good candidate)
+#     sorted_indices = np.argsort(frame_scores)[::-1]
     
-    # 3. Select and (optionally) validate candidates
-    final_dropped_indices = []
-    dropped_flags = np.zeros(num_frames, dtype=bool)
+#     # 3. Select and (optionally) validate candidates
+#     final_dropped_indices = []
+#     dropped_flags = np.zeros(num_frames, dtype=bool)
 
-    print("Selecting best candidate frames...")
-    for idx in sorted_indices:
-        if len(final_dropped_indices) >= num_to_drop_target:
-            break
+#     print("Selecting best candidate frames...")
+#     for idx in sorted_indices:
+#         if len(final_dropped_indices) >= num_to_drop_target:
+#             break
 
-        # Boundary and consecutive-frame checks are essential
-        if idx == 0 or idx == num_frames - 1 or dropped_flags[idx-1] or dropped_flags[idx+1]:
-            continue
+#         # Boundary and consecutive-frame checks are essential
+#         if idx == 0 or idx == num_frames - 1 or dropped_flags[idx-1] or dropped_flags[idx+1]:
+#             continue
         
-        # --- Validation Step ---
-        is_candidate_valid = True
-        if validate_with_optical_flow:
-            motion_magnitude = calculate_motion_coherence(video_path, idx - 1, idx + 1)
-            if motion_magnitude >= motion_threshold:
-                is_candidate_valid = False # Motion is too complex, reject candidate
+#         # --- Validation Step ---
+#         is_candidate_valid = True
+#         if validate_with_optical_flow:
+#             motion_magnitude = calculate_motion_coherence(video_path, idx - 1, idx + 1)
+#             if motion_magnitude >= motion_threshold:
+#                 is_candidate_valid = False # Motion is too complex, reject candidate
         
-        if is_candidate_valid:
-            final_dropped_indices.append(idx)
-            dropped_flags[idx] = True
+#         if is_candidate_valid:
+#             final_dropped_indices.append(idx)
+#             dropped_flags[idx] = True
     
-    print(f"Targeted {num_to_drop_target} frames to drop.")
-    if validate_with_optical_flow:
-        print(f"Confirmed {len(final_dropped_indices)} frames after motion validation.")
-    else:
-        print(f"Selected {len(final_dropped_indices)} frames based on uniformity score alone.")
+#     print(f"Targeted {num_to_drop_target} frames to drop.")
+#     if validate_with_optical_flow:
+#         print(f"Confirmed {len(final_dropped_indices)} frames after motion validation.")
+#     else:
+#         print(f"Selected {len(final_dropped_indices)} frames based on uniformity score alone.")
           
-    return sorted(final_dropped_indices)
+#     return sorted(final_dropped_indices)
 
 def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: int = 1000000) -> None:
     """
@@ -929,27 +935,29 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
 
 if __name__ == "__main__":
     # Example usage parameters
-
     reference_video = "davis_test/bear.mp4"
     width, height = 640, 368
     block_size = 16
     segment_size = 30  # Number of frames per segment for processing
 
+    # Dictionary to store execution times
+    execution_times = {}
+
     # Calculate appropriate target bitrate based on video characteristics
-    framerate = cv2.VideoCapture(reference_video).get(cv2.CAP_PROP_FPS)
+    cap = cv2.VideoCapture(reference_video)
+    framerate = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
     target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
-    print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
 
     # SERVER SIDE
 
-    # Start recording time
+    # --- Video Preprocessing ---
     start = time.time()
 
     # Create experiment directory for all experiment-related files
     experiment_dir = "experiment"
     os.makedirs(experiment_dir, exist_ok=True)
 
-    # resize video based on required resolution, save raw and frames for reference
     print(f"Processing video: {reference_video}")
     print(f"Target resolution: {width}x{height}")
     print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
@@ -959,16 +967,18 @@ if __name__ == "__main__":
 
     print("Converting video to raw YUV format...")
     raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
-    os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
+    os.system(f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
     print("Extracting reference frames...")
-    os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
+    os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
 
     end = time.time()
+    execution_times["preprocessing"] = end - start
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
+
+    # --- Removability Score Calculation ---
     start = time.time()
 
-    # Calculate removability scores with integrated temporal smoothing
     print(f"Calculating removability scores with block size: {block_size}x{block_size}")
     removability_scores = calculate_removability_scores(
         raw_video_file=raw_video_path,
@@ -980,15 +990,17 @@ if __name__ == "__main__":
         working_dir=experiment_dir,
         smoothing_beta=0.5
     )
+    
     end = time.time()
+    execution_times["removability_score_calculation"] = end - start
     print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
-    start = time.time()
 
-    # Benchmark 1: traditional encoding with H.265
+    # --- Baseline H.265 Encoding ---
+    start = time.time()
+    
     print(f"Encoding reference frames with H.265 for baseline comparison...")
     baseline_video_h265 = os.path.join(experiment_dir, "baseline.mp4")
 
-    # Use subprocess for better control and consistency with adaptive encoding
     baseline_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-framerate", str(framerate),
@@ -997,7 +1009,7 @@ if __name__ == "__main__":
         "-b:v", str(target_bitrate),
         "-minrate", str(int(target_bitrate * 0.9)),
         "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),  # Small buffer for strict bitrate control
+        "-bufsize", str(target_bitrate),
         "-preset", "medium",
         "-g", "1",
         "-y", baseline_video_h265
@@ -1007,18 +1019,17 @@ if __name__ == "__main__":
     if result.returncode != 0:
         print(f"Baseline encoding failed: {result.stderr}")
         raise RuntimeError(f"Baseline encoding failed: {result.stderr}")
-    else:
-        print("Baseline encoding completed successfully")
 
     end = time.time()
+    execution_times["baseline_encoding"] = end - start
     print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
+
+    # --- Adaptive ROI H.265 Encoding ---
     start = time.time()
 
-    # Benchmark 2: adaptive encoding
     print(f"Encoding frames with ROI-based adaptive quantization...")
     adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
 
-    # Use same encoder parameters as baseline encoding for fair comparison
     encode_with_roi(
         input_frames_dir=reference_frames_dir,
         output_video=adaptive_video_h265,
@@ -1032,18 +1043,18 @@ if __name__ == "__main__":
     )
 
     end = time.time()
+    execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
+
+    # --- ELVIS v1 (zero information removal and inpainting) ---
+
+
+    # --- Performance Analysis ---
     start = time.time()
-
-    # Benchmark 3: ELVIS 1 (zero information removal and inpainting)
-
-    # Method 1: 
-
-
+    
     # Compare file sizes and quality metrics
     baseline_size = os.path.getsize(baseline_video_h265)
     adaptive_size = os.path.getsize(adaptive_video_h265)
-    compression_ratio = baseline_size / adaptive_size
 
     print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
     print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
@@ -1051,27 +1062,22 @@ if __name__ == "__main__":
     print(f"Size ratio: {adaptive_size / baseline_size:.2f}x")
     print(f"Size difference: {(adaptive_size - baseline_size) / baseline_size * 100:+.1f}%")
 
-    # Comprehensive quality comparison
     encoded_videos = {
         "Baseline H.265": baseline_video_h265,
         "Adaptive ROI": adaptive_video_h265
     }
 
-    # Define quality metrics to analyze
     quality_metrics = {
         "PSNR": psnr,
         "SSIM": msssim
     }
 
-    # Set up UFO masks directory (created during removability calculation)
     ufo_masks_dir = os.path.join(experiment_dir, "UFO_masks")
     
-    # Define sample frames for heatmap generation
     frame_count = len(os.listdir(reference_frames_dir))
     sample_frames = [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
-    sample_frames = [f for f in sample_frames if f < frame_count]  # Ensure frames exist
+    sample_frames = [f for f in sample_frames if f < frame_count]
 
-    # Run comprehensive quality analysis
     analysis_results = analyze_encoding_performance(
         reference_frames_dir=reference_frames_dir,
         encoded_videos=encoded_videos,
@@ -1083,11 +1089,20 @@ if __name__ == "__main__":
         masks_dir=ufo_masks_dir,
         sample_frames=sample_frames
     )
+    
+    # Add collected times to the results dictionary
+    analysis_results["execution_times_seconds"] = execution_times
+
+    # Add video parameters to the results dictionary
+    analysis_results["video_length_seconds"] = frame_count / framerate
+    analysis_results["video_framerate"] = framerate
+    analysis_results["video_resolution"] = f"{width}x{height}"
+    analysis_results["block_size"] = block_size
+    analysis_results["segment_size_frames"] = segment_size
+    analysis_results["target_bitrate_bps"] = target_bitrate
+    
     # Save analysis results to a JSON file
     results_json_path = os.path.join(experiment_dir, "analysis_results.json")
     with open(results_json_path, 'w') as f:
         json.dump(analysis_results, f, indent=4)
     print(f"Analysis results saved to: {results_json_path}")
-
-    end = time.time()
-    print(f"Encoding performance analysis completed in {end - start:.2f} seconds.\n")

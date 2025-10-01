@@ -1,4 +1,5 @@
 # cd elvis && conda env create -f environment.yml && conda activate elvis2 && mim install mmcv==2.1.0 mmdet==3.2.0 mmpose==1.3.2 mmpretrain
+# For UFO to work, custom_ufo_test.py needs to be moved to UFO root
 name: elvis2
 channels:
   - pytorch
