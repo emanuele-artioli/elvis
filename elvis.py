@@ -10,6 +10,8 @@ from skimage.metrics import structural_similarity as ssim
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import json
+import functools
+import multiprocessing
 
 
 
@@ -365,7 +367,7 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 "-maxrate", str(int(target_bitrate * 1.1)),
                 "-bufsize", str(target_bitrate),
                 "-preset", "medium",
-                "-g", "1",
+                "-g", "10",
                 "-y", segment_file
             ])
             
@@ -428,33 +430,9 @@ def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     
     return min(psnr_val, 100.0)
 
-def msssim(ref_block: np.ndarray, test_block: np.ndarray) -> float:
-    """
-    Calculates the MS-SSIM for a single pair of image blocks.
-    """
-    # Get the minimum dimension of the block
-    min_dim = min(ref_block.shape[0], ref_block.shape[1])
-    # Set window size to be at most the minimum dimension and ensure it's odd
-    win_size = min(7, min_dim)
-    if win_size % 2 == 0:
-        win_size -= 1
-    # Ensure win_size is at least 3
-    win_size = max(3, win_size)
-    
-    return ssim(ref_block, test_block, gaussian_weights=True, data_range=255, channel_axis=-1, win_size=win_size)
-
 def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
     """
-    Applies a given metric function to each pair of blocks.
-
-    Args:
-        ref_blocks: 5D array of reference blocks.
-        test_blocks: 5D array of test blocks.
-        metric_func: The metric function to apply (e.g., psnr, ssim).
-                     It should accept two blocks (np.ndarray) as its first arguments.
-
-    Returns:
-        A 2D NumPy array (map) of the calculated metric scores.
+    Applies a given metric function to each pair of blocks in parallel.
     """
     num_blocks_y, num_blocks_x, block_h, block_w, channels = ref_blocks.shape
     
@@ -462,9 +440,14 @@ def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, 
     ref_blocks_list = ref_blocks.reshape(-1, block_h, block_w, channels)
     test_blocks_list = test_blocks.reshape(-1, block_h, block_w, channels)
     
-    # Use a list comprehension to apply the metric function to each block pair
-    scores_flat = [metric_func(r, t) for r, t in zip(ref_blocks_list, test_blocks_list)]
+    # Create pairs of (ref_block, test_block) for starmap
+    block_pairs = zip(ref_blocks_list, test_blocks_list)
     
+    # Use a multiprocessing pool to parallelize the metric calculation
+    # By default, this uses all available CPU cores.
+    with multiprocessing.Pool() as pool:
+        scores_flat = pool.starmap(metric_func, block_pairs)
+        
     # Reshape the flat list of scores back into a 2D map
     metric_map = np.array(scores_flat).reshape(num_blocks_y, num_blocks_x)
     
@@ -489,7 +472,7 @@ def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     blocks = image.reshape(num_rows, block_size, num_cols, block_size, C).transpose(0, 2, 1, 3, 4)
     return blocks
 
-def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_sizes: Dict[str, int] = {}) -> Dict:
+def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_bitrates: Dict[str, float] = {}) -> Dict:
     """
     A comprehensive function to analyze and compare video encoding performance.
 
@@ -511,6 +494,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         temp_dir: A directory for temporary files (decoded frames, heatmaps).
         masks_dir: Path to the directory with UFO masks.
         sample_frames: A list of frame indices to generate heatmaps for.
+        video_bitrates: Dictionary mapping video name to bitrate in bps.
 
     Returns:
         A dictionary containing the aggregated analysis results for each video.
@@ -611,7 +595,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             return
 
         # Header
-        print(f"{'Method':<25} {'Region':<12} {'SSIM':<12} {'PSNR (dB)':<12} {'Blocks':<12} {'File Size (MB)':<18}")
+        print(f"{'Method':<25} {'Region':<12} {'SSIM':<12} {'PSNR (dB)':<12} {'Blocks':<12} {'Bitrate (Mbps)':<18}")
         print(f"{'-'*100}")
 
         for video_name, data in results.items():
@@ -624,7 +608,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             bg_ssim_str = f"{bg_data['ssim_mean']:.4f} ± {bg_data['ssim_std']:.4f}"
             bg_psnr_str = f"{bg_data['psnr_mean']:.2f} ± {bg_data['psnr_std']:.2f}"
             
-            print(f"{video_name:<25} {'Foreground':<12} {fg_ssim_str:<12} {fg_psnr_str:<12} {fg_data['block_count']:<12} {data['file_size_mb']:<18.2f}")
+            print(f"{video_name:<25} {'Foreground':<12} {fg_ssim_str:<12} {fg_psnr_str:<12} {fg_data['block_count']:<12} {data['bitrate_mbps']:<18.2f}")
             print(f"{'':<25} {'Background':<12} {bg_ssim_str:<12} {bg_psnr_str:<12} {bg_data['block_count']:<12}")
             print(f"{'-'*100}")
 
@@ -699,10 +683,31 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             ref_blocks = split_image_into_blocks(ref_frame, block_size)
             test_blocks = split_image_into_blocks(decoded_frame, block_size)
 
+            # Calculate win_size ONCE before processing all blocks for the frame.
+            min_dim = block_size
+            win_size = min(7, min_dim)
+            if win_size % 2 == 0:
+                win_size -= 1
+            win_size = max(3, win_size)
+
+            metrics_to_run = {}
+            if 'PSNR' in metrics:
+                metrics_to_run['PSNR'] = psnr # psnr has no extra params, so it's fine
+            if 'SSIM' in metrics:
+                # Create a new function that is ssim() with win_size already set
+                ssim_with_win_size = functools.partial(
+                    ssim, 
+                    gaussian_weights=True, 
+                    data_range=255, 
+                    channel_axis=-1, 
+                    win_size=win_size
+                )
+                metrics_to_run['SSIM'] = ssim_with_win_size
+
             # 3. Calculate all requested metrics
             frame_metric_maps = {
                 name: calculate_blockwise_metric(ref_blocks, test_blocks, func)
-                for name, func in metrics.items()
+                for name, func in metrics_to_run.items()
             }
 
             # 4. Separate FG/BG scores if masks are available
@@ -739,7 +744,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         analysis_results[video_name] = {
             'foreground': {},
             'background': {},
-            'file_size_mb': video_sizes[video_name] / (1024 * 1024) if video_name in video_sizes else 0
+            'bitrate_mbps': video_bitrates[video_name] / 1000000 if video_name in video_bitrates else 0
         }
         for name in metrics:
             fg_vals = [v for v in fg_scores[name] if np.isfinite(v)]
@@ -1095,7 +1100,7 @@ if __name__ == "__main__":
         "-maxrate", str(int(target_bitrate * 1.1)),
         "-bufsize", str(target_bitrate),
         "-preset", "medium",
-        "-g", "1",
+        "-g", "10",
         "-y", baseline_video
     ]
     result = subprocess.run(baseline_cmd, capture_output=True, text=True)
@@ -1155,7 +1160,7 @@ if __name__ == "__main__":
         "-maxrate", str(int(target_bitrate * 1.1)),
         "-bufsize", str(target_bitrate),
         "-preset", "medium",
-        "-g", "1",
+        "-g", "10",
         "-y", shrunk_video
     ]
     result = subprocess.run(shrunk_cmd, capture_output=True, text=True)
@@ -1278,7 +1283,7 @@ if __name__ == "__main__":
 
     print("Evaluating and comparing encoding performance...")
     start = time.time()
-    
+
     # Compare file sizes and quality metrics
     video_sizes = {
         "Baseline": os.path.getsize(baseline_video),
@@ -1286,9 +1291,12 @@ if __name__ == "__main__":
         "ELVIS v1": os.path.getsize(shrunk_video)
     }
 
+    duration = len(os.listdir(reference_frames_dir)) / framerate
+    bitrates = {key: (size * 8) / duration for key, size in video_sizes.items()}
+
     print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
-    for key, size in video_sizes.items():
-        print(f"{key} video size: {size / 1024 / 1024:.2f} MB")
+    for key, bitrate in bitrates.items():
+        print(f"{key} bitrate: {bitrate / 1000000:.2f} Mbps")
 
     encoded_videos = {
         "Baseline": baseline_video,
@@ -1298,13 +1306,13 @@ if __name__ == "__main__":
 
     quality_metrics = {
         "PSNR": psnr,
-        "SSIM": msssim
+        "SSIM": ssim
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "UFO_masks")
     
     frame_count = len(os.listdir(reference_frames_dir))
-    sample_frames = [0, frame_count // 2, frame_count - 1] # [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
+    sample_frames = [frame_count // 2] # [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
     sample_frames = [f for f in sample_frames if f < frame_count]
 
     analysis_results = analyze_encoding_performance(
@@ -1317,7 +1325,7 @@ if __name__ == "__main__":
         temp_dir=experiment_dir,
         masks_dir=ufo_masks_dir,
         sample_frames=sample_frames,
-        video_sizes=video_sizes
+        video_bitrates=bitrates
     )
     
     # Add collected times to the results dictionary
