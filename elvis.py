@@ -336,6 +336,12 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             
             roi_filter_string = ",".join(roi_filters) if roi_filters else ""
             
+            # Create a temporary file for the filter script
+            roi_script_path = os.path.join(segments_dir, f"roi_script_{segment_idx:03d}.txt")
+            if roi_filter_string:
+                with open(roi_script_path, 'w') as f:
+                    f.write(roi_filter_string)
+            
             # Create segment video file
             segment_file = os.path.join(segments_dir, f"segment_{segment_idx:03d}.mp4")
             
@@ -348,8 +354,9 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 "-frames:v", str(segment_end - segment_start),
             ]
             
+            # Use -filter_complex_script to read the filter graph from the file.
             if roi_filter_string:
-                cmd.extend(["-vf", roi_filter_string])
+                cmd.extend(["-filter_complex_script", roi_script_path])
             
             cmd.extend([
                 "-c:v", "libx265",
@@ -391,9 +398,10 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             "-y", output_video
         ]
         
-        result = subprocess.run(concat_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Concatenation failed: {result.stderr}")
+        try:
+            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Concatenation failed: {e.stderr}") from e
             
     finally:
         # --- Part 3: Clean up all temporary files and directories ---
@@ -424,7 +432,16 @@ def msssim(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     """
     Calculates the MS-SSIM for a single pair of image blocks.
     """
-    return ssim(ref_block, test_block, gaussian_weights=True, data_range=255, channel_axis=-1)
+    # Get the minimum dimension of the block
+    min_dim = min(ref_block.shape[0], ref_block.shape[1])
+    # Set window size to be at most the minimum dimension and ensure it's odd
+    win_size = min(7, min_dim)
+    if win_size % 2 == 0:
+        win_size -= 1
+    # Ensure win_size is at least 3
+    win_size = max(3, win_size)
+    
+    return ssim(ref_block, test_block, gaussian_weights=True, data_range=255, channel_axis=-1, win_size=win_size)
 
 def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
     """
@@ -472,7 +489,7 @@ def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     blocks = image.reshape(num_rows, block_size, num_cols, block_size, C).transpose(0, 2, 1, 3, 4)
     return blocks
 
-def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40]) -> Dict:
+def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_sizes: Dict[str, int] = {}) -> Dict:
     """
     A comprehensive function to analyze and compare video encoding performance.
 
@@ -722,7 +739,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         analysis_results[video_name] = {
             'foreground': {},
             'background': {},
-            'file_size_mb': os.path.getsize(video_path) / (1024 * 1024)
+            'file_size_mb': video_sizes[video_name] / (1024 * 1024) if video_name in video_sizes else 0
         }
         for name in metrics:
             fg_vals = [v for v in fg_scores[name] if np.isfinite(v)]
@@ -793,7 +810,7 @@ def stretch_frame(shrunk_frame: np.ndarray, binary_mask: np.ndarray, block_size:
     return reconstructed_image
 
 
-def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, to_remove: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
+def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """
     Selects and removes blocks from a single image based on removability scores.
 
@@ -807,7 +824,7 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
         image: The original image for the frame (H, W, C).
         frame_scores: The 2D array of final scores for this frame (num_blocks_y, num_blocks_x).
         block_size: The side length (l) of each block block.
-        to_remove: The number of blocks to remove per row. If < 1, it's a percentage.
+        shrink_amount: The number of blocks to remove per row. If < 1, it's a percentage.
 
     Returns:
         A tuple containing:
@@ -818,10 +835,10 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
     num_blocks_y, num_blocks_x = frame_scores.shape
     
     # --- 1. Selection Step ---
-    if to_remove < 1.0:
-        num_blocks_to_remove = int(to_remove * num_blocks_x)
+    if shrink_amount < 1.0:
+        num_blocks_to_remove = int(shrink_amount * num_blocks_x)
     else:
-        num_blocks_to_remove = int(to_remove)
+        num_blocks_to_remove = int(shrink_amount)
     num_blocks_to_remove = min(num_blocks_to_remove, num_blocks_x)
 
     block_coords_to_remove = []
@@ -992,10 +1009,10 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
 if __name__ == "__main__":
     # Example usage parameters
     reference_video = "davis_test/bear.mp4"
-    width, height = 640, 368
-    block_size = 16
-    segment_size = 30  # Number of frames per segment for processing
-    to_remove = 0.25      # Number of blocks to remove per row in ELVIS v1
+    width, height = 640, 360
+    block_size = 8
+    segment_size = 10  # Number of frames per segment for processing
+    shrink_amount = 0.25      # Number of blocks to remove per row in ELVIS v1
 
     # Dictionary to store execution times
     execution_times = {}
@@ -1116,19 +1133,19 @@ if __name__ == "__main__":
 
     # --- ELVIS v1 (shrinking and extracting metadata) ---
     start = time.time()
-    print(f"Encoding frames with ELVIS v1...")
+    print(f"Shrinking and encoding frames with ELVIS v1...")
 
-    # Remove blocks based on removability scores
+    # Shrink frames based on removability scores
     shrunk_frames_dir = os.path.join(experiment_dir, "shrunk_frames")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
-    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, to_remove=to_remove) for img, scores in zip(reference_frames, removability_scores)))
+    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
     for i, frame in enumerate(shrunk_frames):
         cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.jpg"), frame)
 
     # Encode the shrunk frames
     shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
-    elvis_cmd = [
+    shrunk_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-framerate", str(framerate),
         "-i", f"{shrunk_frames_dir}/%05d.jpg",
@@ -1141,10 +1158,10 @@ if __name__ == "__main__":
         "-g", "1",
         "-y", shrunk_video
     ]
-    result = subprocess.run(elvis_cmd, capture_output=True, text=True)
+    result = subprocess.run(shrunk_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"ELVIS v1 encoding failed: {result.stderr}")
-        raise RuntimeError(f"ELVIS v1 encoding failed: {result.stderr}")
+        print(f"Shrunk encoding failed: {result.stderr}")
+        raise RuntimeError(f"Shrunk encoding failed: {result.stderr}")
 
     # Save compressed metadata about removed blocks
     removal_masks = np.array(removal_masks, dtype=np.uint8)
@@ -1152,8 +1169,8 @@ if __name__ == "__main__":
     np.savez(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"), packed=masks_packed, shape=removal_masks.shape)
 
     end = time.time()
-    execution_times["elvis_v1_encoding"] = end - start
-    print(f"ELVIS v1 encoding completed in {end - start:.2f} seconds.\n")
+    execution_times["elvis_v1_shrinking"] = end - start
+    print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -1165,16 +1182,32 @@ if __name__ == "__main__":
 
     # --- ELVIS v1 (stretching and inpainting) ---
     start = time.time()
-    print(f"Decoding metadata and stretching ELVIS v1 video...")
+    print(f"Decoding and stretching ELVIS v1 video...")
 
     # Decode the shrunk video to frames
     removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
     removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
     stretched_frames_dir = os.path.join(experiment_dir, "stretched_frames")
     os.makedirs(stretched_frames_dir, exist_ok=True)
-    for shrunk_frame, mask in zip(shrunk_frames, removal_masks):
-        stretched_frame = stretch_frame(shrunk_frame, mask, block_size)
-        cv2.imwrite(os.path.join(stretched_frames_dir, f"{len(os.listdir(stretched_frames_dir))+1:05d}.jpg"), stretched_frame)
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-i", shrunk_video,
+        "-q:v", "1",
+        "-r", str(framerate),
+        "-f", "image2",
+        "-start_number", "1",
+        "-y", f"{stretched_frames_dir}/%05d.jpg"
+    ]
+    result = subprocess.run(decode_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Stretched decoding failed: {result.stderr}")
+        raise RuntimeError(f"Stretched decoding failed: {result.stderr}")
+
+    # Stretch each frame using the removal masks
+    stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg")) for i in range(len(removal_masks))]
+    stretched_frames = [stretch_frame(img, mask, block_size) for img, mask in zip(stretched_frames, removal_masks)]
+    for i, frame in enumerate(stretched_frames):
+        cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg"), frame)
 
     # Convert removal_masks to mask images for inpainting (considering block size)
     removal_masks_dir = os.path.join(experiment_dir, "removal_masks")
@@ -1183,6 +1216,10 @@ if __name__ == "__main__":
         mask_img = (mask * 255).astype(np.uint8)
         mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
         cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
+
+    end = time.time()
+    execution_times["elvis_v1_stretching"] = end - start
+    print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
 
     # Encode the stretched frames losslessly TODO: this is not needed in practice
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
@@ -1199,10 +1236,6 @@ if __name__ == "__main__":
     if result.returncode != 0:
         print(f"ELVIS v1 stretching failed: {result.stderr}")
         raise RuntimeError(f"ELVIS v1 stretching failed: {result.stderr}")
-
-    end = time.time()
-    execution_times["elvis_v1_stretching"] = end - start
-    print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
 
     # --- Inpainting ---
     start = time.time()
@@ -1221,7 +1254,7 @@ if __name__ == "__main__":
     execution_times["elvis_v1_inpainting"] = end - start
     print(f"ELVIS v1 inpainting completed in {end - start:.2f} seconds.\n")
 
-    # Encode the inpainted frames losslessly
+    # Encode the inpainted frames losslessly TODO: this is not needed in practice
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
     inpaint_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1234,12 +1267,8 @@ if __name__ == "__main__":
     ]
     result = subprocess.run(inpaint_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"ELVIS v1 inpainting encoding failed: {result.stderr}")
-        raise RuntimeError(f"ELVIS v1 inpainting encoding failed: {result.stderr}")
-
-    end = time.time()
-    execution_times["elvis_v1_encoding"] = end - start
-    print(f"ELVIS v1 encoding completed in {end - start:.2f} seconds.\n")
+        print(f"Inpainted encoding failed: {result.stderr}")
+        raise RuntimeError(f"Inpainted encoding failed: {result.stderr}")
 
 
 
@@ -1251,14 +1280,15 @@ if __name__ == "__main__":
     start = time.time()
     
     # Compare file sizes and quality metrics
-    baseline_size = os.path.getsize(baseline_video)
-    adaptive_size = os.path.getsize(adaptive_video)
-    shrunk_size = os.path.getsize(shrunk_video)
+    video_sizes = {
+        "Baseline": os.path.getsize(baseline_video),
+        "Adaptive": os.path.getsize(adaptive_video),
+        "ELVIS v1": os.path.getsize(shrunk_video)
+    }
 
     print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
-    print(f"Baseline video size: {baseline_size / 1024 / 1024:.2f} MB")
-    print(f"Adaptive video size: {adaptive_size / 1024 / 1024:.2f} MB")
-    print(f"ELVIS v1 video size: {shrunk_size / 1024 / 1024:.2f} MB")
+    for key, size in video_sizes.items():
+        print(f"{key} video size: {size / 1024 / 1024:.2f} MB")
 
     encoded_videos = {
         "Baseline": baseline_video,
@@ -1274,7 +1304,7 @@ if __name__ == "__main__":
     ufo_masks_dir = os.path.join(experiment_dir, "UFO_masks")
     
     frame_count = len(os.listdir(reference_frames_dir))
-    sample_frames = [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
+    sample_frames = [0, frame_count // 2, frame_count - 1] # [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
     sample_frames = [f for f in sample_frames if f < frame_count]
 
     analysis_results = analyze_encoding_performance(
@@ -1286,7 +1316,8 @@ if __name__ == "__main__":
         height=height,
         temp_dir=experiment_dir,
         masks_dir=ufo_masks_dir,
-        sample_frames=sample_frames
+        sample_frames=sample_frames,
+        video_sizes=video_sizes
     )
     
     # Add collected times to the results dictionary
