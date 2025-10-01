@@ -41,7 +41,7 @@ def normalize_array(arr: np.ndarray) -> np.ndarray:
         return (arr - min_val) / (max_val - min_val)
     return arr
 
-def calculate_removability_scores(raw_video_file: str, reference_frames_folder: str, width: int, height: int, square_size: int, alpha: float = 0.5, working_dir: str = ".") -> np.ndarray:
+def calculate_removability_scores(raw_video_file: str, reference_frames_folder: str, width: int, height: int, square_size: int, alpha: float = 0.5, working_dir: str = ".", smoothing_beta: float = 1) -> np.ndarray:
     """
     This function computes a "removability score" by running EVCA for complexity analysis
     and UFO for object detection, then combining the results. Higher scores mean the block is a
@@ -55,6 +55,7 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         square_size: The size of each block in pixels.
         alpha: The weight for combining spatial and temporal scores.
         working_dir: Working directory for temporary files (default: current directory).
+        smoothing_beta: Smoothing factor for temporal smoothing. 1.0 = no smoothing, 0.0 = only previous frame (default: 1).
 
     Returns:
         A 3D NumPy array of shape (num_frames, num_blocks_y, num_blocks_x)
@@ -160,6 +161,20 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
             else:
                 print(f"Warning: Mask file not found for frame {i}: {mask_path}")
 
+        # Apply temporal smoothing if requested
+        if smoothing_beta < 1 and removability_scores.shape[0] >= 2:
+            print("Applying temporal smoothing to removability scores...")
+            smoothed_scores = np.zeros_like(removability_scores)
+            
+            # The first frame has no prior frame, so its scores remain unchanged.
+            smoothed_scores[0] = removability_scores[0]
+
+            # For all subsequent frames, apply the smoothing formula.
+            # This is a vectorized operation, which is very fast.
+            smoothed_scores[1:] = smoothing_beta * removability_scores[1:] + (1 - smoothing_beta) * removability_scores[:-1]
+            
+            removability_scores = smoothed_scores
+
         return removability_scores
     
     except Exception as e:
@@ -168,37 +183,6 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
     finally:
         # Always return to original directory
         os.chdir(original_dir)
-
-def apply_temporal_smoothing(scores: np.ndarray, beta: float = 0.5) -> np.ndarray:
-    """
-    Applies temporal smoothing across frames to a score array.
-
-    This function helps reduce flicker or jitter in decisions made based on these
-    scores by blending the scores of a frame with the scores of the preceding frame.
-
-    Args:
-        scores: A 3D NumPy array of scores (num_frames, num_blocks_y, num_blocks_x).
-        beta: The smoothing factor. A value of 1.0 means no smoothing (only use
-              current frame), while a value of 0.0 would mean only using the
-              previous frame's scores.
-
-    Returns:
-        A new 3D NumPy array of the same shape with smoothed scores.
-    """
-    if scores.ndim != 3 or scores.shape[0] < 2:
-        # Not enough frames to smooth, return the original scores
-        return scores
-
-    smoothed_scores = np.zeros_like(scores)
-    
-    # The first frame has no prior frame, so its scores remain unchanged.
-    smoothed_scores[0] = scores[0]
-
-    # For all subsequent frames, apply the smoothing formula.
-    # This is a vectorized operation, which is very fast.
-    smoothed_scores[1:] = beta * scores[1:] + (1 - beta) * scores[:-1]
-    
-    return smoothed_scores
 
 def calculate_frame_uniformity_scores(removability_scores: np.ndarray) -> np.ndarray:
     """
@@ -1643,7 +1627,7 @@ def main():
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
     start = time.time()
 
-    # Calculate removability scores and smooth them to avoid flickering
+    # Calculate removability scores with integrated temporal smoothing
     print(f"Calculating removability scores with block size: {square_size}x{square_size}")
     removability_scores = calculate_removability_scores(
         raw_video_file=raw_video_path,
@@ -1652,17 +1636,12 @@ def main():
         height=height,
         square_size=square_size,
         alpha=0.5,
-        working_dir=experiment_dir
+        working_dir=experiment_dir,
+        smoothing_beta=0.5
     )
-
-    print(f"Applying temporal smoothing to removability scores...")
-    removability_scores = apply_temporal_smoothing(removability_scores, beta=0.5)
-
     end = time.time()
     print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
     start = time.time()
-
-
 
     # Benchmark 1: traditional encoding with H.265
     print(f"Encoding reference frames with H.265 for baseline comparison...")
