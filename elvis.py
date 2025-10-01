@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import json
 
+
+
 def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> int:
     """
     Calculate an appropriate target bitrate based on video characteristics.
@@ -27,7 +29,7 @@ def calculate_target_bitrate(width: int, height: int, framerate: float, quality_
     # Basic bitrate calculation: pixels per second * bits per pixel
     pixels_per_second = width * height * framerate
     
-    # Base bits per pixel for H.265 (typically 0.1-0.2 for good quality)
+    # Base bits per pixel for  (typically 0.1-0.2 for good quality)
     bits_per_pixel = 0.3 * quality_factor
     
     # Calculate target bitrate in bps
@@ -460,7 +462,7 @@ def split_image_into_blocks(image: np.ndarray, l: int) -> np.ndarray:
     num_cols = m // l
     return image.reshape(num_rows, l, num_cols, l, c).transpose(0, 2, 1, 3, 4)
 
-def analyze_encoding_performance(reference_frames_dir: str, encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40]) -> Dict:
+def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40]) -> Dict:
     """
     A comprehensive function to analyze and compare video encoding performance.
 
@@ -472,7 +474,7 @@ def analyze_encoding_performance(reference_frames_dir: str, encoded_videos: Dict
     5. Prints a detailed summary report comparing all encoding methods.
 
     Args:
-        reference_frames_dir: Path to the directory with original frames.
+        reference_frames: List of original reference frames.
         encoded_videos: Dictionary mapping a method name to its video file path.
         metrics: Dictionary mapping a metric name (e.g., "PSNR") to its function.
                  The function must take two np.ndarray blocks as input.
@@ -648,9 +650,8 @@ def analyze_encoding_performance(reference_frames_dir: str, encoded_videos: Dict
         if not _decode_video_to_frames(video_path, video_decoded_dir):
             continue
             
-        ref_frame_files = sorted([f for f in os.listdir(reference_frames_dir) if f.endswith('.jpg')])
         decoded_frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.jpg')])
-        num_frames = min(len(ref_frame_files), len(decoded_frame_files))
+        num_frames = min(len(reference_frames), len(decoded_frame_files))
 
         # Storage for all metric values for this video
         # e.g., fg_scores['SSIM'] = [0.9, 0.95, ...], fg_scores['PSNR'] = [34.5, 35.1, ...]
@@ -659,7 +660,7 @@ def analyze_encoding_performance(reference_frames_dir: str, encoded_videos: Dict
 
         # 2. Process each frame
         for i in range(num_frames):
-            ref_frame = cv2.imread(os.path.join(reference_frames_dir, ref_frame_files[i]))
+            ref_frame = reference_frames[i]
             decoded_frame = cv2.imread(os.path.join(video_decoded_dir, decoded_frame_files[i]))
             
             if ref_frame is None or decoded_frame is None: continue
@@ -933,12 +934,14 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
     return final_block
 
 
+
 if __name__ == "__main__":
     # Example usage parameters
     reference_video = "davis_test/bear.mp4"
     width, height = 640, 368
     block_size = 16
     segment_size = 30  # Number of frames per segment for processing
+    to_remove = 0.25      # Number of blocks to remove per row in ELVIS v1
 
     # Dictionary to store execution times
     execution_times = {}
@@ -971,10 +974,12 @@ if __name__ == "__main__":
 
     print("Extracting reference frames...")
     os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
-
+    
     end = time.time()
     execution_times["preprocessing"] = end - start
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
+
+
 
     # --- Removability Score Calculation ---
     start = time.time()
@@ -995,11 +1000,13 @@ if __name__ == "__main__":
     execution_times["removability_score_calculation"] = end - start
     print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
 
-    # --- Baseline H.265 Encoding ---
+
+
+    # --- Baseline  Encoding ---
     start = time.time()
     
-    print(f"Encoding reference frames with H.265 for baseline comparison...")
-    baseline_video_h265 = os.path.join(experiment_dir, "baseline.mp4")
+    print(f"Encoding reference frames with  for baseline comparison...")
+    baseline_video = os.path.join(experiment_dir, "baseline.mp4")
 
     baseline_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1012,7 +1019,7 @@ if __name__ == "__main__":
         "-bufsize", str(target_bitrate),
         "-preset", "medium",
         "-g", "1",
-        "-y", baseline_video_h265
+        "-y", baseline_video
     ]
 
     result = subprocess.run(baseline_cmd, capture_output=True, text=True)
@@ -1024,15 +1031,16 @@ if __name__ == "__main__":
     execution_times["baseline_encoding"] = end - start
     print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
 
-    # --- Adaptive ROI H.265 Encoding ---
-    start = time.time()
 
+
+    # --- Adaptive ROI Encoding ---
+    start = time.time()
     print(f"Encoding frames with ROI-based adaptive quantization...")
-    adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
+    adaptive_video = os.path.join(experiment_dir, "adaptive.mp4")
 
     encode_with_roi(
         input_frames_dir=reference_frames_dir,
-        output_video=adaptive_video_h265,
+        output_video=adaptive_video,
         removability_scores=removability_scores,
         block_size=block_size,
         framerate=framerate,
@@ -1046,25 +1054,63 @@ if __name__ == "__main__":
     execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
 
+
+
     # --- ELVIS v1 (zero information removal and inpainting) ---
+    start = time.time()
+    print(f"Encoding frames with ELVIS v1...")
+
+    # Remove blocks based on removability scores
+    shrunk_frames_dir = os.path.join(experiment_dir, "shrunk_frames")
+    os.makedirs(shrunk_frames_dir, exist_ok=True)
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+    shrunk_frames = [apply_selective_removal(img, scores, block_size, to_remove=to_remove)[0] for img, scores in zip(reference_frames, removability_scores)]
+    for i, frame in enumerate(shrunk_frames):
+        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.jpg"), frame)
+
+    # Encode the shrunk frames
+    shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
+    elvis_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{shrunk_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-b:v", str(target_bitrate),
+        "-minrate", str(int(target_bitrate * 0.9)),
+        "-maxrate", str(int(target_bitrate * 1.1)),
+        "-bufsize", str(target_bitrate),
+        "-preset", "medium",
+        "-g", "1",
+        "-y", shrunk_video
+    ]
+    result = subprocess.run(elvis_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ELVIS v1 encoding failed: {result.stderr}")
+        raise RuntimeError(f"ELVIS v1 encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v1_encoding"] = end - start
+    print(f"ELVIS v1 encoding completed in {end - start:.2f} seconds.\n")
+
 
 
     # --- Performance Analysis ---
     start = time.time()
     
     # Compare file sizes and quality metrics
-    baseline_size = os.path.getsize(baseline_video_h265)
-    adaptive_size = os.path.getsize(adaptive_video_h265)
+    baseline_size = os.path.getsize(baseline_video)
+    adaptive_size = os.path.getsize(adaptive_video)
+    shrunk_size = os.path.getsize(shrunk_video)
 
     print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
-    print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
-    print(f"Adaptive ROI video size: {adaptive_size / 1024 / 1024:.2f} MB")
-    print(f"Size ratio: {adaptive_size / baseline_size:.2f}x")
-    print(f"Size difference: {(adaptive_size - baseline_size) / baseline_size * 100:+.1f}%")
+    print(f"Baseline video size: {baseline_size / 1024 / 1024:.2f} MB")
+    print(f"Adaptive video size: {adaptive_size / 1024 / 1024:.2f} MB")
+    print(f"ELVIS v1 video size: {shrunk_size / 1024 / 1024:.2f} MB")
 
     encoded_videos = {
-        "Baseline H.265": baseline_video_h265,
-        "Adaptive ROI": adaptive_video_h265
+        "Baseline": baseline_video,
+        "Adaptive": adaptive_video,
+        "ELVIS v1": shrunk_video
     }
 
     quality_metrics = {
@@ -1079,7 +1125,7 @@ if __name__ == "__main__":
     sample_frames = [f for f in sample_frames if f < frame_count]
 
     analysis_results = analyze_encoding_performance(
-        reference_frames_dir=reference_frames_dir,
+        reference_frames=reference_frames,
         encoded_videos=encoded_videos,
         metrics=quality_metrics,
         block_size=block_size,
