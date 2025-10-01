@@ -11,8 +11,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import json
 
-# Utility functions
-
 def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> int:
     """
     Calculate an appropriate target bitrate based on video characteristics.
@@ -269,45 +267,9 @@ def select_frames_to_drop(removability_scores: np.ndarray, drop_ratio: float = 0
           
     return sorted(final_dropped_indices)
 
-def concat_segments(segment_files: List[str], output_video: str) -> None:
-    """
-    Concatenate video segments into a single video file.
-    
-    Args:
-        segment_files: List of segment file paths
-        output_video: Output video file path
-    """
-    # Create a temporary file list for ffmpeg concat
-    temp_dir = os.path.dirname(output_video)
-    filelist_path = os.path.join(temp_dir, "segments_list.txt")
-    
-    try:
-        with open(filelist_path, 'w') as f:
-            for segment_file in segment_files:
-                f.write(f"file '{os.path.abspath(segment_file)}'\n")
-        
-        # Concatenate using ffmpeg
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", filelist_path,
-            "-c", "copy",
-            "-y", output_video
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Concatenation failed: {result.stderr}")
-            
-    finally:
-        # Clean up temporary file list
-        if os.path.exists(filelist_path):
-            os.remove(filelist_path)
-
 def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: int = 1000000) -> None:
     """
-    Encode video using ROI-based quantization.
+    Encode video using ROI-based quantization by processing in segments and then concatenating them.
     
     Args:
         input_frames_dir: Directory containing input frames
@@ -326,10 +288,11 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
     segments_dir = os.path.join(temp_dir, "segments")
     os.makedirs(segments_dir, exist_ok=True)
     
-    # Process frames in segments for better efficiency
     segment_files = []
-    
+    filelist_path = os.path.join(temp_dir, "segments_list.txt")
+
     try:
+        # --- Part 1: Encode video segments ---
         for segment_start in range(0, num_frames, segment_size):
             segment_end = min(segment_start + segment_size, num_frames)
             segment_idx = segment_start // segment_size
@@ -348,28 +311,21 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             
             # Create ROI filter string
             roi_filters = []
-            
             for block_y in range(num_blocks_y):
                 for block_x in range(num_blocks_x):
                     score = normalized_scores[block_y, block_x]
-                    
-                    # Calculate block boundaries
                     x1 = block_x * block_size
                     y1 = block_y * block_size
                     x2 = min(x1 + block_size, width)
                     y2 = min(y1 + block_size, height)
                     
                     # Convert removability score to quantization offset
-                    # High removability (background) -> positive offset (lower quality)
-                    # Low removability (important) -> negative offset (higher quality)
                     qoffset = (score - 0.5) * 2.0  # Maps [0,1] to [-1,1]
                     
-                    # Only add ROI if the offset is significant
                     if abs(qoffset) > 0.1:
                         roi_filter = f"addroi=x={x1}:y={y1}:w={x2-x1}:h={y2-y1}:qoffset={qoffset:.2f}"
                         roi_filters.append(roi_filter)
             
-            # Chain multiple addroi filters
             roi_filter_string = ",".join(roi_filters) if roi_filters else ""
             
             # Create segment video file
@@ -378,13 +334,12 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             # Build FFmpeg command for this segment
             cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                "-start_number", str(segment_start + 1),  # ffmpeg frames are 1-indexed
+                "-start_number", str(segment_start + 1),
                 "-framerate", str(framerate),
                 "-i", f"{input_frames_dir}/%05d.jpg",
                 "-frames:v", str(segment_end - segment_start),
             ]
             
-            # Add ROI filter if available
             if roi_filter_string:
                 cmd.extend(["-vf", roi_filter_string])
             
@@ -393,9 +348,9 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 "-b:v", str(target_bitrate),
                 "-minrate", str(int(target_bitrate * 0.9)),
                 "-maxrate", str(int(target_bitrate * 1.1)),
-                "-bufsize", str(target_bitrate),  # Small buffer for strict bitrate control
+                "-bufsize", str(target_bitrate),
                 "-preset", "medium",
-                "-g", "1",  # Shorter GOP for segments
+                "-g", "1",
                 "-y", segment_file
             ])
             
@@ -406,14 +361,39 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             
             segment_files.append(segment_file)
         
-        # Concatenate all segments into final video
+        # --- Part 2: Concatenate all segments into final video (inlined functionality) ---
+        if not segment_files:
+            print("No segments were generated.")
+            return
+
         print(f"Concatenating {len(segment_files)} segments into final video...")
-        concat_segments(segment_files, output_video)
+
+        # Create a temporary file list for ffmpeg concat
+        with open(filelist_path, 'w') as f:
+            for segment_file in segment_files:
+                f.write(f"file '{os.path.abspath(segment_file)}'\n")
         
+        # Concatenate using ffmpeg's concat demuxer
+        concat_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", filelist_path,
+            "-c", "copy",
+            "-y", output_video
+        ]
         
+        result = subprocess.run(concat_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Concatenation failed: {result.stderr}")
+            
     finally:
-        # Clean up segment files
-        shutil.rmtree(segments_dir, ignore_errors=True)
+        # --- Part 3: Clean up all temporary files and directories ---
+        if os.path.exists(segments_dir):
+            shutil.rmtree(segments_dir, ignore_errors=True)
+        if os.path.exists(filelist_path):
+            os.remove(filelist_path)
+
 
 def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     """
@@ -745,8 +725,6 @@ def analyze_encoding_performance(reference_frames_dir: str, encoded_videos: Dict
     return analysis_results
 
 
-
-
 def flatten_image_from_blocks(blocks: np.ndarray) -> np.ndarray:
     """
     Reconstructs an image from an array of blocks using vectorization.
@@ -949,11 +927,7 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
     return final_block
 
 
-
-
-
-
-def main():
+if __name__ == "__main__":
     # Example usage parameters
 
     reference_video = "davis_test/bear.mp4"
@@ -1117,6 +1091,3 @@ def main():
 
     end = time.time()
     print(f"Encoding performance analysis completed in {end - start:.2f} seconds.\n")
-
-if __name__ == "__main__":
-    main()
