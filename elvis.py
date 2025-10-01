@@ -9,32 +9,7 @@ from typing import List, Callable, Tuple
 
 # Utility functions
 
-def calculate_bitrate_with_factor(bitrate_str: str, factor: float) -> str:
-    """
-    Calculate a bitrate with a multiplier factor.
-    
-    Args:
-        bitrate_str: Bitrate string like "1M" or "500k"
-        factor: Multiplier factor (e.g., 0.9, 1.1)
-        
-    Returns:
-        New bitrate string with factor applied
-    """
-    if bitrate_str.endswith('M'):
-        value = int(bitrate_str[:-1]) * 1_000_000
-    elif bitrate_str.endswith('k'):
-        value = int(bitrate_str[:-1]) * 1_000
-    else:
-        value = int(bitrate_str)
-    
-    new_value = int(value * factor)
-    
-    if new_value >= 1_000_000:
-        return f"{new_value // 1_000_000}M"
-    else:
-        return f"{new_value // 1_000}k"
-
-def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> str:
+def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> int:
     """
     Calculate an appropriate target bitrate based on video characteristics.
     
@@ -45,7 +20,7 @@ def calculate_target_bitrate(width: int, height: int, framerate: float, quality_
         quality_factor: Quality multiplier (1.0 = standard, higher = better quality)
         
     Returns:
-        Bitrate string (e.g., "1M", "500k")
+        Bitrate in bits per second (integer)
     """
     # Basic bitrate calculation: pixels per second * bits per pixel
     pixels_per_second = width * height * framerate
@@ -56,11 +31,7 @@ def calculate_target_bitrate(width: int, height: int, framerate: float, quality_
     # Calculate target bitrate in bps
     target_bps = int(pixels_per_second * bits_per_pixel)
     
-    # Convert to human-readable format
-    if target_bps >= 1_000_000:
-        return f"{target_bps // 1_000_000}M"
-    else:
-        return f"{target_bps // 1_000}k"
+    return target_bps
 
 def normalize_array(arr: np.ndarray) -> np.ndarray:
     """Normalizes a NumPy array to the range [0, 1]."""
@@ -228,6 +199,100 @@ def apply_temporal_smoothing(scores: np.ndarray, beta: float = 0.5) -> np.ndarra
     smoothed_scores[1:] = beta * scores[1:] + (1 - beta) * scores[:-1]
     
     return smoothed_scores
+
+def calculate_frame_uniformity_scores(removability_scores: np.ndarray) -> np.ndarray:
+    """
+    Aggregates block-level removability scores to a single "uniformity score" per frame.
+    This score is higher for frames that have a high average removability score AND
+    low variance, indicating the frame is uniformly simple.
+
+    Args:
+        removability_scores: 3D NumPy array of scores from your script.
+
+    Returns:
+        A 1D NumPy array where each element is the uniformity score for that frame.
+    """
+    if removability_scores.ndim != 3:
+        raise ValueError("Input must be a 3D array of shape (frames, height, width)")
+
+    # Calculate mean and variance across all blocks for each frame
+    mean_scores = np.mean(removability_scores, axis=(1, 2))
+    variance_scores = np.var(removability_scores, axis=(1, 2))
+
+    # Normalize both to prevent scale issues
+    normalized_mean = normalize_array(mean_scores)
+    normalized_variance = normalize_array(variance_scores)
+
+    # Combine them. We want high mean and low variance.
+    # Add a small epsilon to the denominator to avoid division by zero.
+    epsilon = 1e-6
+    uniformity_scores = normalized_mean / (normalized_variance + epsilon)
+    
+    # Final normalization of the combined score
+    return normalize_array(uniformity_scores)
+
+def select_frames_to_drop(removability_scores: np.ndarray, drop_ratio: float = 0.1, validate_with_optical_flow: bool = True, video_path: str = None, motion_threshold: float = 2.0) -> list[int]:
+    """
+    Selects frames to drop using a "uniformity score" (mean/variance) and an
+    optional optical flow validation step.
+
+    Args:
+        removability_scores: Your 3D array of per-block scores.
+        drop_ratio: The target fraction of frames to drop.
+        validate_with_optical_flow: If True, uses optical flow as a final check.
+        video_path: Path to the video file (required if validation is enabled).
+        motion_threshold: Max allowed motion magnitude for a drop to be confirmed.
+
+    Returns:
+        A final list of frame indices to be dropped.
+    """
+    if validate_with_optical_flow and not video_path:
+        raise ValueError("video_path must be provided if validate_with_optical_flow is True.")
+
+    # 1. Calculate our new uniformity score for each frame
+    print("Calculating frame uniformity scores (mean/variance)...")
+    frame_scores = calculate_frame_uniformity_scores(removability_scores)
+    
+    # We assume scene changes are already handled, so we don't mark any frames as forbidden.
+
+    # 2. Get initial candidates based on the uniformity score
+    num_frames = len(frame_scores)
+    num_to_drop_target = int(num_frames * drop_ratio)
+    
+    # Get indices sorted by score (high score = good candidate)
+    sorted_indices = np.argsort(frame_scores)[::-1]
+    
+    # 3. Select and (optionally) validate candidates
+    final_dropped_indices = []
+    dropped_flags = np.zeros(num_frames, dtype=bool)
+
+    print("Selecting best candidate frames...")
+    for idx in sorted_indices:
+        if len(final_dropped_indices) >= num_to_drop_target:
+            break
+
+        # Boundary and consecutive-frame checks are essential
+        if idx == 0 or idx == num_frames - 1 or dropped_flags[idx-1] or dropped_flags[idx+1]:
+            continue
+        
+        # --- Validation Step ---
+        is_candidate_valid = True
+        if validate_with_optical_flow:
+            motion_magnitude = calculate_motion_coherence(video_path, idx - 1, idx + 1)
+            if motion_magnitude >= motion_threshold:
+                is_candidate_valid = False # Motion is too complex, reject candidate
+        
+        if is_candidate_valid:
+            final_dropped_indices.append(idx)
+            dropped_flags[idx] = True
+    
+    print(f"Targeted {num_to_drop_target} frames to drop.")
+    if validate_with_optical_flow:
+        print(f"Confirmed {len(final_dropped_indices)} frames after motion validation.")
+    else:
+        print(f"Selected {len(final_dropped_indices)} frames based on uniformity score alone.")
+          
+    return sorted(final_dropped_indices)
 
 def split_image_into_squares(image: np.ndarray, l: int) -> np.ndarray:
     """
@@ -556,7 +621,7 @@ def generate_roi_filter_string_from_scores(frame_scores: np.ndarray, square_size
     else:
         return ""
 
-def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: str = "1M") -> None:
+def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, square_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: int = 1000000) -> None:
     """
     Encode video with H.265 using per-frame ROI-based quantization.
     
@@ -569,7 +634,7 @@ def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_
         width: Video width
         height: Video height
         segment_size: Number of frames per segment for processing
-        target_bitrate: Target bitrate (e.g., "1M", "500k", "2M")
+        target_bitrate: Target bitrate in bits per second (default: 1000000 = 1 Mbps)
     """
     print("Encoding with H.265 using per-frame ROI-based quantization...")
     
@@ -613,10 +678,10 @@ def encode_with_h265_roi(input_frames_dir: str, output_video: str, removability_
             
             cmd.extend([
                 "-c:v", "libx265",
-                "-b:v", target_bitrate,
-                "-minrate", calculate_bitrate_with_factor(target_bitrate, 0.9),
-                "-maxrate", calculate_bitrate_with_factor(target_bitrate, 1.1),
-                "-bufsize", target_bitrate,  # Small buffer for strict bitrate control
+                "-b:v", str(target_bitrate),
+                "-minrate", str(int(target_bitrate * 0.9)),
+                "-maxrate", str(int(target_bitrate * 1.1)),
+                "-bufsize", str(target_bitrate),  # Small buffer for strict bitrate control
                 "-preset", "medium",
                 "-g", "1",  # Shorter GOP for segments
                 "-y", segment_file
@@ -1537,143 +1602,153 @@ def concat_segments(segment_files: List[str], output_video: str) -> None:
         if os.path.exists(filelist_path):
             os.remove(filelist_path)
 
-# Example usage parameters
+def main():
+    # Example usage parameters
 
-reference_video = "davis_test/bear.mp4"
-width, height = 640, 368
-square_size = 16
-segment_size = 30  # Number of frames per segment for processing
+    reference_video = "davis_test/bear.mp4"
+    width, height = 640, 368
+    square_size = 16
+    segment_size = 30  # Number of frames per segment for processing
 
-# Calculate appropriate target bitrate based on video characteristics
-framerate = cv2.VideoCapture(reference_video).get(cv2.CAP_PROP_FPS)
-target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
-print(f"Calculated target bitrate: {target_bitrate} for {width}x{height}@{framerate:.1f}fps")
+    # Calculate appropriate target bitrate based on video characteristics
+    framerate = cv2.VideoCapture(reference_video).get(cv2.CAP_PROP_FPS)
+    target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
+    print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
 
-# SERVER SIDE
+    # SERVER SIDE
 
-# Start recording time
-total_start = time.time()
-start = time.time()
+    # Start recording time
+    start = time.time()
 
-# Create experiment directory for all experiment-related files
-experiment_dir = "experiment"
-os.makedirs(experiment_dir, exist_ok=True)
+    # Create experiment directory for all experiment-related files
+    experiment_dir = "experiment"
+    os.makedirs(experiment_dir, exist_ok=True)
 
-# resize video based on required resolution, save raw and frames for reference
-print(f"Processing video: {reference_video}")
-print(f"Target resolution: {width}x{height}")
-print(f"Calculated target bitrate: {target_bitrate} for {width}x{height}@{framerate:.1f}fps")
+    # resize video based on required resolution, save raw and frames for reference
+    print(f"Processing video: {reference_video}")
+    print(f"Target resolution: {width}x{height}")
+    print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
 
-reference_frames_dir = os.path.join(experiment_dir, "reference_frames")
-os.makedirs(reference_frames_dir, exist_ok=True)
+    reference_frames_dir = os.path.join(experiment_dir, "reference_frames")
+    os.makedirs(reference_frames_dir, exist_ok=True)
 
-print("Converting video to raw YUV format...")
-raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
-os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
+    print("Converting video to raw YUV format...")
+    raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
+    os.system(f"ffmpeg -hide_banner -loglevel error -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
-print("Extracting reference frames...")
-os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
+    print("Extracting reference frames...")
+    os.system(f"ffmpeg -hide_banner -loglevel error -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
 
-end = time.time()
-print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
-start = time.time()
+    end = time.time()
+    print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
+    start = time.time()
 
-print(f"Calculating removability scores with block size: {square_size}x{square_size}")
-removability_scores = calculate_removability_scores(
-    raw_video_file=raw_video_path,
-    reference_frames_folder=reference_frames_dir,
-    width=width,
-    height=height,
-    square_size=square_size,
-    alpha=0.5,
-    working_dir=experiment_dir
-)
+    # Calculate removability scores and smooth them to avoid flickering
+    print(f"Calculating removability scores with block size: {square_size}x{square_size}")
+    removability_scores = calculate_removability_scores(
+        raw_video_file=raw_video_path,
+        reference_frames_folder=reference_frames_dir,
+        width=width,
+        height=height,
+        square_size=square_size,
+        alpha=0.5,
+        working_dir=experiment_dir
+    )
 
-print(f"Applying temporal smoothing to removability scores...")
-removability_scores = apply_temporal_smoothing(removability_scores, beta=0.5)
+    print(f"Applying temporal smoothing to removability scores...")
+    removability_scores = apply_temporal_smoothing(removability_scores, beta=0.5)
 
-end = time.time()
-print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
-start = time.time()
+    end = time.time()
+    print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
+    start = time.time()
 
-# Benchmark 1: traditional encoding with H.265
-print(f"Encoding reference frames with H.265 for baseline comparison...")
-baseline_video_h265 = os.path.join(experiment_dir, "baseline.mp4")
 
-# Use subprocess for better control and consistency with adaptive encoding
-baseline_cmd = [
-    "ffmpeg", "-hide_banner", "-loglevel", "warning",
-    "-framerate", str(framerate),
-    "-i", f"{reference_frames_dir}/%05d.jpg",
-    "-c:v", "libx265",
-    "-b:v", target_bitrate,
-    "-minrate", calculate_bitrate_with_factor(target_bitrate, 0.9),
-    "-maxrate", calculate_bitrate_with_factor(target_bitrate, 1.1),
-    "-bufsize", target_bitrate,  # Small buffer for strict bitrate control
-    "-preset", "medium",
-    "-g", "1",
-    "-y", baseline_video_h265
-]
 
-result = subprocess.run(baseline_cmd, capture_output=True, text=True)
-if result.returncode != 0:
-    print(f"Baseline encoding failed: {result.stderr}")
-    raise RuntimeError(f"Baseline encoding failed: {result.stderr}")
-else:
-    print("Baseline encoding completed successfully")
+    # Benchmark 1: traditional encoding with H.265
+    print(f"Encoding reference frames with H.265 for baseline comparison...")
+    baseline_video_h265 = os.path.join(experiment_dir, "baseline.mp4")
 
-end = time.time()
-print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
-start = time.time()
+    # Use subprocess for better control and consistency with adaptive encoding
+    baseline_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{reference_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-b:v", str(target_bitrate),
+        "-minrate", str(int(target_bitrate * 0.9)),
+        "-maxrate", str(int(target_bitrate * 1.1)),
+        "-bufsize", str(target_bitrate),  # Small buffer for strict bitrate control
+        "-preset", "medium",
+        "-g", "1",
+        "-y", baseline_video_h265
+    ]
 
-# Benchmark 2: adaptive encoding
-print(f"Encoding frames with ROI-based adaptive quantization...")
-adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
+    result = subprocess.run(baseline_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Baseline encoding failed: {result.stderr}")
+        raise RuntimeError(f"Baseline encoding failed: {result.stderr}")
+    else:
+        print("Baseline encoding completed successfully")
 
-# Use same encoder parameters as baseline encoding for fair comparison
-encode_with_h265_roi(
-    input_frames_dir=reference_frames_dir,
-    output_video=adaptive_video_h265,
-    removability_scores=removability_scores,
-    square_size=square_size,
-    framerate=framerate,
-    width=width,
-    height=height,
-    segment_size=segment_size,
-    target_bitrate=target_bitrate
-)
+    end = time.time()
+    print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
+    start = time.time()
 
-end = time.time()
-print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
-start = time.time()
+    # Benchmark 2: adaptive encoding
+    print(f"Encoding frames with ROI-based adaptive quantization...")
+    adaptive_video_h265 = os.path.join(experiment_dir, "adaptive.mp4")
 
-# Compare file sizes and quality metrics
-baseline_size = os.path.getsize(baseline_video_h265)
-adaptive_size = os.path.getsize(adaptive_video_h265)
-compression_ratio = baseline_size / adaptive_size
+    # Use same encoder parameters as baseline encoding for fair comparison
+    encode_with_h265_roi(
+        input_frames_dir=reference_frames_dir,
+        output_video=adaptive_video_h265,
+        removability_scores=removability_scores,
+        square_size=square_size,
+        framerate=framerate,
+        width=width,
+        height=height,
+        segment_size=segment_size,
+        target_bitrate=target_bitrate
+    )
 
-print(f"\nEncoding Results (Target Bitrate: {target_bitrate}):")
-print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
-print(f"Adaptive ROI video size: {adaptive_size / 1024 / 1024:.2f} MB")
-print(f"Size ratio: {adaptive_size / baseline_size:.2f}x")
-print(f"Size difference: {(adaptive_size - baseline_size) / baseline_size * 100:+.1f}%")
+    end = time.time()
+    print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
+    start = time.time()
 
-# Comprehensive quality comparison
-encoded_videos = {
-    "Baseline H.265": baseline_video_h265,
-    "Adaptive ROI": adaptive_video_h265
-}
+    # Benchmark 3: ELVIS 1 (zero information removal and inpainting)
 
-compare_encoding_quality(
-    reference_frames_dir=reference_frames_dir,
-    encoded_videos=encoded_videos,
-    framerate=framerate,
-    width=width,
-    height=height,
-    temp_dir=experiment_dir,
-    square_size=square_size
-)
+    # Method 1: 
 
-end = time.time()
-print(f"Quality comparison completed in {end - start:.2f} seconds.\n")
 
+    # Compare file sizes and quality metrics
+    baseline_size = os.path.getsize(baseline_video_h265)
+    adaptive_size = os.path.getsize(adaptive_video_h265)
+    compression_ratio = baseline_size / adaptive_size
+
+    print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
+    print(f"Baseline H.265 video size: {baseline_size / 1024 / 1024:.2f} MB")
+    print(f"Adaptive ROI video size: {adaptive_size / 1024 / 1024:.2f} MB")
+    print(f"Size ratio: {adaptive_size / baseline_size:.2f}x")
+    print(f"Size difference: {(adaptive_size - baseline_size) / baseline_size * 100:+.1f}%")
+
+    # Comprehensive quality comparison
+    encoded_videos = {
+        "Baseline H.265": baseline_video_h265,
+        "Adaptive ROI": adaptive_video_h265
+    }
+
+    compare_encoding_quality(
+        reference_frames_dir=reference_frames_dir,
+        encoded_videos=encoded_videos,
+        framerate=framerate,
+        width=width,
+        height=height,
+        temp_dir=experiment_dir,
+        square_size=square_size
+    )
+
+    end = time.time()
+    print(f"Quality comparison completed in {end - start:.2f} seconds.\n")
+
+if __name__ == "__main__":
+    main()

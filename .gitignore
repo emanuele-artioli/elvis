@@ -160,5 +160,5 @@ cython_debug/
 #.idea/
 
 # project files
-experiment/
+experiment*/
 *test*/
