@@ -453,14 +453,24 @@ def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, 
     
     return metric_map
 
-def split_image_into_blocks(image: np.ndarray, l: int) -> np.ndarray:
+def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     """
-    Splits an image into blocks of a specific size using vectorization.
+    Efficiently splits an image into non-overlapping blocks using vectorized operations.
+
+    Args:
+        image: The image to split, with shape (H, W, C).
+        block_size: The side length (l) of each square block.
+
+    Returns:
+        A 5D array of blocks with shape (num_rows, num_cols, l, l, C).
     """
-    n, m, c = image.shape
-    num_rows = n // l
-    num_cols = m // l
-    return image.reshape(num_rows, l, num_cols, l, c).transpose(0, 2, 1, 3, 4)
+    H, W, C = image.shape
+    num_rows = H // block_size
+    num_cols = W // block_size
+    
+    # Reshape and transpose to create a "view" of the blocks without copying data
+    blocks = image.reshape(num_rows, block_size, num_cols, block_size, C).transpose(0, 2, 1, 3, 4)
+    return blocks
 
 def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], metrics: Dict[str, Callable], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40]) -> Dict:
     """
@@ -731,13 +741,57 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
     
     return analysis_results
 
+def combine_blocks_into_image(blocks: np.ndarray) -> np.ndarray:
+    """
+    Efficiently combines an array of blocks back into a single image.
 
-def flatten_image_from_blocks(blocks: np.ndarray) -> np.ndarray:
+    Args:
+        blocks: A 5D array of blocks with shape (num_rows, num_cols, l, l, C).
+
+    Returns:
+        The reconstructed image with shape (num_rows*l, num_cols*l, C).
     """
-    Reconstructs an image from an array of blocks using vectorization.
+    num_rows, num_cols, l_h, l_w, C = blocks.shape
+    
+    # Transpose and reshape back to the original image dimensions
+    image = blocks.transpose(0, 2, 1, 3, 4).reshape(num_rows * l_h, num_cols * l_w, C)
+    return image
+
+def stretch_frame(shrunk_frame: np.ndarray, binary_mask: np.ndarray, block_size: int) -> np.ndarray:
     """
-    n, m, l, _, c = blocks.shape
-    return blocks.transpose(0, 2, 1, 3, 4).reshape(n * l, m * l, c)
+    Recreates a full-resolution video frame from a shrunk version and a removal mask.
+
+    Args:
+        shrunk_frame: The shrunk image, containing only the "kept" blocks stitched together.
+        binary_mask: A 2D array of 0s and 1s where 1 indicates a removed block.
+        block_size: The side length (l) of each block.
+
+    Returns:
+        The reconstructed full-resolution frame.
+    """
+    # 1. Get the dimensions of the final frame from the mask
+    num_blocks_y, num_blocks_x = binary_mask.shape
+    # Assuming 3 color channels (e.g., RGB)
+    channels = shrunk_frame.shape[2] 
+
+    # 2. Create a "canvas" of final blocks, initialized to all black
+    final_blocks = np.zeros((num_blocks_y, num_blocks_x, block_size, block_size, channels), dtype=shrunk_frame.dtype)
+
+    # 3. Get the blocks from the shrunk frame
+    shrunk_blocks = split_image_into_blocks(shrunk_frame, block_size)
+
+    # 4. Use boolean indexing to place the shrunk blocks onto the canvas.
+    #    This is the key step. It finds all positions where mask is 0 (i.e., "keep")
+    #    and places the shrunk_blocks there in a single, fast operation.
+    #    Note: The number of `True` elements in `(binary_mask == 0)` must equal the number of blocks
+    #    in `shrunk_blocks`.
+    final_blocks[binary_mask == 0] = shrunk_blocks.reshape(-1, block_size, block_size, channels)
+
+    # 5. Combine the completed set of blocks back into a single image
+    reconstructed_image = combine_blocks_into_image(final_blocks)
+    
+    return reconstructed_image
+
 
 def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, to_remove: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """
@@ -797,7 +851,7 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
     kept_blocks = np.stack(kept_blocks_list, axis=0)
 
     # Reconstruct the final image from the remaining blocks
-    new_image = flatten_image_from_blocks(kept_blocks)
+    new_image = combine_blocks_into_image(kept_blocks)
     
     return new_image, removal_mask, block_coords_to_remove
 
@@ -952,7 +1006,13 @@ if __name__ == "__main__":
     cap.release()
     target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
 
-    # SERVER SIDE
+
+
+    #########################################################################################################
+    ############################################## SERVER SIDE ##############################################
+    #########################################################################################################
+
+
 
     # --- Video Preprocessing ---
     start = time.time()
@@ -1021,7 +1081,6 @@ if __name__ == "__main__":
         "-g", "1",
         "-y", baseline_video
     ]
-
     result = subprocess.run(baseline_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Baseline encoding failed: {result.stderr}")
@@ -1037,7 +1096,6 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Encoding frames with ROI-based adaptive quantization...")
     adaptive_video = os.path.join(experiment_dir, "adaptive.mp4")
-
     encode_with_roi(
         input_frames_dir=reference_frames_dir,
         output_video=adaptive_video,
@@ -1056,7 +1114,7 @@ if __name__ == "__main__":
 
 
 
-    # --- ELVIS v1 (zero information removal and inpainting) ---
+    # --- ELVIS v1 (shrinking and extracting metadata) ---
     start = time.time()
     print(f"Encoding frames with ELVIS v1...")
 
@@ -1064,7 +1122,7 @@ if __name__ == "__main__":
     shrunk_frames_dir = os.path.join(experiment_dir, "shrunk_frames")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
-    shrunk_frames = [apply_selective_removal(img, scores, block_size, to_remove=to_remove)[0] for img, scores in zip(reference_frames, removability_scores)]
+    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, to_remove=to_remove) for img, scores in zip(reference_frames, removability_scores)))
     for i, frame in enumerate(shrunk_frames):
         cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.jpg"), frame)
 
@@ -1088,13 +1146,108 @@ if __name__ == "__main__":
         print(f"ELVIS v1 encoding failed: {result.stderr}")
         raise RuntimeError(f"ELVIS v1 encoding failed: {result.stderr}")
 
+    # Save compressed metadata about removed blocks
+    removal_masks = np.array(removal_masks, dtype=np.uint8)
+    masks_packed = np.packbits(removal_masks)
+    np.savez(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"), packed=masks_packed, shape=removal_masks.shape)
+
     end = time.time()
     execution_times["elvis_v1_encoding"] = end - start
     print(f"ELVIS v1 encoding completed in {end - start:.2f} seconds.\n")
 
 
 
-    # --- Performance Analysis ---
+    #########################################################################################################
+    ############################################## CLIENT SIDE ##############################################
+    #########################################################################################################
+
+
+
+    # --- ELVIS v1 (stretching and inpainting) ---
+    start = time.time()
+    print(f"Decoding metadata and stretching ELVIS v1 video...")
+
+    # Decode the shrunk video to frames
+    removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
+    removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
+    stretched_frames_dir = os.path.join(experiment_dir, "stretched_frames")
+    os.makedirs(stretched_frames_dir, exist_ok=True)
+    for shrunk_frame, mask in zip(shrunk_frames, removal_masks):
+        stretched_frame = stretch_frame(shrunk_frame, mask, block_size)
+        cv2.imwrite(os.path.join(stretched_frames_dir, f"{len(os.listdir(stretched_frames_dir))+1:05d}.jpg"), stretched_frame)
+
+    # Convert removal_masks to mask images for inpainting (considering block size)
+    removal_masks_dir = os.path.join(experiment_dir, "removal_masks")
+    os.makedirs(removal_masks_dir, exist_ok=True)
+    for i, mask in enumerate(removal_masks):
+        mask_img = (mask * 255).astype(np.uint8)
+        mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
+
+    # Encode the stretched frames losslessly TODO: this is not needed in practice
+    stretched_video = os.path.join(experiment_dir, "stretched.mp4")
+    stretch_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{stretched_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-x265-params", "lossless=1",
+        "-y", stretched_video
+    ]
+    result = subprocess.run(stretch_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ELVIS v1 stretching failed: {result.stderr}")
+        raise RuntimeError(f"ELVIS v1 stretching failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v1_stretching"] = end - start
+    print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
+
+    # --- Inpainting ---
+    start = time.time()
+    print(f"Inpainting stretched frames to fill in removed blocks...")
+
+    # Inpaint the stretched frames to fill in removed blocks TODO: replace with ProPainter or E2FGVI
+    inpainted_frames_dir = os.path.join(experiment_dir, "inpainted_frames")
+    os.makedirs(inpainted_frames_dir, exist_ok=True)
+    for i in range(len(removal_masks)):
+        stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg"))
+        mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        cv2.imwrite(os.path.join(inpainted_frames_dir, f"{i+1:05d}.jpg"), inpainted_frame)
+
+    end = time.time()
+    execution_times["elvis_v1_inpainting"] = end - start
+    print(f"ELVIS v1 inpainting completed in {end - start:.2f} seconds.\n")
+
+    # Encode the inpainted frames losslessly
+    inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
+    inpaint_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{inpainted_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-x265-params", "lossless=1",
+        "-y", inpainted_video
+    ]
+    result = subprocess.run(inpaint_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ELVIS v1 inpainting encoding failed: {result.stderr}")
+        raise RuntimeError(f"ELVIS v1 inpainting encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v1_encoding"] = end - start
+    print(f"ELVIS v1 encoding completed in {end - start:.2f} seconds.\n")
+
+
+
+    #########################################################################################################
+    ######################################### PERFORMANCE EVALUATION ########################################
+    #########################################################################################################
+
+    print("Evaluating and comparing encoding performance...")
     start = time.time()
     
     # Compare file sizes and quality metrics
@@ -1110,7 +1263,7 @@ if __name__ == "__main__":
     encoded_videos = {
         "Baseline": baseline_video,
         "Adaptive": adaptive_video,
-        "ELVIS v1": shrunk_video
+        "ELVIS v1": inpainted_video
     }
 
     quality_metrics = {
