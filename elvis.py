@@ -65,7 +65,7 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
 
     Returns:
         A 3D NumPy array of shape (num_frames, num_blocks_y, num_blocks_x)
-        containing the final removability scores.
+        containing the final removability scores normalized to [0, 1].
     """
     # Create temporary directories for outputs
     evca_dir = os.path.join(working_dir, "evca")
@@ -131,7 +131,6 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         temporal_csv_path = os.path.join(evca_dir, "evca_TC_blocks.csv")
         spatial_csv_path = os.path.join(evca_dir, "evca_SC_blocks.csv")
         
-        # Load the actual EVCA output files
         temporal_array = np.loadtxt(temporal_csv_path, delimiter=',', skiprows=1)
         spatial_array = np.loadtxt(spatial_csv_path, delimiter=',', skiprows=1)
 
@@ -186,6 +185,9 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
             smoothed_scores[1:] = smoothing_beta * removability_scores[1:] + (1 - smoothing_beta) * removability_scores[:-1]
             
             removability_scores = smoothed_scores
+
+        # Final normalization to [0, 1]
+        removability_scores = normalize_array(removability_scores)
 
         return removability_scores
     
@@ -877,54 +879,61 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
     
     return new_image, removal_mask, block_coords_to_remove
 
-def apply_adaptive_filtering(image: np.ndarray, frame_scores: np.ndarray, block_size: int, filter_func: Callable[[np.ndarray, float], np.ndarray], max_filter_strength: float = 1.0) -> np.ndarray:
+def map_strength_linear(normalized_scores: np.ndarray, max_strength: float = 1.0) -> np.ndarray:
     """
-    Applies a variable-strength filter to each block of an image based on scores.
+    Linearly maps normalized scores [0, 1] to a strength range [0, max_strength].
+    This is suitable for filters where strength is a simple multiplier (e.g., Gaussian blur's sigma).
+    """
+    return normalized_scores * max_strength
 
-    A high score for a block results in a stronger filter application, simplifying
-    the block to save bits during video encoding.
+def map_strength_dct_cutoff(normalized_scores: np.ndarray, block_size: int, max_cutoff_reduction: float = 0.8) -> np.ndarray:
+    """
+    Maps normalized scores [0, 1] to a DCT high-frequency cutoff strength.
+    
+    The strength represents how many high-frequency components to cut.
+    A score of 1.0 means cutting max_cutoff_reduction * block_size coefficients.
+    e.g., max_cutoff_reduction=0.8 means up to 80% of the block size is cut.
+    """
+    # Max number of coefficients to cut (must be < block_size)
+    max_cut = block_size * max_cutoff_reduction
+    
+    # Scale scores to the cutoff range
+    strength = normalized_scores * max_cut
+    
+    # Ensure strength is at least 1 for any significant score
+    return np.maximum(strength, 0.0).astype(np.int32)
+
+def map_strength_downsampling_factor(normalized_scores: np.ndarray, max_factor: int = 8) -> np.ndarray:
+    """
+    Maps normalized scores [0, 1] to a downsampling factor that is a power of 2: 
+    [1, 2, 4, ..., max_factor].
 
     Args:
-        image: The original image for the frame (H, W, C).
-        frame_scores: The 2D array of scores for this frame (num_blocks_y, num_blocks_x).
-                      Scores are expected to be in the [0, 1] range for best results.
-        block_size: The side length (l) of each block block.
-        filter_func: A function that takes a block (l, l, C) and a strength 
-                     (float) and returns a filtered block.
-        max_filter_strength: A multiplier to scale the normalized scores to a
-                             range appropriate for the chosen filter_func.
+        normalized_scores: The 2D array of normalized scores [0, 1].
+        max_factor: The maximum allowed downsampling factor (must be a power of 2).
 
     Returns:
-        The new image with adaptive filtering applied to its blocks.
+        The 2D array of integer downsampling factors (powers of 2).
     """
-    # Normalize scores to a [0, 1] range to ensure predictable behavior
-    normalized_scores = normalize_array(frame_scores)
-    
-    # Split the image into an array of blocks
-    blocks = split_image_into_blocks(image, block_size)
-    # Create a copy to store the filtered results
-    filtered_blocks = blocks.copy()
-    
-    num_blocks_y, num_blocks_x, _, _, _ = blocks.shape
+    if max_factor < 1 or (max_factor & (max_factor - 1) != 0):
+        raise ValueError("max_factor must be a positive power of 2 (e.g., 1, 2, 4, 8).")
 
-    # Iterate over each block to apply the corresponding filter
-    for i in range(num_blocks_y):
-        for j in range(num_blocks_x):
-            score = normalized_scores[i, j]
-            
-            # Linearly map the normalized score to the filter's strength range
-            strength = score * max_filter_strength
-            
-            # Apply the user-provided filter function if strength is significant
-            if strength > 0.1: # Small threshold to avoid unnecessary computation
-                block = blocks[i, j]
-                filtered_block = filter_func(block, strength)
-                filtered_blocks[i, j] = filtered_block
-
-    # Reconstruct the image from the (partially) filtered blocks
-    new_image = flatten_image_from_blocks(filtered_blocks)
+    # 1. Define the possible power-of-2 factors (e.g., [1, 2, 4, 8])
+    # The number of levels is log2(max_factor) + 1
+    levels = int(np.log2(max_factor)) + 1
+    pow2_factors = np.logspace(0, levels - 1, levels, base=2, dtype=np.int32) 
     
-    return new_image
+    # 2. Map normalized scores [0, 1] to the indices of these factors [0, 1, 2, ..., levels-1]
+    # We use (levels - 1) to map 1.0 to the highest index.
+    
+    # Ensure scores slightly less than 1.0 map correctly to the max index
+    # Use np.floor to get the index.
+    indices = np.floor(normalized_scores * (levels - 1)).astype(np.int32)
+    
+    # 3. Use the indices to look up the corresponding factor
+    factors = pow2_factors[indices]
+    
+    return factors
 
 def apply_gaussian_blur(block: np.ndarray, strength: float) -> np.ndarray:
     """
@@ -1009,6 +1018,47 @@ def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
     
     return final_block
 
+def apply_adaptive_filtering(image: np.ndarray, strengths: np.ndarray, block_size: int, filter_func: Callable[[np.ndarray, float], np.ndarray], min_strength_threshold: float = 0.1) -> np.ndarray:
+    """
+    Applies a variable-strength filter to each block of an image based on 
+    a pre-calculated 2D array of filter strengths.
+
+    Args:
+        image: The original image for the frame (H, W, C).
+        strengths: The 2D array of filter strengths for each block 
+                   (num_blocks_y, num_blocks_x).
+        block_size: The side length (l) of each block.
+        filter_func: A function that takes a block (l, l, C) and a strength 
+                     (float or int) and returns a filtered block.
+        min_strength_threshold: A value below which the filter is not applied.
+
+    Returns:
+        The new image with adaptive filtering applied to its blocks.
+    """
+    
+    # Split the image into an array of blocks
+    blocks = split_image_into_blocks(image, block_size)
+    # Create a copy to store the filtered results
+    filtered_blocks = blocks.copy()
+    
+    num_blocks_y, num_blocks_x, _, _, _ = blocks.shape
+
+    # Iterate over each block to apply the corresponding filter
+    for i in range(num_blocks_y):
+        for j in range(num_blocks_x):
+            strength = strengths[i, j]
+            
+            # Apply the filter function if strength is above the threshold
+            if strength > min_strength_threshold:
+                block = blocks[i, j]
+                # Filter function is called with the pre-calculated strength
+                filtered_block = filter_func(block, strength)
+                filtered_blocks[i, j] = filtered_block
+
+    # Reconstruct the image from the (partially) filtered blocks
+    new_image = combine_blocks_into_image(filtered_blocks)
+    
+    return new_image
 
 
 if __name__ == "__main__":
@@ -1179,6 +1229,125 @@ if __name__ == "__main__":
 
 
 
+    # --- DCT Damping-based ELVIS v2 (adaptive filtering and encoding) ---
+    start = time.time()
+    print(f"Applying DCT damping-based ELVIS v2 adaptive filtering and encoding...")
+    dct_filtered_frames_dir = os.path.join(experiment_dir, "dct_filtered_frames")
+    os.makedirs(dct_filtered_frames_dir, exist_ok=True)
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+    dct_strengths = map_strength_dct_cutoff(removability_scores, block_size, max_cutoff_reduction=0.99)
+    dct_filtered_frames = [apply_adaptive_filtering(img, strengths, block_size,
+                                                   filter_func=apply_dct_damping,
+                                                   min_strength_threshold=1.0)
+                           for img, strengths in zip(reference_frames, dct_strengths)]
+    for i, frame in enumerate(dct_filtered_frames):
+        cv2.imwrite(os.path.join(dct_filtered_frames_dir, f"{i+1:05d}.jpg"), frame)
+
+    dct_filtered_video = os.path.join(experiment_dir, "dct_filtered.mp4")
+    dct_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{dct_filtered_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-b:v", str(target_bitrate),
+        "-minrate", str(int(target_bitrate * 0.9)),
+        "-maxrate", str(int(target_bitrate * 1.1)),
+        "-bufsize", str(target_bitrate),
+        "-preset", "medium",
+        "-g", "10",
+        "-y", dct_filtered_video
+    ]
+    result = subprocess.run(dct_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"DCT filtered encoding failed: {result.stderr}")
+        raise RuntimeError(f"DCT filtered encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_dct_filtering"] = end - start
+    print(f"DCT damping-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+
+
+
+    # --- Downsampling-based ELVIS v2 (adaptive filtering and encoding) ---
+    start = time.time()
+    print(f"Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
+    downsampled_frames_dir = os.path.join(experiment_dir, "downsampled_frames")
+    os.makedirs(downsampled_frames_dir, exist_ok=True)
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+    downsample_strengths = map_strength_downsampling_factor(removability_scores, max_factor=8)
+    downsampled_frames = [apply_adaptive_filtering(img, strengths, block_size,
+                                                  filter_func=apply_downsampling,
+                                                  min_strength_threshold=1.0)
+                         for img, strengths in zip(reference_frames, downsample_strengths)]
+    for i, frame in enumerate(downsampled_frames):
+        cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.jpg"), frame)
+
+    downsampled_video = os.path.join(experiment_dir, "downsampled.mp4")
+    downsampled_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{downsampled_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-b:v", str(target_bitrate),
+        "-minrate", str(int(target_bitrate * 0.9)),
+        "-maxrate", str(int(target_bitrate * 1.1)),
+        "-bufsize", str(target_bitrate),
+        "-preset", "medium",
+        "-g", "10",
+        "-y", downsampled_video
+    ]
+    result = subprocess.run(downsampled_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Downsampling encoding failed: {result.stderr}")
+        raise RuntimeError(f"Downsampling encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_downsampling"] = end - start
+    print(f"Downsampling-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+
+
+
+    # --- Gaussian Blur-based ELVIS v2 (adaptive filtering and encoding) ---
+    start = time.time()
+    print(f"Applying Gaussian blur-based ELVIS v2 adaptive filtering and encoding...")
+    blurred_frames_dir = os.path.join(experiment_dir, "blurred_frames")
+    os.makedirs(blurred_frames_dir, exist_ok=True)
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+    blur_strengths = map_strength_linear(removability_scores, max_strength=3.0)
+    blurred_frames = [apply_adaptive_filtering(img, strengths, block_size,
+                                             filter_func=apply_gaussian_blur,
+                                             min_strength_threshold=0.1)
+                      for img, strengths in zip(reference_frames, blur_strengths)]
+    for i, frame in enumerate(blurred_frames):
+        cv2.imwrite(os.path.join(blurred_frames_dir, f"{i+1:05d}.jpg"), frame)
+    blurred_video = os.path.join(experiment_dir, "blurred.mp4")
+    blur_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{blurred_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-b:v", str(target_bitrate),
+        "-minrate", str(int(target_bitrate * 0.9)),
+        "-maxrate", str(int(target_bitrate * 1.1)),
+        "-bufsize", str(target_bitrate),
+        "-preset", "medium",
+        "-g", "10",
+        "-y", blurred_video
+    ]
+    result = subprocess.run(blur_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Gaussian blur encoding failed: {result.stderr}")
+        raise RuntimeError(f"Gaussian blur encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_gaussian_blur"] = end - start
+    print(f"Gaussian blur-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+
+
+
     #########################################################################################################
     ############################################## CLIENT SIDE ##############################################
     #########################################################################################################
@@ -1277,6 +1446,202 @@ if __name__ == "__main__":
 
 
 
+    # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with LaplacianVCAR ---
+    start = time.time()
+    print(f"Decoding DCT filtered ELVIS v2 video...")
+    dct_decoded_frames_dir = os.path.join(experiment_dir, "dct_decoded_frames")
+    os.makedirs(dct_decoded_frames_dir, exist_ok=True)
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-i", dct_filtered_video,
+        "-q:v", "1",
+        "-r", str(framerate),
+        "-f", "image2",
+        "-start_number", "1",
+        "-y", f"{dct_decoded_frames_dir}/%05d.jpg"
+    ]
+    result = subprocess.run(decode_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"DCT filtered decoding failed: {result.stderr}")
+        raise RuntimeError(f"DCT filtered decoding failed: {result.stderr}")
+
+    # Restoration: Deblock using LaplacianVCAR
+    print("Restoring DCT filtered frames using LaplacianVCAR...")
+    
+    # Restore frames using LaplacianVCAR
+    dct_restored_frames_dir = os.path.join(experiment_dir, "dct_restored_frames")
+    os.makedirs(dct_restored_frames_dir, exist_ok=True)
+    
+    # Create a temporary config file for LaplacianVCAR testing
+    laplacian_config = {
+        "input_folder": dct_decoded_frames_dir,
+        "output_folder": dct_restored_frames_dir
+    }
+    
+    # Run LaplacianVCAR restoration
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(laplacian_dir)
+        model_path = os.path.join(laplacian_dir, "QP37", "M.pth")
+        # Run the restoration
+        restore_cmd = [
+            "python", "test.py",
+            "--pretrained_path", model_path,
+            "--input_path", dct_decoded_frames_dir,
+            "--output_path", dct_restored_frames_dir
+        ]
+        restore_result = subprocess.run(restore_cmd, capture_output=True, text=True, env=restore_env)
+    finally:
+        os.chdir(old_cwd)
+
+    # Encode the restored frames
+    dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
+    dct_restore_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{dct_restored_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-x265-params", "lossless=1",
+        "-y", dct_restored_video
+    ]
+    result = subprocess.run(dct_restore_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"DCT restored encoding failed: {result.stderr}")
+        raise RuntimeError(f"DCT restored encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_dct_restoration"] = end - start
+    print(f"DCT damping-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+
+
+
+    # --- Downsampling-based ELVIS v2: Decode the downsampled video to frames ---
+    start = time.time()
+    print(f"Decoding downsampled ELVIS v2 video...")
+    downsampled_decoded_frames_dir = os.path.join(experiment_dir, "downsampled_decoded_frames")
+    os.makedirs(downsampled_decoded_frames_dir, exist_ok=True)
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-i", downsampled_video,
+        "-q:v", "1",
+        "-r", str(framerate),
+        "-f", "image2",
+        "-start_number", "1",
+        "-y", f"{downsampled_decoded_frames_dir}/%05d.jpg"
+    ]
+    result = subprocess.run(decode_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Downsampled decoding failed: {result.stderr}")
+        raise RuntimeError(f"Downsampled decoding failed: {result.stderr}")
+
+    # Restoration: Upscale using SinSR
+    print("Restoring downsampled frames using SinSR...")
+    
+    downsampled_restored_frames_dir = os.path.join(experiment_dir, "downsampled_restored_frames")
+    os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
+    
+    # Run SinSR restoration
+    sinsr_dir = os.path.join(original_dir, "SinSR")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(sinsr_dir)
+        # Use SinSR for super-resolution restoration
+        sinsr_cmd = [
+            "python", "inference.py",
+            "--task", "realsrx4",
+            "-i", downsampled_decoded_frames_dir,
+            "-o", downsampled_restored_frames_dir,
+            "--scale", "4"
+        ]
+        
+        sinsr_result = subprocess.run(sinsr_cmd, capture_output=True, text=True, env=sinsr_env)
+    finally:
+        os.chdir(old_cwd)
+
+    # Encode the restored frames
+    downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
+    downsample_restore_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{downsampled_restored_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-x265-params", "lossless=1",
+        "-y", downsampled_restored_video
+    ]
+    result = subprocess.run(downsample_restore_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Downsampled restored encoding failed: {result.stderr}")
+        raise RuntimeError(f"Downsampled restored encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_downsampling_restoration"] = end - start
+    print(f"Downsampling-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+
+
+
+    # --- Gaussian Blur-based ELVIS v2: Decode the blurred video to frames ---
+    start = time.time()
+    print(f"Decoding blurred ELVIS v2 video...")
+    blurred_decoded_frames_dir = os.path.join(experiment_dir, "blurred_decoded_frames")
+    os.makedirs(blurred_decoded_frames_dir, exist_ok=True)
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-i", blurred_video,
+        "-q:v", "1",
+        "-r", str(framerate),
+        "-f", "image2",
+        "-start_number", "1",
+        "-y", f"{blurred_decoded_frames_dir}/%05d.jpg"
+    ]
+    result = subprocess.run(decode_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Blurred decoding failed: {result.stderr}")
+        raise RuntimeError(f"Blurred decoding failed: {result.stderr}")
+
+    # Restoration: Deblur using SwinTormer
+    print("Restoring blurred frames using SwinTormer...")
+    
+    # Setup SwinTormer (one-time setup - should be in README)
+    swintormer_dir = os.path.join(original_dir, "swintormer")
+    training_config = os.path.join(swintormer_dir, "options", "train", "swintormer", "train_swintormer.yml")
+    
+    blurred_restored_frames_dir = os.path.join(experiment_dir, "blurred_restored_frames")
+    os.makedirs(blurred_restored_frames_dir, exist_ok=True)
+    
+    # Run SwinTormer restoration
+    swintormer_cmd = [
+        "python", "basicsr/test.py",
+        "-opt", training_config
+    ]
+    result = subprocess.run(swintormer_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"SwinTormer restoration failed: {result.stderr}")
+        raise RuntimeError(f"SwinTormer restoration failed: {result.stderr}")
+
+    # Encode the restored frames
+    blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
+    blur_restore_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-framerate", str(framerate),
+        "-i", f"{blurred_restored_frames_dir}/%05d.jpg",
+        "-c:v", "libx265",
+        "-preset", "veryslow",
+        "-x265-params", "lossless=1",
+        "-y", blurred_restored_video
+    ]
+    result = subprocess.run(blur_restore_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Blurred restored encoding failed: {result.stderr}")
+        raise RuntimeError(f"Blurred restored encoding failed: {result.stderr}")
+
+    end = time.time()
+    execution_times["elvis_v2_gaussian_blur_restoration"] = end - start
+    print(f"Gaussian blur-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+
+    
+
     #########################################################################################################
     ######################################### PERFORMANCE EVALUATION ########################################
     #########################################################################################################
@@ -1288,7 +1653,10 @@ if __name__ == "__main__":
     video_sizes = {
         "Baseline": os.path.getsize(baseline_video),
         "Adaptive": os.path.getsize(adaptive_video),
-        "ELVIS v1": os.path.getsize(shrunk_video)
+        "ELVIS v1": os.path.getsize(shrunk_video),
+        "ELVIS v2 DCT": os.path.getsize(dct_filtered_video),
+        "ELVIS v2 Downsample": os.path.getsize(downsampled_video),
+        "ELVIS v2 Blur": os.path.getsize(blurred_video)
     }
 
     duration = len(os.listdir(reference_frames_dir)) / framerate
@@ -1301,7 +1669,10 @@ if __name__ == "__main__":
     encoded_videos = {
         "Baseline": baseline_video,
         "Adaptive": adaptive_video,
-        "ELVIS v1": inpainted_video
+        "ELVIS v1": inpainted_video,
+        "ELVIS v2 DCT": dct_restored_video,
+        "ELVIS v2 Downsample": downsampled_restored_video,
+        "ELVIS v2 Blur": blurred_restored_video
     }
 
     quality_metrics = {
