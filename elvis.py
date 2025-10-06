@@ -1446,7 +1446,7 @@ if __name__ == "__main__":
 
 
 
-    # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with LaplacianVCAR ---
+    # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding DCT filtered ELVIS v2 video...")
     dct_decoded_frames_dir = os.path.join(experiment_dir, "dct_decoded_frames")
@@ -1465,34 +1465,14 @@ if __name__ == "__main__":
         print(f"DCT filtered decoding failed: {result.stderr}")
         raise RuntimeError(f"DCT filtered decoding failed: {result.stderr}")
 
-    # Restoration: Deblock using LaplacianVCAR
-    print("Restoring DCT filtered frames using LaplacianVCAR...")
-    
-    # Restore frames using LaplacianVCAR
+    # Restoration: Deblock using a simple bilateral filter (placeholder for a SOTA model)
+    print("Restoring DCT filtered frames using bilateral filter...")
     dct_restored_frames_dir = os.path.join(experiment_dir, "dct_restored_frames")
     os.makedirs(dct_restored_frames_dir, exist_ok=True)
-    
-    # Create a temporary config file for LaplacianVCAR testing
-    laplacian_config = {
-        "input_folder": dct_decoded_frames_dir,
-        "output_folder": dct_restored_frames_dir
-    }
-    
-    # Run LaplacianVCAR restoration
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(laplacian_dir)
-        model_path = os.path.join(laplacian_dir, "QP37", "M.pth")
-        # Run the restoration
-        restore_cmd = [
-            "python", "test.py",
-            "--pretrained_path", model_path,
-            "--input_path", dct_decoded_frames_dir,
-            "--output_path", dct_restored_frames_dir
-        ]
-        restore_result = subprocess.run(restore_cmd, capture_output=True, text=True, env=restore_env)
-    finally:
-        os.chdir(old_cwd)
+    for i in range(len(removability_scores)):
+        dct_frame = cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        restored_frame = cv2.bilateralFilter(dct_frame, d=9, sigmaColor=75, sigmaSpace=75)
+        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
 
     # Encode the restored frames
     dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
@@ -1516,7 +1496,7 @@ if __name__ == "__main__":
 
 
 
-    # --- Downsampling-based ELVIS v2: Decode the downsampled video to frames ---
+    # --- Downsampling-based ELVIS v2: Decode the downsampled video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding downsampled ELVIS v2 video...")
     downsampled_decoded_frames_dir = os.path.join(experiment_dir, "downsampled_decoded_frames")
@@ -1535,29 +1515,14 @@ if __name__ == "__main__":
         print(f"Downsampled decoding failed: {result.stderr}")
         raise RuntimeError(f"Downsampled decoding failed: {result.stderr}")
 
-    # Restoration: Upscale using SinSR
-    print("Restoring downsampled frames using SinSR...")
-    
+    # Restoration: Upscale using a simple Lanczos interpolation (placeholder for a SOTA model)
+    print("Restoring downsampled frames using Lanczos interpolation...")
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "downsampled_restored_frames")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
-    
-    # Run SinSR restoration
-    sinsr_dir = os.path.join(original_dir, "SinSR")
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(sinsr_dir)
-        # Use SinSR for super-resolution restoration
-        sinsr_cmd = [
-            "python", "inference.py",
-            "--task", "realsrx4",
-            "-i", downsampled_decoded_frames_dir,
-            "-o", downsampled_restored_frames_dir,
-            "--scale", "4"
-        ]
-        
-        sinsr_result = subprocess.run(sinsr_cmd, capture_output=True, text=True, env=sinsr_env)
-    finally:
-        os.chdir(old_cwd)
+    for i in range(len(removability_scores)):
+        downsampled_frame = cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        restored_frame = cv2.resize(downsampled_frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
 
     # Encode the restored frames
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
@@ -1581,7 +1546,7 @@ if __name__ == "__main__":
 
 
 
-    # --- Gaussian Blur-based ELVIS v2: Decode the blurred video to frames ---
+    # --- Gaussian Blur-based ELVIS v2: Decode the blurred video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding blurred ELVIS v2 video...")
     blurred_decoded_frames_dir = os.path.join(experiment_dir, "blurred_decoded_frames")
@@ -1600,25 +1565,15 @@ if __name__ == "__main__":
         print(f"Blurred decoding failed: {result.stderr}")
         raise RuntimeError(f"Blurred decoding failed: {result.stderr}")
 
-    # Restoration: Deblur using SwinTormer
-    print("Restoring blurred frames using SwinTormer...")
-    
-    # Setup SwinTormer (one-time setup - should be in README)
-    swintormer_dir = os.path.join(original_dir, "swintormer")
-    training_config = os.path.join(swintormer_dir, "options", "train", "swintormer", "train_swintormer.yml")
-    
+    # Restoration: Deblur using a simple unsharp mask (placeholder for a SOTA model)
+    print("Restoring blurred frames using unsharp masking...")
     blurred_restored_frames_dir = os.path.join(experiment_dir, "blurred_restored_frames")
     os.makedirs(blurred_restored_frames_dir, exist_ok=True)
-    
-    # Run SwinTormer restoration
-    swintormer_cmd = [
-        "python", "basicsr/test.py",
-        "-opt", training_config
-    ]
-    result = subprocess.run(swintormer_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"SwinTormer restoration failed: {result.stderr}")
-        raise RuntimeError(f"SwinTormer restoration failed: {result.stderr}")
+    for i in range(len(removability_scores)):
+        blurred_frame = cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        gaussian = cv2.GaussianBlur(blurred_frame, (9, 9), 10.0)
+        restored_frame = cv2.addWeighted(blurred_frame, 1.5, gaussian, -0.5, 0)
+        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
 
     # Encode the restored frames
     blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
@@ -1640,7 +1595,7 @@ if __name__ == "__main__":
     execution_times["elvis_v2_gaussian_blur_restoration"] = end - start
     print(f"Gaussian blur-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
 
-    
+
 
     #########################################################################################################
     ######################################### PERFORMANCE EVALUATION ########################################
