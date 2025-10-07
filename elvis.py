@@ -14,6 +14,7 @@ import functools
 import multiprocessing
 import torch
 import lpips
+import platform
 
 
 
@@ -170,7 +171,7 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
                 # Find background blocks (mask value is 0)
                 background_blocks = (resized_mask == 0)
                 # Significantly increase the score for background blocks, making them prime candidates for removal.
-                removability_scores[i][background_blocks] *= 100.0
+                removability_scores[i][background_blocks] *= 10.0
             else:
                 print(f"Warning: Mask file not found for frame {i}: {mask_path}")
 
@@ -200,141 +201,120 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         # Always return to original directory
         os.chdir(original_dir)
 
-def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: int = 1000000) -> None:
-    """
-    Encode video using ROI-based quantization by processing in segments and then concatenating them. 
-    TODO: what if we do a two pass encode, where the first pass does ROI encoding on each frame (so segment size of 1), and the second pass does a normal encoding, in a single segment, at the target bitrate?
+def map_score_to_qp(score: float, min_qp: int = 1, max_qp: int = 50) -> int:
+    """Maps a normalized score [0, 1] to a QP value.
     
+    A low score (important region) maps to a low QP (high quality).
+    A high score (removable region) maps to a high QP (low quality).
+    The QP range is chosen to provide a good quality spread.
+    """
+    return int(min_qp + (score * (max_qp - min_qp)))
+
+def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, target_bitrate: int = 1000000) -> None:
+    """
+    Encodes a video using a two-pass process with a detailed qpfile for per-block QP control.
+
+    This method provides the ultimate control:
+    1.  **Per-Block Quality:** Assigns a specific Quantization Parameter (QP) to each
+        individual block in every frame based on its removability score.
+    2.  **Bitrate Adherence:** Uses a standard two-pass encode to ensure the final
+        video file accurately meets the target bitrate.
+
     Args:
-        input_frames_dir: Directory containing input frames
-        output_video: Output video file path
-        removability_scores: 3D array of removability scores
-        block_size: Size of blocks used for scoring
-        framerate: Video framerate
-        width: Video width
-        height: Video height
-        segment_size: Number of frames per segment for processing
-        target_bitrate: Target bitrate in bits per second (default: 1000000 = 1 Mbps)
+        input_frames_dir: Directory containing input frames (e.g., '%05d.jpg').
+        output_video: The path for the final encoded video file.
+        removability_scores: A 3D numpy array of shape (num_frames, num_blocks_y, num_blocks_x)
+                             containing the importance score for each block.
+        block_size: The side length of the square blocks used for scoring (e.g., 64).
+                    This must match the block size used to generate the scores.
+        framerate: The framerate of the output video.
+        width: The width of the video.
+        height: The height of the video.
+        target_bitrate: The target bitrate for the video in bits per second.
     """
+    num_frames, num_blocks_y, num_blocks_x = removability_scores.shape
+    temp_dir = os.path.dirname(output_video) or '.'
+    os.makedirs(temp_dir, exist_ok=True)
     
-    num_frames = removability_scores.shape[0]
-    temp_dir = os.path.dirname(output_video)
-    segments_dir = os.path.join(temp_dir, "segments")
-    os.makedirs(segments_dir, exist_ok=True)
+    qpfile_path = os.path.join(temp_dir, "qpfile_per_block.txt")
+    passlog_file = os.path.join(temp_dir, "ffmpeg_2pass_log")
     
-    segment_files = []
-    filelist_path = os.path.join(temp_dir, "segments_list.txt")
+    # Use platform-specific null device for the first pass output
+    null_device = "NUL" if platform.system() == "Windows" else "/dev/null"
 
     try:
-        # --- Part 1: Encode video segments ---
-        for segment_start in range(0, num_frames, segment_size):
-            segment_end = min(segment_start + segment_size, num_frames)
-            segment_idx = segment_start // segment_size
-            
-            print(f"Processing segment {segment_idx + 1} (frames {segment_start}-{segment_end-1})")
-            
-            # Calculate average ROI for this segment
-            segment_scores = removability_scores[segment_start:segment_end]
-            avg_segment_scores = np.mean(segment_scores, axis=0)
-            
-            # Generate ROI filter for this segment
-            num_blocks_y, num_blocks_x = avg_segment_scores.shape
-            
-            # Normalize scores to [0, 1] range
-            normalized_scores = normalize_array(avg_segment_scores)
-            
-            # Create ROI filter string
-            roi_filters = []
-            for block_y in range(num_blocks_y):
-                for block_x in range(num_blocks_x):
-                    score = normalized_scores[block_y, block_x]
-                    x1 = block_x * block_size
-                    y1 = block_y * block_size
-                    x2 = min(x1 + block_size, width)
-                    y2 = min(y1 + block_size, height)
-                    
-                    # Convert removability score to quantization offset
-                    qoffset = (score - 0.5) * 2.0  # Maps [0,1] to [-1,1]
-                    
-                    if abs(qoffset) > 0.1:
-                        roi_filter = f"addroi=x={x1}:y={y1}:w={x2-x1}:h={y2-y1}:qoffset={qoffset:.2f}"
-                        roi_filters.append(roi_filter)
-            
-            roi_filter_string = ",".join(roi_filters) if roi_filters else ""
-            
-            # Create a temporary file for the filter script
-            roi_script_path = os.path.join(segments_dir, f"roi_script_{segment_idx:03d}.txt")
-            if roi_filter_string:
-                with open(roi_script_path, 'w') as f:
-                    f.write(roi_filter_string)
-            
-            # Create segment video file
-            segment_file = os.path.join(segments_dir, f"segment_{segment_idx:03d}.mp4")
-            
-            # Build FFmpeg command for this segment
-            cmd = [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                "-start_number", str(segment_start + 1),
-                "-framerate", str(framerate),
-                "-i", f"{input_frames_dir}/%05d.jpg",
-                "-frames:v", str(segment_end - segment_start),
-            ]
-            
-            # Use -filter_complex_script to read the filter graph from the file.
-            if roi_filter_string:
-                cmd.extend(["-filter_complex_script", roi_script_path])
-            
-            cmd.extend([
-                "-c:v", "libx265",
-                "-b:v", str(target_bitrate),
-                "-minrate", str(int(target_bitrate * 0.9)),
-                "-maxrate", str(int(target_bitrate * 1.1)),
-                "-bufsize", str(target_bitrate),
-                "-preset", "medium",
-                "-g", "10",
-                "-y", segment_file
-            ])
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"Encoding failed for segment: {result.stderr}")
-                raise RuntimeError(f"Encoding failed for segment: {result.stderr}")
-            
-            segment_files.append(segment_file)
-        
-        # --- Part 2: Concatenate all segments into final video (inlined functionality) ---
-        if not segment_files:
-            print("No segments were generated.")
-            return
+        # --- Part 1: Generate the detailed per-block qpfile ---
+        print("Generating detailed qpfile for per-block quality control...")
 
-        print(f"Concatenating {len(segment_files)} segments into final video...")
+        with open(qpfile_path, 'w') as f:
+            for frame_idx in range(num_frames):
+                # Start the line with frame index and a generic frame type ('P')
+                # The '-1' for QP indicates we are providing per-block QPs
+                line_parts = [f"{frame_idx} P -1"]
+                
+                # Append QP for each block in raster-scan order (left-to-right, top-to-bottom)
+                for y in range(num_blocks_y):
+                    for x in range(num_blocks_x):
+                        score = normalized_scores[frame_idx, y, x]
+                        qp = map_score_to_qp(score)
+                        line_parts.append(str(qp))
+                
+                f.write(" ".join(line_parts) + "\n")
+        print(f"qpfile generated at {qpfile_path}")
 
-        # Create a temporary file list for ffmpeg concat
-        with open(filelist_path, 'w') as f:
-            for segment_file in segment_files:
-                f.write(f"file '{os.path.abspath(segment_file)}'\n")
-        
-        # Concatenate using ffmpeg's concat demuxer
-        concat_cmd = [
+        # --- Part 2: Run Global Two-Pass Encode ---
+        base_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", filelist_path,
-            "-c", "copy",
-            "-y", output_video
+            "-framerate", str(framerate),
+            "-i", f"{input_frames_dir}/%05d.jpg",
+            "-s", f"{width}x{height}",
         ]
         
-        try:
-            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Concatenation failed: {e.stderr}") from e
-            
+        # x265 requires CTU size to be 16, 32, or 64. Map block_size to nearest valid CTU.
+        # The qpfile will still use the block_size grid, but CTU sets the encoding block size.
+        valid_ctu_sizes = [16, 32, 64]
+        ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
+        x265_base_params = f"ctu={ctu_size}"
+
+        # Pass 1 (Analysis)
+        print("Starting Pass 1 (Global Analysis)...")
+        pass1_cmd = base_cmd + [
+            "-c:v", "libx265",
+            "-b:v", str(target_bitrate),
+            "-preset", "medium",
+            "-x265-params", f"{x265_base_params}:pass=1:stats={passlog_file}",
+            "-f", "mp4", "-y", null_device
+        ]
+        subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
+
+        # Pass 2 (Encoding with the detailed qpfile)
+        print("Starting Pass 2 (Global Encoding with per-block qpfile)...")
+        pass2_cmd = base_cmd + [
+            "-c:v", "libx265",
+            "-b:v", str(target_bitrate),
+            "-preset", "medium",
+            # Provide pass info, the stats file from pass 1, AND our detailed qpfile
+            "-x265-params", f"{x265_base_params}:pass=2:stats={passlog_file}:qpfile={qpfile_path}",
+            "-y", output_video
+        ]
+        subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+
+        print(f"\nTwo-pass per-block encoding complete. Output saved to {output_video}")
+
+    except subprocess.CalledProcessError as e:
+        print("--- FFMPEG COMMAND FAILED ---")
+        print("STDOUT:", e.stdout)
+        print("STDERR:", e.stderr)
+        raise RuntimeError(f"FFmpeg command failed with exit code {e.returncode}") from e
     finally:
-        # --- Part 3: Clean up all temporary files and directories ---
-        if os.path.exists(segments_dir):
-            shutil.rmtree(segments_dir, ignore_errors=True)
-        if os.path.exists(filelist_path):
-            os.remove(filelist_path)
+        # --- Part 3: Clean up temporary files ---
+        print("Cleaning up temporary files...")
+        if os.path.exists(qpfile_path):
+            os.remove(qpfile_path)
+        # FFmpeg might create multiple log files (e.g., .log, .log.mbtree)
+        for f in os.listdir(temp_dir):
+            if f.startswith(os.path.basename(passlog_file)):
+                 os.remove(os.path.join(temp_dir, f))
 
 def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     """
@@ -1302,7 +1282,6 @@ if __name__ == "__main__":
     reference_video = "davis_test/bear.mp4"
     width, height = 640, 360
     block_size = 8
-    segment_size = 10  # Number of frames per segment for processing
     shrink_amount = 0.25      # Number of blocks to remove per row in ELVIS v1
 
     # Dictionary to store execution times
@@ -1414,7 +1393,6 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        segment_size=segment_size,
         target_bitrate=target_bitrate
     )
 
