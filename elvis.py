@@ -198,87 +198,6 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         # Always return to original directory
         os.chdir(original_dir)
 
-# def select_frames_to_drop(removability_scores: np.ndarray, drop_ratio: float = 0.1, validate_with_optical_flow: bool = True, video_path: str = None, motion_threshold: float = 2.0) -> list[int]:
-#     """
-#     Selects frames to drop using a "uniformity score" (mean/variance) and an
-#     optional optical flow validation step.
-
-#     Args:
-#         removability_scores: Your 3D array of per-block scores.
-#         drop_ratio: The target fraction of frames to drop.
-#         validate_with_optical_flow: If True, uses optical flow as a final check.
-#         video_path: Path to the video file (required if validation is enabled).
-#         motion_threshold: Max allowed motion magnitude for a drop to be confirmed.
-
-#     Returns:
-#         A final list of frame indices to be dropped.
-#     """
-#     if validate_with_optical_flow and not video_path:
-#         raise ValueError("video_path must be provided if validate_with_optical_flow is True.")
-
-#     # 1. Calculate frame uniformity scores (mean/variance) - integrated from calculate_frame_uniformity_scores
-#     print("Calculating frame uniformity scores (mean/variance)...")
-    
-#     if removability_scores.ndim != 3:
-#         raise ValueError("Input must be a 3D array of shape (frames, height, width)")
-
-#     # Calculate mean and variance across all blocks for each frame
-#     mean_scores = np.mean(removability_scores, axis=(1, 2))
-#     variance_scores = np.var(removability_scores, axis=(1, 2))
-
-#     # Normalize both to prevent scale issues
-#     normalized_mean = normalize_array(mean_scores)
-#     normalized_variance = normalize_array(variance_scores)
-
-#     # Combine them. We want high mean and low variance.
-#     # Add a small epsilon to the denominator to avoid division by zero.
-#     epsilon = 1e-6
-#     frame_scores = normalized_mean / (normalized_variance + epsilon)
-    
-#     # Final normalization of the combined score
-#     frame_scores = normalize_array(frame_scores)
-    
-#     # We assume scene changes are already handled, so we don't mark any frames as forbidden.
-
-#     # 2. Get initial candidates based on the uniformity score
-#     num_frames = len(frame_scores)
-#     num_to_drop_target = int(num_frames * drop_ratio)
-    
-#     # Get indices sorted by score (high score = good candidate)
-#     sorted_indices = np.argsort(frame_scores)[::-1]
-    
-#     # 3. Select and (optionally) validate candidates
-#     final_dropped_indices = []
-#     dropped_flags = np.zeros(num_frames, dtype=bool)
-
-#     print("Selecting best candidate frames...")
-#     for idx in sorted_indices:
-#         if len(final_dropped_indices) >= num_to_drop_target:
-#             break
-
-#         # Boundary and consecutive-frame checks are essential
-#         if idx == 0 or idx == num_frames - 1 or dropped_flags[idx-1] or dropped_flags[idx+1]:
-#             continue
-        
-#         # --- Validation Step ---
-#         is_candidate_valid = True
-#         if validate_with_optical_flow:
-#             motion_magnitude = calculate_motion_coherence(video_path, idx - 1, idx + 1)
-#             if motion_magnitude >= motion_threshold:
-#                 is_candidate_valid = False # Motion is too complex, reject candidate
-        
-#         if is_candidate_valid:
-#             final_dropped_indices.append(idx)
-#             dropped_flags[idx] = True
-    
-#     print(f"Targeted {num_to_drop_target} frames to drop.")
-#     if validate_with_optical_flow:
-#         print(f"Confirmed {len(final_dropped_indices)} frames after motion validation.")
-#     else:
-#         print(f"Selected {len(final_dropped_indices)} frames based on uniformity score alone.")
-          
-#     return sorted(final_dropped_indices)
-
 def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, segment_size: int = 30, target_bitrate: int = 1000000) -> None:
     """
     Encode video using ROI-based quantization by processing in segments and then concatenating them.
@@ -413,7 +332,6 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             shutil.rmtree(segments_dir, ignore_errors=True)
         if os.path.exists(filelist_path):
             os.remove(filelist_path)
-
 
 def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     """
@@ -815,7 +733,6 @@ def stretch_frame(shrunk_frame: np.ndarray, binary_mask: np.ndarray, block_size:
     reconstructed_image = combine_blocks_into_image(final_blocks)
     
     return reconstructed_image
-
 
 def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """
