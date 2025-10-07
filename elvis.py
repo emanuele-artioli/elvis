@@ -210,7 +210,125 @@ def map_score_to_qp(score: float, min_qp: int = 1, max_qp: int = 50) -> int:
     """
     return int(min_qp + (score * (max_qp - min_qp)))
 
-def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, target_bitrate: int = 1000000) -> None:
+def encode_video(input_frames_dir: str, output_video: str, framerate: float, width: int, height: int, lossless: bool = False, target_bitrate: int = None, **extra_params) -> None:
+    """
+    Encodes a video using a two-pass process with libx265.
+    
+    This function provides a unified interface for both lossless and lossy encoding:
+    - Lossless: Uses veryslow preset with lossless=1 parameter
+    - Lossy: Uses medium preset with bitrate control
+    
+    Both modes use two-pass encoding for optimal quality/size trade-off.
+    
+    Args:
+        input_frames_dir: Directory containing input frames (e.g., '%05d.jpg').
+        output_video: The path for the final encoded video file.
+        framerate: The framerate of the output video.
+        width: The width of the video.
+        height: The height of the video.
+        lossless: If True, encode losslessly. If False, use target_bitrate.
+        target_bitrate: The target bitrate for lossy encoding in bits per second.
+        **extra_params: Additional x265 parameters to append (e.g., qpfile path).
+    """
+    temp_dir = os.path.dirname(output_video) or '.'
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    passlog_file = os.path.join(temp_dir, f"ffmpeg_2pass_log_{os.path.basename(output_video)}")
+    
+    # Use platform-specific null device for the first pass output
+    null_device = "NUL" if platform.system() == "Windows" else "/dev/null"
+    
+    try:
+        # Base command shared by both passes
+        base_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-framerate", str(framerate),
+            "-i", f"{input_frames_dir}/%05d.jpg",
+            "-s", f"{width}x{height}",
+        ]
+        
+        if lossless:
+            # Lossless encoding with two passes
+            preset = "veryslow"
+            x265_base_params = "lossless=1"
+            
+            # Pass 1
+            pass1_cmd = base_cmd + [
+                "-c:v", "libx265",
+                "-preset", preset,
+                "-x265-params", f"{x265_base_params}:pass=1:stats={passlog_file}",
+                "-f", "mp4", "-y", null_device
+            ]
+            subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
+            
+            # Pass 2
+            pass2_params = f"{x265_base_params}:pass=2:stats={passlog_file}"
+            if extra_params:
+                for key, value in extra_params.items():
+                    pass2_params += f":{key}={value}"
+            
+            pass2_cmd = base_cmd + [
+                "-c:v", "libx265",
+                "-preset", preset,
+                "-x265-params", pass2_params,
+                "-y", output_video
+            ]
+            subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+        else:
+            # Lossy encoding with bitrate control and two passes
+            if target_bitrate is None:
+                raise ValueError("target_bitrate must be specified for lossy encoding")
+            
+            preset = "medium"
+            
+            # Pass 1
+            pass1_cmd = base_cmd + [
+                "-c:v", "libx265",
+                "-b:v", str(target_bitrate),
+                "-minrate", str(int(target_bitrate * 0.9)),
+                "-maxrate", str(int(target_bitrate * 1.1)),
+                "-bufsize", str(target_bitrate),
+                "-preset", preset,
+                "-g", "10",
+                "-x265-params", f"pass=1:stats={passlog_file}",
+                "-f", "mp4", "-y", null_device
+            ]
+            subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
+            
+            # Pass 2
+            pass2_params = f"pass=2:stats={passlog_file}"
+            if extra_params:
+                for key, value in extra_params.items():
+                    pass2_params += f":{key}={value}"
+            
+            pass2_cmd = base_cmd + [
+                "-c:v", "libx265",
+                "-b:v", str(target_bitrate),
+                "-minrate", str(int(target_bitrate * 0.9)),
+                "-maxrate", str(int(target_bitrate * 1.1)),
+                "-bufsize", str(target_bitrate),
+                "-preset", preset,
+                "-g", "10",
+                "-x265-params", pass2_params,
+                "-y", output_video
+            ]
+            subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+        
+    except subprocess.CalledProcessError as e:
+        print("--- FFMPEG COMMAND FAILED ---")
+        print("STDOUT:", e.stdout)
+        print("STDERR:", e.stderr)
+        raise RuntimeError(f"FFmpeg command failed with exit code {e.returncode}") from e
+    finally:
+        # Clean up pass log files
+        for f in os.listdir(temp_dir):
+            if f.startswith(f"ffmpeg_2pass_log_{os.path.basename(output_video)}"):
+                try:
+                    os.remove(os.path.join(temp_dir, f))
+                except:
+                    pass
+
+def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, target_bitrate: int = 1000000, save_qp_maps: bool = False, qp_maps_dir: str = None) -> None:
     """
     Encodes a video using a two-pass process with a detailed qpfile for per-block QP control.
 
@@ -231,6 +349,8 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
         width: The width of the video.
         height: The height of the video.
         target_bitrate: The target bitrate for the video in bits per second.
+        save_qp_maps: Whether to save QP maps as grayscale images for debugging.
+        qp_maps_dir: Directory to save QP maps. If None, uses temp_dir/qp_maps.
     """
     num_frames, num_blocks_y, num_blocks_x = removability_scores.shape
     temp_dir = os.path.dirname(output_video) or '.'
@@ -246,6 +366,9 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
         # --- Part 1: Generate the detailed per-block qpfile ---
         print("Generating detailed qpfile for per-block quality control...")
 
+        # Create QP map array for visualization
+        qp_maps = np.zeros((num_frames, num_blocks_y, num_blocks_x), dtype=np.uint8)
+        
         with open(qpfile_path, 'w') as f:
             for frame_idx in range(num_frames):
                 # Start the line with frame index and a generic frame type ('P')
@@ -255,49 +378,59 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 # Append QP for each block in raster-scan order (left-to-right, top-to-bottom)
                 for y in range(num_blocks_y):
                     for x in range(num_blocks_x):
-                        score = normalized_scores[frame_idx, y, x]
+                        score = removability_scores[frame_idx, y, x]
                         qp = map_score_to_qp(score)
                         line_parts.append(str(qp))
+                        qp_maps[frame_idx, y, x] = qp
                 
                 f.write(" ".join(line_parts) + "\n")
         print(f"qpfile generated at {qpfile_path}")
-
-        # --- Part 2: Run Global Two-Pass Encode ---
-        base_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-framerate", str(framerate),
-            "-i", f"{input_frames_dir}/%05d.jpg",
-            "-s", f"{width}x{height}",
-        ]
         
+        # --- Save QP maps as images if requested ---
+        if save_qp_maps:
+            if qp_maps_dir is None:
+                qp_maps_dir = os.path.join(temp_dir, "qp_maps")
+            os.makedirs(qp_maps_dir, exist_ok=True)
+            
+            print(f"Saving QP maps to {qp_maps_dir}...")
+            for frame_idx in range(num_frames):
+                # Create a full-resolution image by upscaling the block-level QP map
+                qp_map_blocks = qp_maps[frame_idx]
+                
+                # Scale QP values to grayscale range [0, 255] for visualization
+                # Lower QP (high quality) = darker, Higher QP (low quality) = brighter
+                qp_map_normalized = (qp_map_blocks / 50.0 * 255).astype(np.uint8)
+                
+                # Upscale each block to full resolution using nearest neighbor
+                qp_map_fullres = np.kron(qp_map_normalized, np.ones((block_size, block_size), dtype=np.uint8))
+                
+                # Ensure the dimensions match exactly
+                qp_map_fullres = qp_map_fullres[:height, :width]
+                
+                # Save as grayscale image
+                qp_map_path = os.path.join(qp_maps_dir, f"qp_map_{frame_idx+1:05d}.png")
+                cv2.imwrite(qp_map_path, qp_map_fullres)
+            
+            print(f"QP maps saved to {qp_maps_dir}")
+
+        # --- Part 2: Run Global Two-Pass Encode with QP file ---
         # x265 requires CTU size to be 16, 32, or 64. Map block_size to nearest valid CTU.
         # The qpfile will still use the block_size grid, but CTU sets the encoding block size.
         valid_ctu_sizes = [16, 32, 64]
         ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
-        x265_base_params = f"ctu={ctu_size}"
-
-        # Pass 1 (Analysis)
-        print("Starting Pass 1 (Global Analysis)...")
-        pass1_cmd = base_cmd + [
-            "-c:v", "libx265",
-            "-b:v", str(target_bitrate),
-            "-preset", "medium",
-            "-x265-params", f"{x265_base_params}:pass=1:stats={passlog_file}",
-            "-f", "mp4", "-y", null_device
-        ]
-        subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
-
-        # Pass 2 (Encoding with the detailed qpfile)
-        print("Starting Pass 2 (Global Encoding with per-block qpfile)...")
-        pass2_cmd = base_cmd + [
-            "-c:v", "libx265",
-            "-b:v", str(target_bitrate),
-            "-preset", "medium",
-            # Provide pass info, the stats file from pass 1, AND our detailed qpfile
-            "-x265-params", f"{x265_base_params}:pass=2:stats={passlog_file}:qpfile={qpfile_path}",
-            "-y", output_video
-        ]
-        subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+        
+        print("Starting two-pass encoding with per-block QP control...")
+        encode_video(
+            input_frames_dir=input_frames_dir,
+            output_video=output_video,
+            framerate=framerate,
+            width=width,
+            height=height,
+            lossless=False,
+            target_bitrate=target_bitrate,
+            ctu=ctu_size,
+            qpfile=qpfile_path
+        )
 
         print(f"\nTwo-pass per-block encoding complete. Output saved to {output_video}")
 
@@ -1278,6 +1411,11 @@ def apply_adaptive_filtering(image: np.ndarray, strengths: np.ndarray, block_siz
 
 
 if __name__ == "__main__":
+    # Suppress warnings for cleaner output
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
     # Example usage parameters
     reference_video = "davis_test/bear.mp4"
     width, height = 640, 360
@@ -1351,29 +1489,21 @@ if __name__ == "__main__":
 
 
 
-    # --- Baseline  Encoding ---
+    # --- Baseline Encoding ---
     start = time.time()
     
-    print(f"Encoding reference frames with  for baseline comparison...")
+    print(f"Encoding reference frames with two-pass for baseline comparison...")
     baseline_video = os.path.join(experiment_dir, "baseline.mp4")
-
-    baseline_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{reference_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-b:v", str(target_bitrate),
-        "-minrate", str(int(target_bitrate * 0.9)),
-        "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),
-        "-preset", "medium",
-        "-g", "10",
-        "-y", baseline_video
-    ]
-    result = subprocess.run(baseline_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Baseline encoding failed: {result.stderr}")
-        raise RuntimeError(f"Baseline encoding failed: {result.stderr}")
+    
+    encode_video(
+        input_frames_dir=reference_frames_dir,
+        output_video=baseline_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=False,
+        target_bitrate=target_bitrate
+    )
 
     end = time.time()
     execution_times["baseline_encoding"] = end - start
@@ -1385,6 +1515,7 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Encoding frames with ROI-based adaptive quantization...")
     adaptive_video = os.path.join(experiment_dir, "adaptive.mp4")
+    qp_maps_dir = os.path.join(experiment_dir, "qp_maps")
     encode_with_roi(
         input_frames_dir=reference_frames_dir,
         output_video=adaptive_video,
@@ -1393,7 +1524,9 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=target_bitrate
+        target_bitrate=target_bitrate,
+        save_qp_maps=True,
+        qp_maps_dir=qp_maps_dir
     )
 
     end = time.time()
@@ -1414,25 +1547,18 @@ if __name__ == "__main__":
     for i, frame in enumerate(shrunk_frames):
         cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.jpg"), frame)
 
-    # Encode the shrunk frames
+    # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
     shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
-    shrunk_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{shrunk_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-b:v", str(target_bitrate),
-        "-minrate", str(int(target_bitrate * 0.9)),
-        "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),
-        "-preset", "medium",
-        "-g", "10",
-        "-y", shrunk_video
-    ]
-    result = subprocess.run(shrunk_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Shrunk encoding failed: {result.stderr}")
-        raise RuntimeError(f"Shrunk encoding failed: {result.stderr}")
+    shrunk_width = shrunk_frames[0].shape[1]  # Width is reduced due to removed blocks
+    encode_video(
+        input_frames_dir=shrunk_frames_dir,
+        output_video=shrunk_video,
+        framerate=framerate,
+        width=shrunk_width,
+        height=height,
+        lossless=False,
+        target_bitrate=target_bitrate
+    )
 
     # Save compressed metadata about removed blocks
     removal_masks = np.array(removal_masks, dtype=np.uint8)
@@ -1461,23 +1587,15 @@ if __name__ == "__main__":
         cv2.imwrite(os.path.join(dct_filtered_frames_dir, f"{i+1:05d}.jpg"), frame)
 
     dct_filtered_video = os.path.join(experiment_dir, "dct_filtered.mp4")
-    dct_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{dct_filtered_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-b:v", str(target_bitrate),
-        "-minrate", str(int(target_bitrate * 0.9)),
-        "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),
-        "-preset", "medium",
-        "-g", "10",
-        "-y", dct_filtered_video
-    ]
-    result = subprocess.run(dct_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"DCT filtered encoding failed: {result.stderr}")
-        raise RuntimeError(f"DCT filtered encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=dct_filtered_frames_dir,
+        output_video=dct_filtered_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=False,
+        target_bitrate=target_bitrate
+    )
 
     end = time.time()
     execution_times["elvis_v2_dct_filtering"] = end - start
@@ -1501,23 +1619,15 @@ if __name__ == "__main__":
         cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.jpg"), frame)
 
     downsampled_video = os.path.join(experiment_dir, "downsampled.mp4")
-    downsampled_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{downsampled_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-b:v", str(target_bitrate),
-        "-minrate", str(int(target_bitrate * 0.9)),
-        "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),
-        "-preset", "medium",
-        "-g", "10",
-        "-y", downsampled_video
-    ]
-    result = subprocess.run(downsampled_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Downsampling encoding failed: {result.stderr}")
-        raise RuntimeError(f"Downsampling encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=downsampled_frames_dir,
+        output_video=downsampled_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=False,
+        target_bitrate=target_bitrate
+    )
 
     end = time.time()
     execution_times["elvis_v2_downsampling"] = end - start
@@ -1540,23 +1650,15 @@ if __name__ == "__main__":
     for i, frame in enumerate(blurred_frames):
         cv2.imwrite(os.path.join(blurred_frames_dir, f"{i+1:05d}.jpg"), frame)
     blurred_video = os.path.join(experiment_dir, "blurred.mp4")
-    blur_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{blurred_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-b:v", str(target_bitrate),
-        "-minrate", str(int(target_bitrate * 0.9)),
-        "-maxrate", str(int(target_bitrate * 1.1)),
-        "-bufsize", str(target_bitrate),
-        "-preset", "medium",
-        "-g", "10",
-        "-y", blurred_video
-    ]
-    result = subprocess.run(blur_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Gaussian blur encoding failed: {result.stderr}")
-        raise RuntimeError(f"Gaussian blur encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=blurred_frames_dir,
+        output_video=blurred_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=False,
+        target_bitrate=target_bitrate
+    )
 
     end = time.time()
     execution_times["elvis_v2_gaussian_blur"] = end - start
@@ -1613,19 +1715,14 @@ if __name__ == "__main__":
 
     # Encode the stretched frames losslessly TODO: this is not needed in practice
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
-    stretch_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{stretched_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-preset", "veryslow",
-        "-x265-params", "lossless=1",
-        "-y", stretched_video
-    ]
-    result = subprocess.run(stretch_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ELVIS v1 stretching failed: {result.stderr}")
-        raise RuntimeError(f"ELVIS v1 stretching failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=stretched_frames_dir,
+        output_video=stretched_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
 
     # --- Inpainting ---
     start = time.time()
@@ -1646,19 +1743,14 @@ if __name__ == "__main__":
 
     # Encode the inpainted frames losslessly TODO: this is not needed in practice
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
-    inpaint_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{inpainted_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-preset", "veryslow",
-        "-x265-params", "lossless=1",
-        "-y", inpainted_video
-    ]
-    result = subprocess.run(inpaint_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Inpainted encoding failed: {result.stderr}")
-        raise RuntimeError(f"Inpainted encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=inpainted_frames_dir,
+        output_video=inpainted_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
 
 
 
@@ -1692,19 +1784,14 @@ if __name__ == "__main__":
 
     # Encode the restored frames
     dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
-    dct_restore_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{dct_restored_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-preset", "veryslow",
-        "-x265-params", "lossless=1",
-        "-y", dct_restored_video
-    ]
-    result = subprocess.run(dct_restore_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"DCT restored encoding failed: {result.stderr}")
-        raise RuntimeError(f"DCT restored encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=dct_restored_frames_dir,
+        output_video=dct_restored_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
 
     end = time.time()
     execution_times["elvis_v2_dct_restoration"] = end - start
@@ -1742,19 +1829,14 @@ if __name__ == "__main__":
 
     # Encode the restored frames
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
-    downsample_restore_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{downsampled_restored_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-preset", "veryslow",
-        "-x265-params", "lossless=1",
-        "-y", downsampled_restored_video
-    ]
-    result = subprocess.run(downsample_restore_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Downsampled restored encoding failed: {result.stderr}")
-        raise RuntimeError(f"Downsampled restored encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=downsampled_restored_frames_dir,
+        output_video=downsampled_restored_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
 
     end = time.time()
     execution_times["elvis_v2_downsampling_restoration"] = end - start
@@ -1793,19 +1875,14 @@ if __name__ == "__main__":
 
     # Encode the restored frames
     blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
-    blur_restore_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-framerate", str(framerate),
-        "-i", f"{blurred_restored_frames_dir}/%05d.jpg",
-        "-c:v", "libx265",
-        "-preset", "veryslow",
-        "-x265-params", "lossless=1",
-        "-y", blurred_restored_video
-    ]
-    result = subprocess.run(blur_restore_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Blurred restored encoding failed: {result.stderr}")
-        raise RuntimeError(f"Blurred restored encoding failed: {result.stderr}")
+    encode_video(
+        input_frames_dir=blurred_restored_frames_dir,
+        output_video=blurred_restored_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
 
     end = time.time()
     execution_times["elvis_v2_gaussian_blur_restoration"] = end - start
@@ -1874,7 +1951,6 @@ if __name__ == "__main__":
     analysis_results["video_framerate"] = framerate
     analysis_results["video_resolution"] = f"{width}x{height}"
     analysis_results["block_size"] = block_size
-    analysis_results["segment_size_frames"] = segment_size
     analysis_results["target_bitrate_bps"] = target_bitrate
     
     # Save analysis results to a JSON file
