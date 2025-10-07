@@ -1097,7 +1097,9 @@ if __name__ == "__main__":
     print(f"Target resolution: {width}x{height}")
     print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
 
-    reference_frames_dir = os.path.join(experiment_dir, "reference_frames")
+    frames_dir = os.path.join(experiment_dir, "frames")
+    reference_frames_dir = os.path.join(frames_dir, "reference")
+    os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(reference_frames_dir, exist_ok=True)
 
     print("Converting video to raw YUV format...")
@@ -1191,7 +1193,7 @@ if __name__ == "__main__":
     print(f"Shrinking and encoding frames with ELVIS v1...")
 
     # Shrink frames based on removability scores
-    shrunk_frames_dir = os.path.join(experiment_dir, "shrunk_frames")
+    shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
     shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
@@ -1232,7 +1234,7 @@ if __name__ == "__main__":
     # --- DCT Damping-based ELVIS v2 (adaptive filtering and encoding) ---
     start = time.time()
     print(f"Applying DCT damping-based ELVIS v2 adaptive filtering and encoding...")
-    dct_filtered_frames_dir = os.path.join(experiment_dir, "dct_filtered_frames")
+    dct_filtered_frames_dir = os.path.join(experiment_dir, "frames", "dct_filtered")
     os.makedirs(dct_filtered_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
@@ -1272,7 +1274,7 @@ if __name__ == "__main__":
     # --- Downsampling-based ELVIS v2 (adaptive filtering and encoding) ---
     start = time.time()
     print(f"Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
-    downsampled_frames_dir = os.path.join(experiment_dir, "downsampled_frames")
+    downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
@@ -1312,7 +1314,7 @@ if __name__ == "__main__":
     # --- Gaussian Blur-based ELVIS v2 (adaptive filtering and encoding) ---
     start = time.time()
     print(f"Applying Gaussian blur-based ELVIS v2 adaptive filtering and encoding...")
-    blurred_frames_dir = os.path.join(experiment_dir, "blurred_frames")
+    blurred_frames_dir = os.path.join(experiment_dir, "frames", "blurred")
     os.makedirs(blurred_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
@@ -1361,7 +1363,7 @@ if __name__ == "__main__":
     # Decode the shrunk video to frames
     removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
     removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
-    stretched_frames_dir = os.path.join(experiment_dir, "stretched_frames")
+    stretched_frames_dir = os.path.join(experiment_dir, "frames", "stretched")
     os.makedirs(stretched_frames_dir, exist_ok=True)
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1416,7 +1418,7 @@ if __name__ == "__main__":
     print(f"Inpainting stretched frames to fill in removed blocks...")
 
     # Inpaint the stretched frames to fill in removed blocks TODO: replace with ProPainter or E2FGVI
-    inpainted_frames_dir = os.path.join(experiment_dir, "inpainted_frames")
+    inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
     os.makedirs(inpainted_frames_dir, exist_ok=True)
     for i in range(len(removal_masks)):
         stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg"))
@@ -1449,7 +1451,7 @@ if __name__ == "__main__":
     # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding DCT filtered ELVIS v2 video...")
-    dct_decoded_frames_dir = os.path.join(experiment_dir, "dct_decoded_frames")
+    dct_decoded_frames_dir = os.path.join(experiment_dir, "frames", "dct_decoded")
     os.makedirs(dct_decoded_frames_dir, exist_ok=True)
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1467,7 +1469,7 @@ if __name__ == "__main__":
 
     # Restoration: Deblock using a simple bilateral filter (placeholder for a SOTA model)
     print("Restoring DCT filtered frames using bilateral filter...")
-    dct_restored_frames_dir = os.path.join(experiment_dir, "dct_restored_frames")
+    dct_restored_frames_dir = os.path.join(experiment_dir, "frames", "dct_restored")
     os.makedirs(dct_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
         dct_frame = cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.jpg"))
@@ -1499,7 +1501,7 @@ if __name__ == "__main__":
     # --- Downsampling-based ELVIS v2: Decode the downsampled video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding downsampled ELVIS v2 video...")
-    downsampled_decoded_frames_dir = os.path.join(experiment_dir, "downsampled_decoded_frames")
+    downsampled_decoded_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
     os.makedirs(downsampled_decoded_frames_dir, exist_ok=True)
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1517,7 +1519,7 @@ if __name__ == "__main__":
 
     # Restoration: Upscale using a simple Lanczos interpolation (placeholder for a SOTA model)
     print("Restoring downsampled frames using Lanczos interpolation...")
-    downsampled_restored_frames_dir = os.path.join(experiment_dir, "downsampled_restored_frames")
+    downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
         downsampled_frame = cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.jpg"))
@@ -1549,7 +1551,7 @@ if __name__ == "__main__":
     # --- Gaussian Blur-based ELVIS v2: Decode the blurred video to frames and restore it with OpenCV (TODO: use SOTA model) ---
     start = time.time()
     print(f"Decoding blurred ELVIS v2 video...")
-    blurred_decoded_frames_dir = os.path.join(experiment_dir, "blurred_decoded_frames")
+    blurred_decoded_frames_dir = os.path.join(experiment_dir, "frames", "blurred_decoded")
     os.makedirs(blurred_decoded_frames_dir, exist_ok=True)
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
@@ -1567,7 +1569,7 @@ if __name__ == "__main__":
 
     # Restoration: Deblur using a simple unsharp mask (placeholder for a SOTA model)
     print("Restoring blurred frames using unsharp masking...")
-    blurred_restored_frames_dir = os.path.join(experiment_dir, "blurred_restored_frames")
+    blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "blurred_restored")
     os.makedirs(blurred_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
         blurred_frame = cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.jpg"))
