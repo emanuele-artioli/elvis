@@ -35,7 +35,7 @@ def calculate_target_bitrate(width: int, height: int, framerate: float, quality_
     pixels_per_second = width * height * framerate
     
     # Base bits per pixel for  (typically 0.1-0.2 for good quality)
-    bits_per_pixel = 0.3 * quality_factor
+    bits_per_pixel = 0.02 * quality_factor
     
     # Calculate target bitrate in bps
     target_bps = int(pixels_per_second * bits_per_pixel)
@@ -746,13 +746,14 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             
             frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg')])
             
-            for frame_file in frame_files:
+            for frame_idx, frame_file in enumerate(frame_files, start=1):
                 frame_path = os.path.join(frames_dir, frame_file)
-                mask_path = os.path.join(masks_dir, frame_file.replace('.jpg', '.png'))
+                # UFO masks are numbered sequentially (00001.png, 00002.png, etc.)
+                mask_path = os.path.join(masks_dir, f"{frame_idx:05d}.png")
                 
                 frame = cv2.imread(frame_path)
                 if not os.path.exists(mask_path):
-                    print(f"Warning: Mask not found for {frame_file}, using original frame")
+                    print(f"Warning: Mask not found for frame {frame_idx} ({frame_file}), using original frame")
                     cv2.imwrite(os.path.join(masked_frames_dir, frame_file), frame)
                     continue
                 
@@ -906,12 +907,20 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         if len(results) > 1:
             baseline_name = list(results.keys())[0]
             print(f"\n{'TRADE-OFF ANALYSIS (vs. ' + baseline_name + ')':^160}")
+            print(f"{'Method':<20} {'PSNR FG %':<15} {'PSNR BG %':<15} {'SSIM FG %':<15} {'SSIM BG %':<15} {'LPIPS FG %':<15} {'LPIPS BG %':<15} {'VMAF FG %':<15} {'VMAF BG %':<15}")
             print(f"{'-'*160}")
             
             for video_name in list(results.keys())[1:]:
-                print(f"\n{video_name}:")
-                
                 # Calculate changes for all metrics
+                psnr_fg_change = 0
+                psnr_bg_change = 0
+                ssim_fg_change = 0
+                ssim_bg_change = 0
+                lpips_fg_change = 0
+                lpips_bg_change = 0
+                vmaf_fg_change = 0
+                vmaf_bg_change = 0
+                
                 for metric in ['psnr', 'ssim', 'lpips', 'vmaf']:
                     for region in ['foreground', 'background']:
                         baseline_val = results[baseline_name][region].get(f'{metric}_mean', 0)
@@ -924,29 +933,36 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
                             else:
                                 change = ((current_val / baseline_val) - 1) * 100
                             
-                            region_label = "FG" if region == "foreground" else "BG"
-                            print(f"  {metric.upper()} {region_label}: {change:+.2f}%")
+                            # Store changes
+                            if metric == 'psnr' and region == 'foreground':
+                                psnr_fg_change = change
+                            elif metric == 'psnr' and region == 'background':
+                                psnr_bg_change = change
+                            elif metric == 'ssim' and region == 'foreground':
+                                ssim_fg_change = change
+                            elif metric == 'ssim' and region == 'background':
+                                ssim_bg_change = change
+                            elif metric == 'lpips' and region == 'foreground':
+                                lpips_fg_change = change
+                            elif metric == 'lpips' and region == 'background':
+                                lpips_bg_change = change
+                            elif metric == 'vmaf' and region == 'foreground':
+                                vmaf_fg_change = change
+                            elif metric == 'vmaf' and region == 'background':
+                                vmaf_bg_change = change
                 
-                # Overall verdict
-                fg_ssim_change = ((results[video_name]['foreground'].get('ssim_mean', 0) / 
-                                  results[baseline_name]['foreground'].get('ssim_mean', 1)) - 1) * 100
-                bg_ssim_change = ((results[video_name]['background'].get('ssim_mean', 0) / 
-                                  results[baseline_name]['background'].get('ssim_mean', 1)) - 1) * 100
-                
-                if fg_ssim_change > 0 and bg_ssim_change < 0:
-                    print("  → Verdict: Successful quality trade-off achieved.")
-                elif fg_ssim_change > 0 and bg_ssim_change >= 0:
-                    print("  → Verdict: Overall quality improvement.")
-                else:
-                    print("  → Verdict: Unfavorable or mixed results.")
-                print("-" * 80)
+                # Print table row
+                print(f"{video_name:<20} {psnr_fg_change:+.2f}%{' '*8} {psnr_bg_change:+.2f}%{' '*8} {ssim_fg_change:+.2f}%{' '*8} {ssim_bg_change:+.2f}%{' '*8} {lpips_fg_change:+.2f}%{' '*8} {lpips_bg_change:+.2f}%{' '*8} {vmaf_fg_change:+.2f}%{' '*8} {vmaf_bg_change:+.2f}%{' '*8}")
+            
+            print(f"{'-'*160}")
     
     # --- Setup ---
     os.makedirs(temp_dir, exist_ok=True)
     masked_videos_dir = os.path.join(temp_dir, "masked_videos")
-    decoded_frames_root = os.path.join(temp_dir, "decoded_frames")
-    heatmaps_dir = os.path.join(temp_dir, "quality_heatmaps")
+    frames_root = os.path.join(temp_dir, "frames")
+    heatmaps_dir = os.path.join(temp_dir, "performance_figures")
     os.makedirs(masked_videos_dir, exist_ok=True)
+    os.makedirs(frames_root, exist_ok=True)
     os.makedirs(heatmaps_dir, exist_ok=True)
     
     if not os.path.isdir(masks_dir):
@@ -976,7 +992,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             continue
 
         # 1. Create masked versions of the encoded video
-        video_decoded_dir = os.path.join(decoded_frames_root, video_name.replace(" ", "_"))
+        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
         if not _decode_video_to_frames(video_path, video_decoded_dir):
             continue
         
@@ -1105,13 +1121,238 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         shutil.rmtree(ref_bg_frames_dir, ignore_errors=True)
         shutil.rmtree(enc_bg_frames_dir, ignore_errors=True)
 
+    # --- Generate Visualizations ---
+    print("\nGenerating quality visualization charts...")
+    
+    def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
+        """Generate comprehensive quality visualization charts."""
+        if not results:
+            return
+        
+        video_names = list(results.keys())
+        
+        # 1. Overall Quality Comparison Bar Chart
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
+        
+        metrics = [
+            ('psnr_mean', 'PSNR (dB)', [20, 50]),
+            ('ssim_mean', 'SSIM', [0, 1]),
+            ('lpips_mean', 'LPIPS (lower is better)', [0, 0.5]),
+            ('vmaf_mean', 'VMAF', [0, 100])
+        ]
+        
+        for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
+            ax = axes[idx // 2, idx % 2]
+            
+            fg_values = [results[name]['foreground'].get(metric_key, 0) for name in video_names]
+            bg_values = [results[name]['background'].get(metric_key, 0) for name in video_names]
+            
+            x = np.arange(len(video_names))
+            width = 0.35
+            
+            bars1 = ax.bar(x - width/2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
+            bars2 = ax.bar(x + width/2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
+            
+            ax.set_ylabel(metric_label, fontsize=11, fontweight='bold')
+            ax.set_title(metric_label, fontsize=12, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(video_names, rotation=45, ha='right')
+            ax.legend()
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            ax.set_ylim(ylim)
+            
+            # Add value labels on bars
+            for bars in [bars1, bars2]:
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.2f}',
+                           ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(heatmaps_dir, '1_overall_quality_comparison.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  ✓ Generated quality comparison visualization in {heatmaps_dir}")
+    
+    _generate_quality_visualizations(analysis_results, heatmaps_dir)
+
+    # --- Generate Visual Patch Comparison ---
+    def _generate_patch_comparison(
+        reference_frames: List[np.ndarray],
+        encoded_videos: Dict[str, str],
+        results: Dict,
+        masks_dir: str,
+        heatmaps_dir: str,
+        decoded_frames_root: str,
+        sample_frame_idx: int = None,
+        patch_size: int = 128
+    ) -> None:
+        """Generate visual comparison of FG/BG patches from each method with VMAF scores."""
+        if not results or not reference_frames:
+            return
+        
+        # Use middle frame if not specified
+        if sample_frame_idx is None:
+            sample_frame_idx = len(reference_frames) // 2
+        
+        print(f"  - Generating patch comparison visualization for frame {sample_frame_idx}...")
+        
+        # Load reference frame
+        ref_frame = reference_frames[sample_frame_idx]
+        
+        # Load mask for this frame
+        mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith('.png')])
+        if sample_frame_idx >= len(mask_files):
+            print(f"    Warning: Mask for frame {sample_frame_idx} not found. Skipping patch comparison.")
+            return
+        
+        mask_path = os.path.join(masks_dir, mask_files[sample_frame_idx])
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f"    Warning: Could not load mask from {mask_path}. Skipping patch comparison.")
+            return
+        
+        # Find a good foreground patch (center of mass of mask)
+        mask_binary = (mask > 127).astype(np.uint8)
+        moments = cv2.moments(mask_binary)
+        if moments['m00'] > 0:
+            fg_center_x = int(moments['m10'] / moments['m00'])
+            fg_center_y = int(moments['m01'] / moments['m00'])
+        else:
+            # Fallback to center of frame
+            fg_center_x = ref_frame.shape[1] // 2
+            fg_center_y = ref_frame.shape[0] // 2
+        
+        # Find good background patches (two different areas)
+        mask_inverted = 1 - mask_binary
+        
+        # First background patch: center of mass of inverted mask
+        moments_bg = cv2.moments(mask_inverted)
+        if moments_bg['m00'] > 0:
+            bg1_center_x = int(moments_bg['m10'] / moments_bg['m00'])
+            bg1_center_y = int(moments_bg['m01'] / moments_bg['m00'])
+        else:
+            # Fallback to top-left corner
+            bg1_center_x = ref_frame.shape[1] // 4
+            bg1_center_y = ref_frame.shape[0] // 4
+        
+        # Second background patch: find another area away from first patch
+        # Try top-right corner area first
+        bg2_center_x = ref_frame.shape[1] * 3 // 4
+        bg2_center_y = ref_frame.shape[0] // 4
+        
+        # If that's too close to the first patch, try bottom-left
+        if abs(bg2_center_x - bg1_center_x) < patch_size and abs(bg2_center_y - bg1_center_y) < patch_size:
+            bg2_center_x = ref_frame.shape[1] // 4
+            bg2_center_y = ref_frame.shape[0] * 3 // 4
+        
+        # Extract patches from reference frame
+        def extract_patch(frame, center_x, center_y, size):
+            h, w = frame.shape[:2]
+            x1 = max(0, center_x - size // 2)
+            y1 = max(0, center_y - size // 2)
+            x2 = min(w, x1 + size)
+            y2 = min(h, y1 + size)
+            x1 = max(0, x2 - size)
+            y1 = max(0, y2 - size)
+            return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
+        
+        ref_fg_patch, fg_coords = extract_patch(ref_frame, fg_center_x, fg_center_y, patch_size)
+        ref_bg1_patch, bg1_coords = extract_patch(ref_frame, bg1_center_x, bg1_center_y, patch_size)
+        ref_bg2_patch, bg2_coords = extract_patch(ref_frame, bg2_center_x, bg2_center_y, patch_size)
+        
+        # Load decoded frames for each method and extract patches
+        video_names = list(encoded_videos.keys())
+        num_methods = len(video_names)
+        
+        # Create figure: 3 rows (FG/BG1/BG2) x (num_methods + 1) columns (reference + methods)
+        fig, axes = plt.subplots(3, num_methods + 1, figsize=(4 * (num_methods + 1), 12))
+        fig.suptitle(f'Visual Patch Comparison (Frame {sample_frame_idx + 1})', fontsize=16, fontweight='bold')
+        
+        # Plot reference patches
+        axes[0, 0].imshow(cv2.cvtColor(ref_fg_patch, cv2.COLOR_BGR2RGB))
+        axes[0, 0].set_title('Reference\nForeground', fontsize=10, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        axes[1, 0].imshow(cv2.cvtColor(ref_bg1_patch, cv2.COLOR_BGR2RGB))
+        axes[1, 0].set_title('Reference\nBackground 1', fontsize=10, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        axes[2, 0].imshow(cv2.cvtColor(ref_bg2_patch, cv2.COLOR_BGR2RGB))
+        axes[2, 0].set_title('Reference\nBackground 2', fontsize=10, fontweight='bold')
+        axes[2, 0].axis('off')
+        
+        # Plot patches from each method
+        for idx, video_name in enumerate(video_names):
+            # Load decoded frame
+            video_decoded_dir = os.path.join(decoded_frames_root, f"{video_name.replace(' ', '_')}_decoded")
+            frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.jpg')])
+            
+            if sample_frame_idx >= len(frame_files):
+                continue
+            
+            decoded_frame = cv2.imread(os.path.join(video_decoded_dir, frame_files[sample_frame_idx]))
+            if decoded_frame is None:
+                continue
+            
+            # Extract patches
+            dec_fg_patch, _ = extract_patch(decoded_frame, fg_center_x, fg_center_y, patch_size)
+            dec_bg1_patch, _ = extract_patch(decoded_frame, bg1_center_x, bg1_center_y, patch_size)
+            dec_bg2_patch, _ = extract_patch(decoded_frame, bg2_center_x, bg2_center_y, patch_size)
+            
+            # Get VMAF scores from results
+            fg_vmaf = results[video_name]['foreground'].get('vmaf_mean', 0)
+            bg_vmaf = results[video_name]['background'].get('vmaf_mean', 0)
+            
+            # Plot foreground patch
+            axes[0, idx + 1].imshow(cv2.cvtColor(dec_fg_patch, cv2.COLOR_BGR2RGB))
+            axes[0, idx + 1].set_title(f'{video_name}\nFG VMAF: {fg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[0, idx + 1].axis('off')
+            
+            # Plot background patch 1
+            axes[1, idx + 1].imshow(cv2.cvtColor(dec_bg1_patch, cv2.COLOR_BGR2RGB))
+            axes[1, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[1, idx + 1].axis('off')
+            
+            # Plot background patch 2
+            axes[2, idx + 1].imshow(cv2.cvtColor(dec_bg2_patch, cv2.COLOR_BGR2RGB))
+            axes[2, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[2, idx + 1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(heatmaps_dir, f'2_patch_comparison_frame_{sample_frame_idx + 1}.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  ✓ Generated patch comparison visualization")
+    
+    # Generate patch comparison for middle frame
+    _generate_patch_comparison(
+        reference_frames=reference_frames,
+        encoded_videos=encoded_videos,
+        results=analysis_results,
+        masks_dir=masks_dir,
+        heatmaps_dir=heatmaps_dir,
+        decoded_frames_root=frames_root,
+        sample_frame_idx=len(reference_frames) // 2,
+        patch_size=128
+    )
+
     # --- Finalization ---
     _print_summary_report(analysis_results)
     
-    # Cleanup
-    shutil.rmtree(decoded_frames_root, ignore_errors=True)
+    # Cleanup - clean up decoded frame directories
+    for video_name in encoded_videos.keys():
+        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
+        shutil.rmtree(video_decoded_dir, ignore_errors=True)
     shutil.rmtree(reference_frames_dir, ignore_errors=True)
     print(f"\nAnalysis complete. Masked videos saved to: {masked_videos_dir}")
+    print(f"Quality visualizations saved to: {heatmaps_dir}")
     
     return analysis_results
 
