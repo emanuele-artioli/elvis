@@ -1155,6 +1155,12 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             bars1 = ax.bar(x - width/2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
             bars2 = ax.bar(x + width/2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
             
+            # Set precision for y-axis ticks
+            if metric_key in ['psnr_mean', 'vmaf_mean']:
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
+            else:
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
+                
             ax.set_ylabel(metric_label, fontsize=11, fontweight='bold')
             ax.set_title(metric_label, fontsize=12, fontweight='bold')
             ax.set_xticks(x)
@@ -1470,125 +1476,63 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
     
     return new_image, removal_mask, block_coords_to_remove
 
-def map_strength_linear(normalized_scores: np.ndarray, max_strength: float = 1.0,
-                       save_maps: bool = False, maps_dir: str = None, width: int = None, height: int = None) -> np.ndarray:
+def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, mapping_type: str = 'linear', dtype: type = np.float32, save_maps: bool = False, maps_dir: str = None, width: int = None, height: int = None, map_name: str = 'strength') -> np.ndarray:
     """
-    Linearly maps normalized scores [0, 1] to a strength range [0, max_strength].
-    This is suitable for filters where strength is a simple multiplier (e.g., Gaussian blur's sigma).
+    Maps normalized scores [0, 1] to strength values using different mapping strategies.
+    
+    This unified function supports multiple mapping types:
+    - 'linear': Simple linear mapping to [0, max_value]
+    - 'power_of_2': Maps to discrete power-of-2 values [1, 2, 4, ..., max_value]
     
     Args:
         normalized_scores: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
-        max_strength: Maximum strength value
+        max_value: Maximum strength/factor value
+        mapping_type: Type of mapping ('linear' or 'power_of_2')
+        dtype: Data type for the output array (e.g., np.float32, np.int32)
         save_maps: Whether to save visualization maps
         maps_dir: Directory to save maps to
         width: Frame width (required if save_maps is True)
         height: Frame height (required if save_maps is True)
-    """
-    strength_maps = normalized_scores * max_strength
+        map_name: Name for saved maps (e.g., 'blur_strength', 'dct_cutoff', 'downsample_factor')
     
-    # Save visualization maps if requested
-    if save_maps and maps_dir is not None and width is not None and height is not None:
-        blur_maps_dir = os.path.join(maps_dir, "blur_strength_maps")
-        os.makedirs(blur_maps_dir, exist_ok=True)
-        print(f"Saving blur strength maps to {blur_maps_dir}...")
-        for i, strengths in enumerate(strength_maps):
-            # Normalize strengths to 0-255 range for visualization
-            strength_normalized = (strengths / strengths.max() * 255).astype(np.uint8) if strengths.max() > 0 else strengths.astype(np.uint8)
-            # Resize to match frame dimensions for easier visualization
-            strength_img = cv2.resize(strength_normalized, (width, height), interpolation=cv2.INTER_NEAREST)
-            cv2.imwrite(os.path.join(blur_maps_dir, f"frame_{i+1:05d}.png"), strength_img)
-
-    return strength_maps
-
-def map_strength_dct_cutoff(normalized_scores: np.ndarray, block_size: int, max_cutoff_reduction: float = 0.8, 
-                            save_maps: bool = False, maps_dir: str = None, width: int = None, height: int = None) -> np.ndarray:
-    """
-    Maps normalized scores [0, 1] to a DCT high-frequency cutoff strength.
-    
-    The strength represents how many high-frequency components to cut.
-    A score of 1.0 means cutting max_cutoff_reduction * block_size coefficients.
-    e.g., max_cutoff_reduction=0.8 means up to 80% of the block size is cut.
-    
-    Args:
-        normalized_scores: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
-        block_size: Size of blocks
-        max_cutoff_reduction: Maximum cutoff reduction factor
-        save_maps: Whether to save visualization maps
-        maps_dir: Directory to save maps to
-        width: Frame width (required if save_maps is True)
-        height: Frame height (required if save_maps is True)
-    """
-    # Max number of coefficients to cut (must be < block_size)
-    max_cut = block_size * max_cutoff_reduction
-    
-    # Scale scores to the cutoff range
-    strength = normalized_scores * max_cut
-    
-    # Ensure strength is at least 1 for any significant score
-    strength_maps = np.maximum(strength, 0.0).astype(np.int32)
-    
-    # Save visualization maps if requested
-    if save_maps and maps_dir is not None and width is not None and height is not None:
-        dct_maps_dir = os.path.join(maps_dir, "dct_strength_maps")
-        os.makedirs(dct_maps_dir, exist_ok=True)
-        print(f"Saving DCT strength maps to {dct_maps_dir}...")
-        for i, strengths in enumerate(strength_maps):
-            # Normalize strengths to 0-255 range for visualization
-            strength_normalized = (strengths / strengths.max() * 255).astype(np.uint8) if strengths.max() > 0 else strengths.astype(np.uint8)
-            # Resize to match frame dimensions for easier visualization
-            strength_img = cv2.resize(strength_normalized, (width, height), interpolation=cv2.INTER_NEAREST)
-            cv2.imwrite(os.path.join(dct_maps_dir, f"frame_{i+1:05d}.png"), strength_img)
-    
-    return strength_maps
-
-def map_strength_downsampling_factor(normalized_scores: np.ndarray, max_factor: int = 8,
-                                    save_maps: bool = False, maps_dir: str = None, width: int = None, height: int = None) -> np.ndarray:
-    """
-    Maps normalized scores [0, 1] to a downsampling factor that is a power of 2: 
-    [1, 2, 4, ..., max_factor].
-
-    Args:
-        normalized_scores: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
-        max_factor: The maximum allowed downsampling factor (must be a power of 2).
-        save_maps: Whether to save visualization maps
-        maps_dir: Directory to save maps to
-        width: Frame width (required if save_maps is True)
-        height: Frame height (required if save_maps is True)
-
     Returns:
-        The 3D array of integer downsampling factors (powers of 2).
+        3D array of strength values with the specified dtype
     """
-    if max_factor < 1 or (max_factor & (max_factor - 1) != 0):
-        raise ValueError("max_factor must be a positive power of 2 (e.g., 1, 2, 4, 8).")
-
-    # 1. Define the possible power-of-2 factors (e.g., [1, 2, 4, 8])
-    # The number of levels is log2(max_factor) + 1
-    levels = int(np.log2(max_factor)) + 1
-    pow2_factors = np.logspace(0, levels - 1, levels, base=2, dtype=np.int32) 
-    
-    # 2. Map normalized scores [0, 1] to the indices of these factors [0, 1, 2, ..., levels-1]
-    # We use (levels - 1) to map 1.0 to the highest index.
-    
-    # Ensure scores slightly less than 1.0 map correctly to the max index
-    # Use np.floor to get the index.
-    indices = np.floor(normalized_scores * (levels - 1)).astype(np.int32)
-    
-    # 3. Use the indices to look up the corresponding factor
-    factors = pow2_factors[indices]
+    if mapping_type == 'linear':
+        # Simple linear mapping: score * max_value
+        strength_maps = (normalized_scores * max_value).astype(dtype)
+        
+    elif mapping_type == 'power_of_2':
+        # Validate that max_value is a power of 2
+        if max_value < 1 or (max_value & (max_value - 1) != 0):
+            raise ValueError(f"max_value must be a power of 2 for 'power_of_2' mapping, got {max_value}")
+        
+        # Define the possible power-of-2 factors (e.g., [1, 2, 4, 8])
+        levels = int(np.log2(max_value)) + 1
+        pow2_factors = np.logspace(0, levels - 1, levels, base=2, dtype=np.int32)
+        
+        # Map normalized scores to indices of these factors
+        indices = np.floor(normalized_scores * (levels - 1)).astype(np.int32)
+        
+        # Use the indices to look up the corresponding factor
+        strength_maps = pow2_factors[indices].astype(dtype)
+        
+    else:
+        raise ValueError(f"Unknown mapping_type: {mapping_type}. Use 'linear' or 'power_of_2'.")
     
     # Save visualization maps if requested
     if save_maps and maps_dir is not None and width is not None and height is not None:
-        downsample_maps_dir = os.path.join(maps_dir, "downsample_strength_maps")
-        os.makedirs(downsample_maps_dir, exist_ok=True)
-        print(f"Saving downsampling strength maps to {downsample_maps_dir}...")
-        for i, strengths in enumerate(factors):
+        strength_maps_dir = os.path.join(maps_dir, f"{map_name}_maps")
+        os.makedirs(strength_maps_dir, exist_ok=True)
+        print(f"  - Saving {map_name} maps to {strength_maps_dir}...")
+        for i, strengths in enumerate(strength_maps):
             # Normalize strengths to 0-255 range for visualization
             strength_normalized = (strengths / strengths.max() * 255).astype(np.uint8) if strengths.max() > 0 else strengths.astype(np.uint8)
             # Resize to match frame dimensions for easier visualization
             strength_img = cv2.resize(strength_normalized, (width, height), interpolation=cv2.INTER_NEAREST)
-            cv2.imwrite(os.path.join(downsample_maps_dir, f"frame_{i+1:05d}.png"), strength_img)
-
-    return factors
+            cv2.imwrite(os.path.join(strength_maps_dir, f"frame_{i+1:05d}.png"), strength_img)
+    
+    return strength_maps
 
 def apply_gaussian_blur(block: np.ndarray, strength: float) -> np.ndarray:
     """
@@ -1885,8 +1829,15 @@ if __name__ == "__main__":
     os.makedirs(dct_filtered_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
-    dct_strengths = map_strength_dct_cutoff(removability_scores, block_size, max_cutoff_reduction=0.99,
-                                            save_maps=True, maps_dir=maps_dir, width=width, height=height)
+    dct_strengths = map_scores_to_strengths(removability_scores, 
+                                            max_value=block_size * 0.99,
+                                            mapping_type='linear',
+                                            dtype=np.int32,
+                                            save_maps=True, 
+                                            maps_dir=maps_dir, 
+                                            width=width, 
+                                            height=height,
+                                            map_name='dct_strength')
     dct_filtered_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                                    filter_func=apply_dct_damping,
                                                    min_strength_threshold=1.0)
@@ -1918,8 +1869,15 @@ if __name__ == "__main__":
     os.makedirs(downsampled_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
-    downsample_strengths = map_strength_downsampling_factor(removability_scores, max_factor=8,
-                                                            save_maps=True, maps_dir=maps_dir, width=width, height=height)
+    downsample_strengths = map_scores_to_strengths(removability_scores, 
+                                                   max_value=8,
+                                                   mapping_type='power_of_2',
+                                                   dtype=np.int32,
+                                                   save_maps=True, 
+                                                   maps_dir=maps_dir, 
+                                                   width=width, 
+                                                   height=height,
+                                                   map_name='downsample_strength')
     downsampled_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                                   filter_func=apply_downsampling,
                                                   min_strength_threshold=1.0)
@@ -1951,8 +1909,15 @@ if __name__ == "__main__":
     os.makedirs(blurred_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
                         in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
-    blur_strengths = map_strength_linear(removability_scores, max_strength=3.0,
-                                        save_maps=True, maps_dir=maps_dir, width=width, height=height)
+    blur_strengths = map_scores_to_strengths(removability_scores, 
+                                            max_value=3.0,
+                                            mapping_type='linear',
+                                            dtype=np.float32,
+                                            save_maps=True, 
+                                            maps_dir=maps_dir, 
+                                            width=width, 
+                                            height=height,
+                                            map_name='blur_strength')
     blurred_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                              filter_func=apply_gaussian_blur,
                                              min_strength_threshold=0.1)
