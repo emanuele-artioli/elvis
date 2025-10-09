@@ -15,6 +15,7 @@ import multiprocessing
 import torch
 import lpips
 import platform
+import tempfile
 
 
 
@@ -222,7 +223,7 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
     Both modes use two-pass encoding for optimal quality/size trade-off.
     
     Args:
-        input_frames_dir: Directory containing input frames (e.g., '%05d.jpg').
+        input_frames_dir: Directory containing input frames (e.g., '%05d.png').
         output_video: The path for the final encoded video file.
         framerate: The framerate of the output video.
         width: The width of the video.
@@ -244,8 +245,11 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
         base_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning",
             "-framerate", str(framerate),
-            "-i", f"{input_frames_dir}/%05d.jpg",
-            "-s", f"{width}x{height}",
+            "-i", f"{input_frames_dir}/%05d.png",
+            "-vf", f"scale={width}:{height}:flags=lanczos,format=yuv420p",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
         ]
         
         if lossless:
@@ -340,7 +344,7 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
         video file accurately meets the target bitrate.
 
     Args:
-        input_frames_dir: Directory containing input frames (e.g., '%05d.jpg').
+        input_frames_dir: Directory containing input frames (e.g., '%05d.png').
         output_video: The path for the final encoded video file.
         removability_scores: A 3D numpy array of shape (num_frames, num_blocks_y, num_blocks_x)
                              containing the importance score for each block.
@@ -544,9 +548,6 @@ def calculate_vmaf(reference_video: str, distorted_video: str, width: int, heigh
     Returns:
         Dictionary containing VMAF statistics (mean, min, max, etc.)
     """
-    import subprocess
-    import json
-    import tempfile
     
     # Helper function to convert video to YUV
     def _convert_to_yuv(video_path: str, output_yuv: str, width: int, height: int) -> bool:
@@ -722,8 +723,6 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
     Returns:
         A dictionary containing the aggregated analysis results for each video.
     """
-
-    import tempfile
     
     # Helper functions
     
@@ -745,7 +744,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             masked_frames_dir = output_video.replace('.mp4', '_frames')
             os.makedirs(masked_frames_dir, exist_ok=True)
             
-            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg')])
+            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.png')])
             
             for frame_idx, frame_file in enumerate(frame_files, start=1):
                 frame_path = os.path.join(frames_dir, frame_file)
@@ -776,7 +775,11 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
             encode_cmd = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'error',
                 '-framerate', str(framerate),
-                '-i', os.path.join(masked_frames_dir, '%05d.jpg'),
+                '-i', os.path.join(masked_frames_dir, '%05d.png'),
+                '-vf', f'scale={width}:{height}:flags=lanczos,format=yuv420p',
+                '-color_primaries', 'bt709',
+                '-color_trc', 'bt709',
+                '-colorspace', 'bt709',
                 '-c:v', 'libx265',
                 '-preset', 'veryslow',
                 '-x265-params', 'lossless=1',
@@ -798,8 +801,9 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         decode_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", video_path,
+            "-pix_fmt", "rgb24",
             "-q:v", "2",
-            "-y", os.path.join(output_dir, "%05d.jpg")
+            "-y", os.path.join(output_dir, "%05d.png")
         ]
         result = subprocess.run(decode_cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -975,7 +979,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
     reference_frames_dir = os.path.join(temp_dir, "reference_frames_temp")
     os.makedirs(reference_frames_dir, exist_ok=True)
     for i, frame in enumerate(reference_frames):
-        cv2.imwrite(os.path.join(reference_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(reference_frames_dir, f"{i+1:05d}.png"), frame)
     
     ref_fg_video = os.path.join(masked_videos_dir, "reference_fg.mp4")
     ref_bg_video = os.path.join(masked_videos_dir, "reference_bg.mp4")
@@ -1004,7 +1008,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         _create_masked_video(video_decoded_dir, masks_dir, enc_fg_video, width, height, framerate, 'foreground')
         _create_masked_video(video_decoded_dir, masks_dir, enc_bg_video, width, height, framerate, 'background')
         
-        decoded_frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.jpg')])
+        decoded_frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
         num_frames = min(len(reference_frames), len(decoded_frame_files))
         
         # 2. Calculate all metrics using masked videos for foreground and background
@@ -1027,8 +1031,8 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         _decode_video_to_frames(enc_fg_video, enc_fg_frames_dir)
         
         # Load frames
-        ref_fg_frame_files = sorted([f for f in os.listdir(ref_fg_frames_dir) if f.endswith('.jpg')])
-        enc_fg_frame_files = sorted([f for f in os.listdir(enc_fg_frames_dir) if f.endswith('.jpg')])
+        ref_fg_frame_files = sorted([f for f in os.listdir(ref_fg_frames_dir) if f.endswith('.png')])
+        enc_fg_frame_files = sorted([f for f in os.listdir(enc_fg_frames_dir) if f.endswith('.png')])
         num_fg_frames = min(len(ref_fg_frame_files), len(enc_fg_frame_files))
         
         # Calculate PSNR and SSIM frame-by-frame
@@ -1081,8 +1085,8 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         _decode_video_to_frames(ref_bg_video, ref_bg_frames_dir)
         _decode_video_to_frames(enc_bg_video, enc_bg_frames_dir)
         
-        ref_bg_frame_files = sorted([f for f in os.listdir(ref_bg_frames_dir) if f.endswith('.jpg')])
-        enc_bg_frame_files = sorted([f for f in os.listdir(enc_bg_frames_dir) if f.endswith('.jpg')])
+        ref_bg_frame_files = sorted([f for f in os.listdir(ref_bg_frames_dir) if f.endswith('.png')])
+        enc_bg_frame_files = sorted([f for f in os.listdir(enc_bg_frames_dir) if f.endswith('.png')])
         num_bg_frames = min(len(ref_bg_frame_files), len(enc_bg_frame_files))
         
         # Calculate PSNR and SSIM frame-by-frame
@@ -1295,7 +1299,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
         for idx, video_name in enumerate(video_names):
             # Load decoded frame
             video_decoded_dir = os.path.join(decoded_frames_root, f"{video_name.replace(' ', '_')}_decoded")
-            frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.jpg')])
+            frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
             
             if sample_frame_idx >= len(frame_files):
                 continue
@@ -1413,6 +1417,128 @@ def stretch_frame(shrunk_frame: np.ndarray, binary_mask: np.ndarray, block_size:
     reconstructed_image = combine_blocks_into_image(final_blocks)
     
     return reconstructed_image
+
+def inpaint_with_propainter(stretched_frames_dir: str, removal_masks_dir: str, output_frames_dir: str, width: int, height: int, framerate: float, propainter_dir: str = "ProPainter", resize_ratio: float = 1.0, ref_stride: int = 10, neighbor_length: int = 10, subvideo_length: int = 80, mask_dilation: int = 4, raft_iter: int = 20, fp16: bool = True) -> None:
+    """
+    Uses ProPainter to inpaint stretched frames with removed blocks.
+    
+    This function:
+    1. Creates a temporary video from stretched frames
+    2. Creates a mask video from removal masks
+    3. Runs ProPainter inference
+    4. Extracts inpainted frames back to the output directory
+    
+    Args:
+        stretched_frames_dir: Directory containing stretched frames with black regions
+        removal_masks_dir: Directory containing binary mask images (white = regions to inpaint)
+        output_frames_dir: Directory where inpainted frames will be saved
+        width: Video width
+        height: Video height
+        framerate: Video framerate
+        propainter_dir: Path to ProPainter directory (default: "ProPainter")
+        resize_ratio: Resize scale for processing (default: 1.0)
+        ref_stride: Stride of global reference frames (default: 10)
+        neighbor_length: Length of local neighboring frames (default: 10)
+        subvideo_length: Length of sub-video for long video inference (default: 80)
+        mask_dilation: Mask dilation for video and flow masking (default: 4)
+        raft_iter: Iterations for RAFT inference (default: 20)
+        fp16: Use fp16 (half precision) during inference (default: False)
+    """
+    
+    # Save current directory
+    original_dir = os.getcwd()
+    
+    # Get absolute paths
+    stretched_frames_abs = os.path.abspath(stretched_frames_dir)
+    removal_masks_abs = os.path.abspath(removal_masks_dir)
+    output_frames_abs = os.path.abspath(output_frames_dir)
+    propainter_abs = os.path.abspath(propainter_dir)
+    
+    try:
+        # Create temporary directory for ProPainter inputs/outputs
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create ProPainter input directories
+            propainter_input_dir = os.path.join(propainter_abs, "inputs", "elvis_temp")
+            propainter_output_dir = os.path.join(propainter_abs, "results", "elvis_temp")
+            os.makedirs(propainter_input_dir, exist_ok=True)
+
+            # Copy stretched frames to ProPainter input directory
+            frame_files = sorted([f for f in os.listdir(stretched_frames_abs) if f.endswith(('.jpg', '.png'))])
+            temp_frame_dir = os.path.join(propainter_input_dir, "frames")
+            os.makedirs(temp_frame_dir, exist_ok=True)
+            for i, frame_file in enumerate(frame_files):
+                src_frame = os.path.join(stretched_frames_abs, frame_file)
+                dst_frame = os.path.join(temp_frame_dir, f"{i+1:05d}.png")
+                shutil.copy(src_frame, dst_frame)
+            
+            # Copy masks to ProPainter input directory
+            temp_mask_dir = os.path.join(propainter_input_dir, "masks")
+            os.makedirs(temp_mask_dir, exist_ok=True)
+            mask_files = sorted([f for f in os.listdir(removal_masks_abs) if f.endswith(('.jpg', '.png'))])
+            for i, mask_file in enumerate(mask_files):
+                src_mask = os.path.join(removal_masks_abs, mask_file)
+                dst_mask = os.path.join(temp_mask_dir, f"{i+1:05d}.png")
+                shutil.copy(src_mask, dst_mask)
+            
+            # Change to ProPainter directory
+            os.chdir(propainter_abs)
+            
+            # Build ProPainter command
+            propainter_cmd = [
+                "python", "inference_propainter.py",
+                "--video", temp_frame_dir,
+                "--mask", temp_mask_dir,
+                "--output", propainter_output_dir,
+                "--width", str(width),
+                "--height", str(height),
+                "--resize_ratio", str(resize_ratio),
+                "--ref_stride", str(ref_stride),
+                "--neighbor_length", str(neighbor_length),
+                "--subvideo_length", str(subvideo_length),
+                "--mask_dilation", str(mask_dilation),
+                "--raft_iter", str(raft_iter),
+                "--save_fps", str(int(framerate)),
+                "--save_frames"  # Save individual frames
+            ]
+            
+            if fp16:
+                propainter_cmd.append("--fp16")
+            
+            result = subprocess.run(propainter_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"ProPainter stdout: {result.stdout}")
+                print(f"ProPainter stderr: {result.stderr}")
+                raise RuntimeError(f"ProPainter inference failed: {result.stderr}")
+            
+            print(f"ProPainter output: {result.stdout}")
+            
+            # Extract inpainted frames from ProPainter output
+            propainter_frames_dir = os.path.join(propainter_output_dir, "frames/frames")
+            if not os.path.exists(propainter_frames_dir):
+                raise RuntimeError(f"ProPainter did not generate frames at {propainter_frames_dir}")
+            
+            # Copy inpainted frames to output directory
+            os.makedirs(output_frames_abs, exist_ok=True)
+            inpainted_files = sorted([f for f in os.listdir(propainter_frames_dir) if f.endswith('.png')])
+            for i, inpainted_file in enumerate(inpainted_files):
+                src_inpainted = os.path.join(propainter_frames_dir, inpainted_file)
+                dst_inpainted = os.path.join(output_frames_abs, f"{i+1:05d}.png")
+                shutil.copy(src_inpainted, dst_inpainted)
+            
+            print(f"Inpainted frames saved to {output_frames_abs}")
+            
+            # Clean up ProPainter temp directories
+            if os.path.exists(propainter_input_dir):
+                shutil.rmtree(propainter_input_dir)
+            if os.path.exists(propainter_output_dir):
+                shutil.rmtree(propainter_output_dir)
+    
+    except Exception as e:
+        print(f"Error in inpaint_with_propainter: {e}")
+        raise
+    finally:
+        # Always return to original directory
+        os.chdir(original_dir)
 
 def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """
@@ -1710,7 +1836,7 @@ if __name__ == "__main__":
     os.system(f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
     print("Extracting reference frames...")
-    os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.jpg")
+    os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png")
     
     end = time.time()
     execution_times["preprocessing"] = end - start
@@ -1793,10 +1919,10 @@ if __name__ == "__main__":
     # Shrink frames based on removability scores
     shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
-    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
     shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
     for i, frame in enumerate(shrunk_frames):
-        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
 
     # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
     shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
@@ -1828,7 +1954,7 @@ if __name__ == "__main__":
     dct_filtered_frames_dir = os.path.join(experiment_dir, "frames", "dct_filtered")
     os.makedirs(dct_filtered_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
     dct_strengths = map_scores_to_strengths(removability_scores, 
                                             max_value=block_size * 0.99,
                                             mapping_type='linear',
@@ -1843,7 +1969,7 @@ if __name__ == "__main__":
                                                    min_strength_threshold=1.0)
                            for img, strengths in zip(reference_frames, dct_strengths)]
     for i, frame in enumerate(dct_filtered_frames):
-        cv2.imwrite(os.path.join(dct_filtered_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(dct_filtered_frames_dir, f"{i+1:05d}.png"), frame)
 
     dct_filtered_video = os.path.join(experiment_dir, "dct_filtered.mp4")
     encode_video(
@@ -1868,7 +1994,7 @@ if __name__ == "__main__":
     downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
     downsample_strengths = map_scores_to_strengths(removability_scores, 
                                                    max_value=8,
                                                    mapping_type='power_of_2',
@@ -1883,7 +2009,7 @@ if __name__ == "__main__":
                                                   min_strength_threshold=1.0)
                          for img, strengths in zip(reference_frames, downsample_strengths)]
     for i, frame in enumerate(downsampled_frames):
-        cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.png"), frame)
 
     downsampled_video = os.path.join(experiment_dir, "downsampled.mp4")
     encode_video(
@@ -1908,7 +2034,7 @@ if __name__ == "__main__":
     blurred_frames_dir = os.path.join(experiment_dir, "frames", "blurred")
     os.makedirs(blurred_frames_dir, exist_ok=True)
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.jpg')]
+                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
     blur_strengths = map_scores_to_strengths(removability_scores, 
                                             max_value=3.0,
                                             mapping_type='linear',
@@ -1923,7 +2049,7 @@ if __name__ == "__main__":
                                              min_strength_threshold=0.1)
                       for img, strengths in zip(reference_frames, blur_strengths)]
     for i, frame in enumerate(blurred_frames):
-        cv2.imwrite(os.path.join(blurred_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(blurred_frames_dir, f"{i+1:05d}.png"), frame)
     
     blurred_video = os.path.join(experiment_dir, "blurred.mp4")
     encode_video(
@@ -1960,11 +2086,12 @@ if __name__ == "__main__":
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", shrunk_video,
+        "-pix_fmt", "rgb24",
         "-q:v", "1",
         "-r", str(framerate),
         "-f", "image2",
         "-start_number", "1",
-        "-y", f"{stretched_frames_dir}/%05d.jpg"
+        "-y", f"{stretched_frames_dir}/%05d.png"
     ]
     result = subprocess.run(decode_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1972,10 +2099,10 @@ if __name__ == "__main__":
         raise RuntimeError(f"Stretched decoding failed: {result.stderr}")
 
     # Stretch each frame using the removal masks
-    stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg")) for i in range(len(removal_masks))]
+    stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")) for i in range(len(removal_masks))]
     stretched_frames = [stretch_frame(img, mask, block_size) for img, mask in zip(stretched_frames, removal_masks)]
     for i, frame in enumerate(stretched_frames):
-        cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg"), frame)
+        cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
 
     # Convert removal_masks to mask images for inpainting (considering block size)
     removal_masks_dir = os.path.join(maps_dir, "removal_masks")
@@ -2004,14 +2131,17 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Inpainting stretched frames to fill in removed blocks...")
 
-    # Inpaint the stretched frames to fill in removed blocks TODO: replace with ProPainter or E2FGVI
+    # Inpaint the stretched frames to fill in removed blocks using ProPainter
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
-    os.makedirs(inpainted_frames_dir, exist_ok=True)
-    for i in range(len(removal_masks)):
-        stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.jpg"))
-        mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
-        inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        cv2.imwrite(os.path.join(inpainted_frames_dir, f"{i+1:05d}.jpg"), inpainted_frame)
+    
+    inpaint_with_propainter(
+        stretched_frames_dir=stretched_frames_dir,
+        removal_masks_dir=removal_masks_dir,
+        output_frames_dir=inpainted_frames_dir,
+        width=width,
+        height=height,
+        framerate=framerate
+    )
 
     end = time.time()
     execution_times["elvis_v1_inpainting"] = end - start
@@ -2038,11 +2168,12 @@ if __name__ == "__main__":
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", dct_filtered_video,
+        "-pix_fmt", "rgb24",
         "-q:v", "1",
         "-r", str(framerate),
         "-f", "image2",
         "-start_number", "1",
-        "-y", f"{dct_decoded_frames_dir}/%05d.jpg"
+        "-y", f"{dct_decoded_frames_dir}/%05d.png"
     ]
     result = subprocess.run(decode_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2054,9 +2185,9 @@ if __name__ == "__main__":
     dct_restored_frames_dir = os.path.join(experiment_dir, "frames", "dct_restored")
     os.makedirs(dct_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
-        dct_frame = cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        dct_frame = cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.png"))
         restored_frame = cv2.bilateralFilter(dct_frame, d=9, sigmaColor=75, sigmaSpace=75)
-        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
+        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
 
     # Encode the restored frames
     dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
@@ -2083,11 +2214,12 @@ if __name__ == "__main__":
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", downsampled_video,
+        "-pix_fmt", "rgb24",
         "-q:v", "1",
         "-r", str(framerate),
         "-f", "image2",
         "-start_number", "1",
-        "-y", f"{downsampled_decoded_frames_dir}/%05d.jpg"
+        "-y", f"{downsampled_decoded_frames_dir}/%05d.png"
     ]
     result = subprocess.run(decode_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2099,9 +2231,9 @@ if __name__ == "__main__":
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
-        downsampled_frame = cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        downsampled_frame = cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.png"))
         restored_frame = cv2.resize(downsampled_frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
-        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
+        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
 
     # Encode the restored frames
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
@@ -2128,11 +2260,12 @@ if __name__ == "__main__":
     decode_cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
         "-i", blurred_video,
+        "-pix_fmt", "rgb24",
         "-q:v", "1",
         "-r", str(framerate),
         "-f", "image2",
         "-start_number", "1",
-        "-y", f"{blurred_decoded_frames_dir}/%05d.jpg"
+        "-y", f"{blurred_decoded_frames_dir}/%05d.png"
     ]
     result = subprocess.run(decode_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -2144,10 +2277,10 @@ if __name__ == "__main__":
     blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "blurred_restored")
     os.makedirs(blurred_restored_frames_dir, exist_ok=True)
     for i in range(len(removability_scores)):
-        blurred_frame = cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.jpg"))
+        blurred_frame = cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.png"))
         gaussian = cv2.GaussianBlur(blurred_frame, (9, 9), 10.0)
         restored_frame = cv2.addWeighted(blurred_frame, 1.5, gaussian, -0.5, 0)
-        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.jpg"), restored_frame)
+        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
 
     # Encode the restored frames
     blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
