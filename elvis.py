@@ -2142,9 +2142,37 @@ if __name__ == "__main__":
         lossless=True
     )
 
-    # --- Inpainting ---
+    # --- Inpainting with CV2 ---
     start = time.time()
-    print(f"Inpainting stretched frames to fill in removed blocks...")
+    print(f"Inpainting stretched frames with CV2...")
+
+    # Inpaint the stretched frames to fill in removed blocks using CV2
+    inpainted_cv2_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_cv2")
+    os.makedirs(inpainted_cv2_frames_dir, exist_ok=True)
+    for i in range(len(removal_masks)):
+        stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"))
+        mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
+
+    end = time.time()
+    execution_times["elvis_v1_inpainting_cv2"] = end - start
+    print(f"ELVIS v1 CV2 inpainting completed in {end - start:.2f} seconds.\n")
+
+    # Encode the CV2 inpainted frames losslessly TODO: this is not needed in practice
+    inpainted_cv2_video = os.path.join(experiment_dir, "inpainted_cv2.mp4")
+    encode_video(
+        input_frames_dir=inpainted_cv2_frames_dir,
+        output_video=inpainted_cv2_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
+
+    # --- Inpainting with ProPainter ---
+    start = time.time()
+    print(f"Inpainting stretched frames with ProPainter...")
 
     # Inpaint the stretched frames to fill in removed blocks using ProPainter
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
@@ -2159,10 +2187,10 @@ if __name__ == "__main__":
     )
 
     end = time.time()
-    execution_times["elvis_v1_inpainting"] = end - start
-    print(f"ELVIS v1 inpainting completed in {end - start:.2f} seconds.\n")
+    execution_times["elvis_v1_inpainting_propainter"] = end - start
+    print(f"ELVIS v1 ProPainter inpainting completed in {end - start:.2f} seconds.\n")
 
-    # Encode the inpainted frames losslessly TODO: this is not needed in practice
+    # Encode the ProPainter inpainted frames losslessly TODO: this is not needed in practice
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
     encode_video(
         input_frames_dir=inpainted_frames_dir,
@@ -2302,7 +2330,8 @@ if __name__ == "__main__":
     encoded_videos = {
         "Baseline": baseline_video,
         "Adaptive": adaptive_video,
-        "ELVIS v1": inpainted_video,
+        "ELVIS v1 CV2": inpainted_cv2_video,
+        "ELVIS v1 ProPainter": inpainted_video,
         "ELVIS v2 DCT": dct_restored_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
         "ELVIS v2 Blur": blurred_restored_video
