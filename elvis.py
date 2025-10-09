@@ -454,6 +454,46 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             if f.startswith(os.path.basename(passlog_file)):
                  os.remove(os.path.join(temp_dir, f))
 
+def decode_video(video_path: str, output_dir: str, framerate: float = None, start_number: int = 1, quality: int = 1) -> bool:
+    """
+    Decodes a video file to PNG frames with proper color space handling.
+    
+    Args:
+        video_path: Path to the input video file
+        output_dir: Directory where decoded frames will be saved
+        framerate: Optional framerate to decode at (if None, uses video's native framerate)
+        start_number: Starting number for output frames (default: 1)
+        quality: JPEG quality for PNG encoding, 1-31 where lower is better (default: 1)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-pix_fmt", "rgb24",
+        "-q:v", str(quality),
+    ]
+    
+    # Add framerate if specified
+    if framerate is not None:
+        decode_cmd.extend(["-r", str(framerate)])
+    
+    # Add output parameters
+    decode_cmd.extend([
+        "-f", "image2",
+        "-start_number", str(start_number),
+        "-y", os.path.join(output_dir, "%05d.png")
+    ])
+    
+    result = subprocess.run(decode_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error decoding {video_path}: {result.stderr}")
+        return False
+    return True
+
 def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
     """
     Calculates the PSNR for a single pair of image blocks.
@@ -797,19 +837,7 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
     
     def _decode_video_to_frames(video_path: str, output_dir: str) -> bool:
         """Decodes a video into frames using FFmpeg. Returns True on success."""
-        os.makedirs(output_dir, exist_ok=True)
-        decode_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", video_path,
-            "-pix_fmt", "rgb24",
-            "-q:v", "2",
-            "-y", os.path.join(output_dir, "%05d.png")
-        ]
-        result = subprocess.run(decode_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error decoding {video_path}: {result.stderr}")
-            return False
-        return True
+        return decode_video(video_path, output_dir, quality=2)
 
     def _generate_and_save_heatmap(
         ref_frame: np.ndarray,
@@ -2082,21 +2110,8 @@ if __name__ == "__main__":
     removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
     removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
     stretched_frames_dir = os.path.join(experiment_dir, "frames", "stretched")
-    os.makedirs(stretched_frames_dir, exist_ok=True)
-    decode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-i", shrunk_video,
-        "-pix_fmt", "rgb24",
-        "-q:v", "1",
-        "-r", str(framerate),
-        "-f", "image2",
-        "-start_number", "1",
-        "-y", f"{stretched_frames_dir}/%05d.png"
-    ]
-    result = subprocess.run(decode_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Stretched decoding failed: {result.stderr}")
-        raise RuntimeError(f"Stretched decoding failed: {result.stderr}")
+    if not decode_video(shrunk_video, stretched_frames_dir, framerate=framerate, start_number=1, quality=1):
+        raise RuntimeError(f"Failed to decode shrunk video: {shrunk_video}")
 
     # Stretch each frame using the removal masks
     stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")) for i in range(len(removal_masks))]
@@ -2164,21 +2179,8 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Decoding DCT filtered ELVIS v2 video...")
     dct_decoded_frames_dir = os.path.join(experiment_dir, "frames", "dct_decoded")
-    os.makedirs(dct_decoded_frames_dir, exist_ok=True)
-    decode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-i", dct_filtered_video,
-        "-pix_fmt", "rgb24",
-        "-q:v", "1",
-        "-r", str(framerate),
-        "-f", "image2",
-        "-start_number", "1",
-        "-y", f"{dct_decoded_frames_dir}/%05d.png"
-    ]
-    result = subprocess.run(decode_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"DCT filtered decoding failed: {result.stderr}")
-        raise RuntimeError(f"DCT filtered decoding failed: {result.stderr}")
+    if not decode_video(dct_filtered_video, dct_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
+        raise RuntimeError(f"Failed to decode DCT filtered video: {dct_filtered_video}")
 
     # Restoration: Deblock using a simple bilateral filter (placeholder for a SOTA model)
     print("Restoring DCT filtered frames using bilateral filter...")
@@ -2210,21 +2212,8 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Decoding downsampled ELVIS v2 video...")
     downsampled_decoded_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
-    os.makedirs(downsampled_decoded_frames_dir, exist_ok=True)
-    decode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-i", downsampled_video,
-        "-pix_fmt", "rgb24",
-        "-q:v", "1",
-        "-r", str(framerate),
-        "-f", "image2",
-        "-start_number", "1",
-        "-y", f"{downsampled_decoded_frames_dir}/%05d.png"
-    ]
-    result = subprocess.run(decode_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Downsampled decoding failed: {result.stderr}")
-        raise RuntimeError(f"Downsampled decoding failed: {result.stderr}")
+    if not decode_video(downsampled_video, downsampled_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
+        raise RuntimeError(f"Failed to decode downsampled video: {downsampled_video}")
 
     # Restoration: Upscale using a simple Lanczos interpolation (placeholder for a SOTA model)
     print("Restoring downsampled frames using Lanczos interpolation...")
@@ -2256,21 +2245,8 @@ if __name__ == "__main__":
     start = time.time()
     print(f"Decoding blurred ELVIS v2 video...")
     blurred_decoded_frames_dir = os.path.join(experiment_dir, "frames", "blurred_decoded")
-    os.makedirs(blurred_decoded_frames_dir, exist_ok=True)
-    decode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-i", blurred_video,
-        "-pix_fmt", "rgb24",
-        "-q:v", "1",
-        "-r", str(framerate),
-        "-f", "image2",
-        "-start_number", "1",
-        "-y", f"{blurred_decoded_frames_dir}/%05d.png"
-    ]
-    result = subprocess.run(decode_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Blurred decoding failed: {result.stderr}")
-        raise RuntimeError(f"Blurred decoding failed: {result.stderr}")
+    if not decode_video(blurred_video, blurred_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
+        raise RuntimeError(f"Failed to decode blurred video: {blurred_video}")
 
     # Restoration: Deblur using a simple unsharp mask (placeholder for a SOTA model)
     print("Restoring blurred frames using unsharp masking...")
