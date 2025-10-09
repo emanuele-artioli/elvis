@@ -720,695 +720,32 @@ def calculate_vmaf(reference_video: str, distorted_video: str, width: int, heigh
 
 def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     """
-    Efficiently splits an image into non-overlapping blocks using vectorized operations.
-
-    Args:
-        image: The image to split, with shape (H, W, C).
-        block_size: The side length (l) of each square block.
-
-    Returns:
-        A 5D array of blocks with shape (num_rows, num_cols, l, l, C).
+    Splits an image into a 5D array of blocks.
+    Shape: (num_blocks_y, num_blocks_x, block_size, block_size, channels)
     """
-    H, W, C = image.shape
-    num_rows = H // block_size
-    num_cols = W // block_size
+    h, w, c = image.shape
+    # Ensure the image dimensions are divisible by the block size
+    if h % block_size != 0 or w % block_size != 0:
+        raise ValueError("Image dimensions must be divisible by block_size.")
+        
+    num_blocks_y = h // block_size
+    num_blocks_x = w // block_size
     
-    # Reshape and transpose to create a "view" of the blocks without copying data
-    blocks = image.reshape(num_rows, block_size, num_cols, block_size, C).transpose(0, 2, 1, 3, 4)
+    # The crucial reshape and transpose operations
+    blocks = image.reshape(num_blocks_y, block_size, num_blocks_x, block_size, c)
+    blocks = blocks.swapaxes(1, 2)
     return blocks
-
-def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_bitrates: Dict[str, float] = {}, reference_video_path: str = None, framerate: float = 30.0) -> Dict:
-    """
-    A comprehensive function to analyze and compare video encoding performance using masked videos.
-
-    This function:
-    1. Creates masked versions (foreground/background) of all videos.
-    2. Calculates all metrics (PSNR, SSIM, LPIPS, VMAF) separately for foreground and background.
-    3. Generates and saves quality heatmaps for sample frames.
-    4. Prints a unified summary report comparing all encoding methods.
-
-    Args:
-        reference_frames: List of original reference frames.
-        encoded_videos: Dictionary mapping a method name to its video file path.
-        block_size: The size of blocks for visualization heatmaps.
-        width: The width of the video frames.
-        height: The height of the video frames.
-        temp_dir: A directory for temporary files (masked videos, heatmaps).
-        masks_dir: Path to the directory with UFO masks.
-        sample_frames: A list of frame indices to generate heatmaps for.
-        video_bitrates: Dictionary mapping video name to bitrate in bps.
-        reference_video_path: Path to the reference video file (required for VMAF).
-        framerate: Video framerate.
-
-    Returns:
-        A dictionary containing the aggregated analysis results for each video.
-    """
-    
-    # Helper functions
-    
-    def _create_masked_video(frames_dir: str, masks_dir: str, output_video: str, width: int, height: int, 
-                            framerate: float, mask_mode: str = 'foreground') -> bool:
-        """
-        Creates a video with either foreground or background masked out (set to black).
-        
-        Args:
-            frames_dir: Directory containing input frames
-            masks_dir: Directory containing mask frames
-            output_video: Output video path
-            width: Video width
-            height: Video height
-            framerate: Video framerate
-            mask_mode: Either 'foreground' (keep FG, black BG) or 'background' (keep BG, black FG)
-        """
-        try:
-            masked_frames_dir = output_video.replace('.mp4', '_frames')
-            os.makedirs(masked_frames_dir, exist_ok=True)
-            
-            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.png')])
-            
-            for frame_idx, frame_file in enumerate(frame_files, start=1):
-                frame_path = os.path.join(frames_dir, frame_file)
-                # UFO masks are numbered sequentially (00001.png, 00002.png, etc.)
-                mask_path = os.path.join(masks_dir, f"{frame_idx:05d}.png")
-                
-                frame = cv2.imread(frame_path)
-                if not os.path.exists(mask_path):
-                    print(f"Warning: Mask not found for frame {frame_idx} ({frame_file}), using original frame")
-                    cv2.imwrite(os.path.join(masked_frames_dir, frame_file), frame)
-                    continue
-                
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                
-                # Create masked frame
-                masked_frame = frame.copy()
-                if mask_mode == 'foreground':
-                    # Keep foreground (mask > 128), black out background
-                    masked_frame[mask <= 128] = 0
-                else:  # background
-                    # Keep background (mask <= 128), black out foreground
-                    masked_frame[mask > 128] = 0
-                
-                cv2.imwrite(os.path.join(masked_frames_dir, frame_file), masked_frame)
-            
-            # Encode masked frames to video
-            encode_cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'error',
-                '-framerate', str(framerate),
-                '-i', os.path.join(masked_frames_dir, '%05d.png'),
-                '-vf', f'scale={width}:{height}:flags=lanczos,format=yuv420p',
-                '-color_primaries', 'bt709',
-                '-color_trc', 'bt709',
-                '-colorspace', 'bt709',
-                '-c:v', 'libx265',
-                '-preset', 'veryslow',
-                '-x265-params', 'lossless=1',
-                '-y', output_video
-            ]
-            result = subprocess.run(encode_cmd, capture_output=True, text=True, check=True)
-            
-            # Clean up frames
-            shutil.rmtree(masked_frames_dir, ignore_errors=True)
-            return True
-            
-        except Exception as e:
-            print(f"Error creating masked video: {e}")
-            return False
-    
-    def _decode_video_to_frames(video_path: str, output_dir: str) -> bool:
-        """Decodes a video into frames using FFmpeg. Returns True on success."""
-        return decode_video(video_path, output_dir, quality=2)
-
-    def _generate_and_save_heatmap(
-        ref_frame: np.ndarray,
-        decoded_frame: np.ndarray,
-        mask: np.ndarray,
-        metric_maps: Dict[str, np.ndarray],
-        video_name: str,
-        frame_idx: int,
-        output_path: str,
-        block_size: int
-    ) -> None:
-        """Generates and saves a 2x3 visualization grid for a single frame."""
-        try:
-            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-            fig.suptitle(f'{video_name} - Frame {frame_idx+1}', fontsize=16)
-            
-            height, width, _ = ref_frame.shape
-
-            # Row 1: Images
-            axes[0, 0].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
-            axes[0, 0].set_title('Reference Frame')
-            axes[0, 0].axis('off')
-
-            axes[0, 1].imshow(cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2RGB))
-            axes[0, 1].set_title('Encoded Frame')
-            axes[0, 1].axis('off')
-
-            mask_colored = np.zeros_like(ref_frame)
-            mask_colored[mask > 128] = [255, 0, 0] # Red for FG
-            overlay = cv2.addWeighted(ref_frame, 0.7, mask_colored, 0.3, 0)
-            axes[0, 2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-            axes[0, 2].set_title('UFO Mask (Red=FG)')
-            axes[0, 2].axis('off')
-
-            # Row 2: Heatmaps
-            ssim_map = metric_maps.get('SSIM', np.zeros(list(metric_maps.values())[0].shape))
-            psnr_map = metric_maps.get('PSNR', np.zeros(list(metric_maps.values())[0].shape))
-
-            im1 = axes[1, 0].imshow(ssim_map, cmap='viridis', vmin=0, vmax=1)
-            axes[1, 0].set_title(f'SSIM (Mean: {np.mean(ssim_map):.3f})')
-            plt.colorbar(im1, ax=axes[1, 0])
-
-            psnr_capped = np.clip(psnr_map, 0, 50)
-            im2 = axes[1, 1].imshow(psnr_capped, cmap='viridis', vmin=0, vmax=50)
-            axes[1, 1].set_title(f'PSNR (Mean: {np.mean(psnr_map[np.isfinite(psnr_map)]):.1f} dB)')
-            plt.colorbar(im2, ax=axes[1, 1])
-
-            # Quality overlay
-            axes[1, 2].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
-            num_blocks_y, num_blocks_x = ssim_map.shape
-            for i in range(num_blocks_y):
-                for j in range(num_blocks_x):
-                    if ssim_map[i, j] < 0.7:
-                        color = 'red' if ssim_map[i, j] < 0.5 else 'yellow'
-                        alpha = 0.6 if ssim_map[i, j] < 0.5 else 0.4
-                        rect = patches.Rectangle((j * block_size, i * block_size), block_size, block_size, 
-                                            linewidth=0, facecolor=color, alpha=alpha)
-                        axes[1, 2].add_patch(rect)
-            axes[1, 2].set_title('Low Quality Overlay')
-            axes[1, 2].axis('off')
-
-            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            plt.close(fig)
-
-        except Exception as e:
-            print(f"Error generating heatmap for {video_name} frame {frame_idx+1}: {e}")
-
-    def _print_summary_report(results: Dict) -> None:
-        """Prints a unified summary report with all metrics in one table."""
-        print(f"\n{'='*160}")
-        print(f"{'COMPREHENSIVE ANALYSIS SUMMARY':^160}")
-        print(f"{'='*160}")
-
-        if not results:
-            print("No results to display.")
-            return
-
-        # Unified metrics table
-        print(f"\n{'QUALITY METRICS (Foreground / Background)':^160}")
-        print(f"{'Method':<20} {'PSNR (dB)':<25} {'SSIM':<25} {'LPIPS':<25} {'VMAF':<25} {'Bitrate (Mbps)':<15}")
-        print(f"{'-'*160}")
-
-        for video_name, data in results.items():
-            fg_data = data['foreground']
-            bg_data = data['background']
-            
-            # Format metric strings (FG / BG)
-            psnr_str = f"{fg_data.get('psnr_mean', 0):.2f} / {bg_data.get('psnr_mean', 0):.2f}"
-            ssim_str = f"{fg_data.get('ssim_mean', 0):.4f} / {bg_data.get('ssim_mean', 0):.4f}"
-            lpips_str = f"{fg_data.get('lpips_mean', 0):.4f} / {bg_data.get('lpips_mean', 0):.4f}"
-            vmaf_str = f"{fg_data.get('vmaf_mean', 0):.2f} / {bg_data.get('vmaf_mean', 0):.2f}"
-            bitrate_str = f"{data['bitrate_mbps']:.2f}"
-            
-            print(f"{video_name:<20} {psnr_str:<25} {ssim_str:<25} {lpips_str:<25} {vmaf_str:<25} {bitrate_str:<15}")
-        
-        print(f"{'-'*160}")
-
-        # Trade-off analysis against the first video as baseline
-        if len(results) > 1:
-            baseline_name = list(results.keys())[0]
-            print(f"\n{'TRADE-OFF ANALYSIS (vs. ' + baseline_name + ')':^160}")
-            print(f"{'Method':<20} {'PSNR FG %':<15} {'PSNR BG %':<15} {'SSIM FG %':<15} {'SSIM BG %':<15} {'LPIPS FG %':<15} {'LPIPS BG %':<15} {'VMAF FG %':<15} {'VMAF BG %':<15}")
-            print(f"{'-'*160}")
-            
-            for video_name in list(results.keys())[1:]:
-                # Calculate changes for all metrics
-                psnr_fg_change = 0
-                psnr_bg_change = 0
-                ssim_fg_change = 0
-                ssim_bg_change = 0
-                lpips_fg_change = 0
-                lpips_bg_change = 0
-                vmaf_fg_change = 0
-                vmaf_bg_change = 0
-                
-                for metric in ['psnr', 'ssim', 'lpips', 'vmaf']:
-                    for region in ['foreground', 'background']:
-                        baseline_val = results[baseline_name][region].get(f'{metric}_mean', 0)
-                        current_val = results[video_name][region].get(f'{metric}_mean', 0)
-                        
-                        if baseline_val > 0:
-                            # For LPIPS, lower is better, so invert the change
-                            if metric == 'lpips':
-                                change = ((baseline_val / current_val) - 1) * 100 if current_val > 0 else 0
-                            else:
-                                change = ((current_val / baseline_val) - 1) * 100
-                            
-                            # Store changes
-                            if metric == 'psnr' and region == 'foreground':
-                                psnr_fg_change = change
-                            elif metric == 'psnr' and region == 'background':
-                                psnr_bg_change = change
-                            elif metric == 'ssim' and region == 'foreground':
-                                ssim_fg_change = change
-                            elif metric == 'ssim' and region == 'background':
-                                ssim_bg_change = change
-                            elif metric == 'lpips' and region == 'foreground':
-                                lpips_fg_change = change
-                            elif metric == 'lpips' and region == 'background':
-                                lpips_bg_change = change
-                            elif metric == 'vmaf' and region == 'foreground':
-                                vmaf_fg_change = change
-                            elif metric == 'vmaf' and region == 'background':
-                                vmaf_bg_change = change
-                
-                # Print table row
-                print(f"{video_name:<20} {psnr_fg_change:+.2f}%{' '*8} {psnr_bg_change:+.2f}%{' '*8} {ssim_fg_change:+.2f}%{' '*8} {ssim_bg_change:+.2f}%{' '*8} {lpips_fg_change:+.2f}%{' '*8} {lpips_bg_change:+.2f}%{' '*8} {vmaf_fg_change:+.2f}%{' '*8} {vmaf_bg_change:+.2f}%{' '*8}")
-            
-            print(f"{'-'*160}")
-    
-    # --- Setup ---
-    os.makedirs(temp_dir, exist_ok=True)
-    masked_videos_dir = os.path.join(temp_dir, "masked_videos")
-    frames_root = os.path.join(temp_dir, "frames")
-    heatmaps_dir = os.path.join(temp_dir, "performance_figures")
-    os.makedirs(masked_videos_dir, exist_ok=True)
-    os.makedirs(frames_root, exist_ok=True)
-    os.makedirs(heatmaps_dir, exist_ok=True)
-    
-    if not os.path.isdir(masks_dir):
-        print(f"Warning: Masks directory not found at '{masks_dir}'. Cannot perform FG/BG analysis.")
-        return {}
-    
-    # Create masked reference video
-    print("Creating masked reference videos...")
-    reference_frames_dir = os.path.join(temp_dir, "reference_frames_temp")
-    os.makedirs(reference_frames_dir, exist_ok=True)
-    for i, frame in enumerate(reference_frames):
-        cv2.imwrite(os.path.join(reference_frames_dir, f"{i+1:05d}.png"), frame)
-    
-    ref_fg_video = os.path.join(masked_videos_dir, "reference_fg.mp4")
-    ref_bg_video = os.path.join(masked_videos_dir, "reference_bg.mp4")
-    
-    _create_masked_video(reference_frames_dir, masks_dir, ref_fg_video, width, height, framerate, 'foreground')
-    _create_masked_video(reference_frames_dir, masks_dir, ref_bg_video, width, height, framerate, 'background')
-    
-    analysis_results = {}
-
-    # --- Main Loop: Process each video ---
-    for video_name, video_path in encoded_videos.items():
-        print(f"\nProcessing '{video_name}'...")
-        if not os.path.exists(video_path):
-            print(f"  - Video not found, skipping.")
-            continue
-
-        # 1. Create masked versions of the encoded video
-        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
-        if not _decode_video_to_frames(video_path, video_decoded_dir):
-            continue
-        
-        print(f"  - Creating masked versions of '{video_name}'...")
-        enc_fg_video = os.path.join(masked_videos_dir, f"{video_name.replace(' ', '_')}_fg.mp4")
-        enc_bg_video = os.path.join(masked_videos_dir, f"{video_name.replace(' ', '_')}_bg.mp4")
-        
-        _create_masked_video(video_decoded_dir, masks_dir, enc_fg_video, width, height, framerate, 'foreground')
-        _create_masked_video(video_decoded_dir, masks_dir, enc_bg_video, width, height, framerate, 'background')
-        
-        decoded_frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
-        num_frames = min(len(reference_frames), len(decoded_frame_files))
-        
-        # 2. Calculate all metrics using masked videos for foreground and background
-        analysis_results[video_name] = {
-            'foreground': {},
-            'background': {},
-            'bitrate_mbps': video_bitrates.get(video_name, 0) / 1000000
-        }
-        
-        # Calculate metrics for FOREGROUND
-        print(f"  - Calculating foreground metrics...")
-        
-        # Decode masked videos for frame-by-frame metrics
-        ref_fg_frames_dir = os.path.join(temp_dir, "ref_fg_frames")
-        enc_fg_frames_dir = os.path.join(temp_dir, f"{video_name.replace(' ', '_')}_fg_frames")
-        os.makedirs(ref_fg_frames_dir, exist_ok=True)
-        os.makedirs(enc_fg_frames_dir, exist_ok=True)
-        
-        _decode_video_to_frames(ref_fg_video, ref_fg_frames_dir)
-        _decode_video_to_frames(enc_fg_video, enc_fg_frames_dir)
-        
-        # Load frames
-        ref_fg_frame_files = sorted([f for f in os.listdir(ref_fg_frames_dir) if f.endswith('.png')])
-        enc_fg_frame_files = sorted([f for f in os.listdir(enc_fg_frames_dir) if f.endswith('.png')])
-        num_fg_frames = min(len(ref_fg_frame_files), len(enc_fg_frame_files))
-        
-        # Calculate PSNR and SSIM frame-by-frame
-        psnr_scores_fg = []
-        ssim_scores_fg = []
-        for i in range(num_fg_frames):
-            ref_frame = cv2.imread(os.path.join(ref_fg_frames_dir, ref_fg_frame_files[i]))
-            enc_frame = cv2.imread(os.path.join(enc_fg_frames_dir, enc_fg_frame_files[i]))
-            
-            if ref_frame is not None and enc_frame is not None:
-                # Calculate PSNR for the whole frame
-                psnr_val = psnr(ref_frame, enc_frame)
-                if np.isfinite(psnr_val):
-                    psnr_scores_fg.append(psnr_val)
-                
-                # Calculate SSIM for the whole frame
-                ssim_val = ssim(ref_frame, enc_frame, gaussian_weights=True, data_range=255, channel_axis=-1)
-                if np.isfinite(ssim_val):
-                    ssim_scores_fg.append(ssim_val)
-        
-        analysis_results[video_name]['foreground']['psnr_mean'] = np.mean(psnr_scores_fg) if psnr_scores_fg else 0
-        analysis_results[video_name]['foreground']['psnr_std'] = np.std(psnr_scores_fg) if psnr_scores_fg else 0
-        analysis_results[video_name]['foreground']['ssim_mean'] = np.mean(ssim_scores_fg) if ssim_scores_fg else 0
-        analysis_results[video_name]['foreground']['ssim_std'] = np.std(ssim_scores_fg) if ssim_scores_fg else 0
-        
-        # Calculate LPIPS for foreground
-        ref_fg_frames_list = [cv2.imread(os.path.join(ref_fg_frames_dir, f)) for f in ref_fg_frame_files[:num_fg_frames]]
-        enc_fg_frames_list = [cv2.imread(os.path.join(enc_fg_frames_dir, f)) for f in enc_fg_frame_files[:num_fg_frames]]
-        lpips_scores_fg = calculate_lpips_per_frame(ref_fg_frames_list, enc_fg_frames_list)
-        analysis_results[video_name]['foreground']['lpips_mean'] = np.mean(lpips_scores_fg) if lpips_scores_fg else 0
-        analysis_results[video_name]['foreground']['lpips_std'] = np.std(lpips_scores_fg) if lpips_scores_fg else 0
-        
-        # Calculate VMAF for foreground
-        vmaf_fg = calculate_vmaf(ref_fg_video, enc_fg_video, width, height, framerate)
-        analysis_results[video_name]['foreground']['vmaf_mean'] = vmaf_fg.get('mean', 0)
-        analysis_results[video_name]['foreground']['vmaf_std'] = vmaf_fg.get('std', 0)
-        
-        # Clean up FG temp directories
-        shutil.rmtree(ref_fg_frames_dir, ignore_errors=True)
-        shutil.rmtree(enc_fg_frames_dir, ignore_errors=True)
-        
-        # Calculate metrics for BACKGROUND
-        print(f"  - Calculating background metrics...")
-        
-        ref_bg_frames_dir = os.path.join(temp_dir, "ref_bg_frames")
-        enc_bg_frames_dir = os.path.join(temp_dir, f"{video_name.replace(' ', '_')}_bg_frames")
-        os.makedirs(ref_bg_frames_dir, exist_ok=True)
-        os.makedirs(enc_bg_frames_dir, exist_ok=True)
-        
-        _decode_video_to_frames(ref_bg_video, ref_bg_frames_dir)
-        _decode_video_to_frames(enc_bg_video, enc_bg_frames_dir)
-        
-        ref_bg_frame_files = sorted([f for f in os.listdir(ref_bg_frames_dir) if f.endswith('.png')])
-        enc_bg_frame_files = sorted([f for f in os.listdir(enc_bg_frames_dir) if f.endswith('.png')])
-        num_bg_frames = min(len(ref_bg_frame_files), len(enc_bg_frame_files))
-        
-        # Calculate PSNR and SSIM frame-by-frame
-        psnr_scores_bg = []
-        ssim_scores_bg = []
-        for i in range(num_bg_frames):
-            ref_frame = cv2.imread(os.path.join(ref_bg_frames_dir, ref_bg_frame_files[i]))
-            enc_frame = cv2.imread(os.path.join(enc_bg_frames_dir, enc_bg_frame_files[i]))
-            
-            if ref_frame is not None and enc_frame is not None:
-                psnr_val = psnr(ref_frame, enc_frame)
-                if np.isfinite(psnr_val):
-                    psnr_scores_bg.append(psnr_val)
-                
-                ssim_val = ssim(ref_frame, enc_frame, gaussian_weights=True, data_range=255, channel_axis=-1)
-                if np.isfinite(ssim_val):
-                    ssim_scores_bg.append(ssim_val)
-        
-        analysis_results[video_name]['background']['psnr_mean'] = np.mean(psnr_scores_bg) if psnr_scores_bg else 0
-        analysis_results[video_name]['background']['psnr_std'] = np.std(psnr_scores_bg) if psnr_scores_bg else 0
-        analysis_results[video_name]['background']['ssim_mean'] = np.mean(ssim_scores_bg) if ssim_scores_bg else 0
-        analysis_results[video_name]['background']['ssim_std'] = np.std(ssim_scores_bg) if ssim_scores_bg else 0
-        
-        # Calculate LPIPS for background
-        ref_bg_frames_list = [cv2.imread(os.path.join(ref_bg_frames_dir, f)) for f in ref_bg_frame_files[:num_bg_frames]]
-        enc_bg_frames_list = [cv2.imread(os.path.join(enc_bg_frames_dir, f)) for f in enc_bg_frame_files[:num_bg_frames]]
-        lpips_scores_bg = calculate_lpips_per_frame(ref_bg_frames_list, enc_bg_frames_list)
-        analysis_results[video_name]['background']['lpips_mean'] = np.mean(lpips_scores_bg) if lpips_scores_bg else 0
-        analysis_results[video_name]['background']['lpips_std'] = np.std(lpips_scores_bg) if lpips_scores_bg else 0
-        
-        # Calculate VMAF for background
-        vmaf_bg = calculate_vmaf(ref_bg_video, enc_bg_video, width, height, framerate)
-        analysis_results[video_name]['background']['vmaf_mean'] = vmaf_bg.get('mean', 0)
-        analysis_results[video_name]['background']['vmaf_std'] = vmaf_bg.get('std', 0)
-        
-        # Clean up BG temp directories
-        shutil.rmtree(ref_bg_frames_dir, ignore_errors=True)
-        shutil.rmtree(enc_bg_frames_dir, ignore_errors=True)
-
-    # --- Generate Visualizations ---
-    print("\nGenerating quality visualization charts...")
-    
-    def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
-        """Generate comprehensive quality visualization charts."""
-        if not results:
-            return
-        
-        video_names = list(results.keys())
-        
-        # 1. Overall Quality Comparison Bar Chart
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
-        
-        metrics = [
-            ('psnr_mean', 'PSNR (dB)', [20, 50]),
-            ('ssim_mean', 'SSIM', [0, 1]),
-            ('lpips_mean', 'LPIPS (lower is better)', [0, 0.5]),
-            ('vmaf_mean', 'VMAF', [0, 100])
-        ]
-        
-        for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
-            ax = axes[idx // 2, idx % 2]
-            
-            fg_values = [results[name]['foreground'].get(metric_key, 0) for name in video_names]
-            bg_values = [results[name]['background'].get(metric_key, 0) for name in video_names]
-            
-            x = np.arange(len(video_names))
-            width = 0.35
-            
-            bars1 = ax.bar(x - width/2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
-            bars2 = ax.bar(x + width/2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
-            
-            # Set precision for y-axis ticks
-            if metric_key in ['psnr_mean', 'vmaf_mean']:
-                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
-            else:
-                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
-                
-            ax.set_ylabel(metric_label, fontsize=11, fontweight='bold')
-            ax.set_title(metric_label, fontsize=12, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(video_names, rotation=45, ha='right')
-            ax.legend()
-            ax.grid(axis='y', alpha=0.3, linestyle='--')
-            ax.set_ylim(ylim)
-            
-            # Add value labels on bars
-            for bars in [bars1, bars2]:
-                for bar in bars:
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{height:.2f}',
-                           ha='center', va='bottom', fontsize=8)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(heatmaps_dir, '1_overall_quality_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  ✓ Generated quality comparison visualization in {heatmaps_dir}")
-    
-    _generate_quality_visualizations(analysis_results, heatmaps_dir)
-
-    # --- Generate Visual Patch Comparison ---
-    def _generate_patch_comparison(
-        reference_frames: List[np.ndarray],
-        encoded_videos: Dict[str, str],
-        results: Dict,
-        masks_dir: str,
-        heatmaps_dir: str,
-        decoded_frames_root: str,
-        sample_frame_idx: int = None,
-        patch_size: int = 128
-    ) -> None:
-        """Generate visual comparison of FG/BG patches from each method with VMAF scores."""
-        if not results or not reference_frames:
-            return
-        
-        # Use middle frame if not specified
-        if sample_frame_idx is None:
-            sample_frame_idx = len(reference_frames) // 2
-        
-        print(f"  - Generating patch comparison visualization for frame {sample_frame_idx}...")
-        
-        # Load reference frame
-        ref_frame = reference_frames[sample_frame_idx]
-        
-        # Load mask for this frame
-        mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith('.png')])
-        if sample_frame_idx >= len(mask_files):
-            print(f"    Warning: Mask for frame {sample_frame_idx} not found. Skipping patch comparison.")
-            return
-        
-        mask_path = os.path.join(masks_dir, mask_files[sample_frame_idx])
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            print(f"    Warning: Could not load mask from {mask_path}. Skipping patch comparison.")
-            return
-        
-        # Find a good foreground patch (center of mass of mask)
-        mask_binary = (mask > 127).astype(np.uint8)
-        moments = cv2.moments(mask_binary)
-        if moments['m00'] > 0:
-            fg_center_x = int(moments['m10'] / moments['m00'])
-            fg_center_y = int(moments['m01'] / moments['m00'])
-        else:
-            # Fallback to center of frame
-            fg_center_x = ref_frame.shape[1] // 2
-            fg_center_y = ref_frame.shape[0] // 2
-        
-        # Find good background patches (two different areas)
-        mask_inverted = 1 - mask_binary
-        
-        # First background patch: center of mass of inverted mask
-        moments_bg = cv2.moments(mask_inverted)
-        if moments_bg['m00'] > 0:
-            bg1_center_x = int(moments_bg['m10'] / moments_bg['m00'])
-            bg1_center_y = int(moments_bg['m01'] / moments_bg['m00'])
-        else:
-            # Fallback to top-left corner
-            bg1_center_x = ref_frame.shape[1] // 4
-            bg1_center_y = ref_frame.shape[0] // 4
-        
-        # Second background patch: find another area away from first patch
-        # Try top-right corner area first
-        bg2_center_x = ref_frame.shape[1] * 3 // 4
-        bg2_center_y = ref_frame.shape[0] // 4
-        
-        # If that's too close to the first patch, try bottom-left
-        if abs(bg2_center_x - bg1_center_x) < patch_size and abs(bg2_center_y - bg1_center_y) < patch_size:
-            bg2_center_x = ref_frame.shape[1] // 4
-            bg2_center_y = ref_frame.shape[0] * 3 // 4
-        
-        # Extract patches from reference frame
-        def extract_patch(frame, center_x, center_y, size):
-            h, w = frame.shape[:2]
-            x1 = max(0, center_x - size // 2)
-            y1 = max(0, center_y - size // 2)
-            x2 = min(w, x1 + size)
-            y2 = min(h, y1 + size)
-            x1 = max(0, x2 - size)
-            y1 = max(0, y2 - size)
-            return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
-        
-        ref_fg_patch, fg_coords = extract_patch(ref_frame, fg_center_x, fg_center_y, patch_size)
-        ref_bg1_patch, bg1_coords = extract_patch(ref_frame, bg1_center_x, bg1_center_y, patch_size)
-        ref_bg2_patch, bg2_coords = extract_patch(ref_frame, bg2_center_x, bg2_center_y, patch_size)
-        
-        # Load decoded frames for each method and extract patches
-        video_names = list(encoded_videos.keys())
-        num_methods = len(video_names)
-        
-        # Create figure: 3 rows (FG/BG1/BG2) x (num_methods + 1) columns (reference + methods)
-        fig, axes = plt.subplots(3, num_methods + 1, figsize=(4 * (num_methods + 1), 12))
-        fig.suptitle(f'Visual Patch Comparison (Frame {sample_frame_idx + 1})', fontsize=16, fontweight='bold')
-        
-        # Plot reference patches
-        axes[0, 0].imshow(cv2.cvtColor(ref_fg_patch, cv2.COLOR_BGR2RGB))
-        axes[0, 0].set_title('Reference\nForeground', fontsize=10, fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        axes[1, 0].imshow(cv2.cvtColor(ref_bg1_patch, cv2.COLOR_BGR2RGB))
-        axes[1, 0].set_title('Reference\nBackground 1', fontsize=10, fontweight='bold')
-        axes[1, 0].axis('off')
-        
-        axes[2, 0].imshow(cv2.cvtColor(ref_bg2_patch, cv2.COLOR_BGR2RGB))
-        axes[2, 0].set_title('Reference\nBackground 2', fontsize=10, fontweight='bold')
-        axes[2, 0].axis('off')
-        
-        # Plot patches from each method
-        for idx, video_name in enumerate(video_names):
-            # Load decoded frame
-            video_decoded_dir = os.path.join(decoded_frames_root, f"{video_name.replace(' ', '_')}_decoded")
-            frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
-            
-            if sample_frame_idx >= len(frame_files):
-                continue
-            
-            decoded_frame = cv2.imread(os.path.join(video_decoded_dir, frame_files[sample_frame_idx]))
-            if decoded_frame is None:
-                continue
-            
-            # Extract patches
-            dec_fg_patch, _ = extract_patch(decoded_frame, fg_center_x, fg_center_y, patch_size)
-            dec_bg1_patch, _ = extract_patch(decoded_frame, bg1_center_x, bg1_center_y, patch_size)
-            dec_bg2_patch, _ = extract_patch(decoded_frame, bg2_center_x, bg2_center_y, patch_size)
-            
-            # Get VMAF scores from results
-            fg_vmaf = results[video_name]['foreground'].get('vmaf_mean', 0)
-            bg_vmaf = results[video_name]['background'].get('vmaf_mean', 0)
-            
-            # Plot foreground patch
-            axes[0, idx + 1].imshow(cv2.cvtColor(dec_fg_patch, cv2.COLOR_BGR2RGB))
-            axes[0, idx + 1].set_title(f'{video_name}\nFG VMAF: {fg_vmaf:.1f}', 
-                                       fontsize=10, fontweight='bold')
-            axes[0, idx + 1].axis('off')
-            
-            # Plot background patch 1
-            axes[1, idx + 1].imshow(cv2.cvtColor(dec_bg1_patch, cv2.COLOR_BGR2RGB))
-            axes[1, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
-                                       fontsize=10, fontweight='bold')
-            axes[1, idx + 1].axis('off')
-            
-            # Plot background patch 2
-            axes[2, idx + 1].imshow(cv2.cvtColor(dec_bg2_patch, cv2.COLOR_BGR2RGB))
-            axes[2, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
-                                       fontsize=10, fontweight='bold')
-            axes[2, idx + 1].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(heatmaps_dir, f'2_patch_comparison_frame_{sample_frame_idx + 1}.png'), 
-                   dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  ✓ Generated patch comparison visualization")
-    
-    # Generate patch comparison for middle frame
-    _generate_patch_comparison(
-        reference_frames=reference_frames,
-        encoded_videos=encoded_videos,
-        results=analysis_results,
-        masks_dir=masks_dir,
-        heatmaps_dir=heatmaps_dir,
-        decoded_frames_root=frames_root,
-        sample_frame_idx=len(reference_frames) // 2,
-        patch_size=128
-    )
-
-    # --- Finalization ---
-    _print_summary_report(analysis_results)
-    
-    # Cleanup - clean up decoded frame directories
-    for video_name in encoded_videos.keys():
-        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
-        shutil.rmtree(video_decoded_dir, ignore_errors=True)
-    shutil.rmtree(reference_frames_dir, ignore_errors=True)
-    print(f"\nAnalysis complete. Masked videos saved to: {masked_videos_dir}")
-    print(f"Quality visualizations saved to: {heatmaps_dir}")
-    
-    return analysis_results
 
 def combine_blocks_into_image(blocks: np.ndarray) -> np.ndarray:
     """
-    Efficiently combines an array of blocks back into a single image.
-
-    Args:
-        blocks: A 5D array of blocks with shape (num_rows, num_cols, l, l, C).
-
-    Returns:
-        The reconstructed image with shape (num_rows*l, num_cols*l, C).
+    Combines a 5D array of blocks back into a single image.
+    This is the exact inverse of split_image_into_blocks.
     """
-    num_rows, num_cols, l_h, l_w, C = blocks.shape
+    num_blocks_y, num_blocks_x, block_size, _, c = blocks.shape
     
-    # Transpose and reshape back to the original image dimensions
-    image = blocks.transpose(0, 2, 1, 3, 4).reshape(num_rows * l_h, num_cols * l_w, C)
+    # The crucial inverse transpose and reshape operations
+    image = blocks.swapaxes(1, 2)
+    image = image.reshape(num_blocks_y * block_size, num_blocks_x * block_size, c)
     return image
 
 def stretch_frame(shrunk_frame: np.ndarray, binary_mask: np.ndarray, block_size: int) -> np.ndarray:
@@ -1812,6 +1149,741 @@ def apply_adaptive_filtering(image: np.ndarray, strengths: np.ndarray, block_siz
     new_image = combine_blocks_into_image(filtered_blocks)
     
     return new_image
+
+def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_bitrates: Dict[str, float] = {}, reference_video_path: str = None, framerate: float = 30.0) -> Dict:
+    """
+    A comprehensive function to analyze and compare video encoding performance using masked videos.
+
+    This function:
+    1. Creates masked versions (foreground/background) of all videos.
+    2. Calculates all metrics (PSNR, SSIM, LPIPS, VMAF) separately for foreground and background.
+    3. Generates and saves quality heatmaps for sample frames.
+    4. Prints a unified summary report comparing all encoding methods.
+
+    Args:
+        reference_frames: List of original reference frames.
+        encoded_videos: Dictionary mapping a method name to its video file path.
+        block_size: The size of blocks for visualization heatmaps.
+        width: The width of the video frames.
+        height: The height of the video frames.
+        temp_dir: A directory for temporary files (masked videos, heatmaps).
+        masks_dir: Path to the directory with UFO masks.
+        sample_frames: A list of frame indices to generate heatmaps for.
+        video_bitrates: Dictionary mapping video name to bitrate in bps.
+        reference_video_path: Path to the reference video file (required for VMAF).
+        framerate: Video framerate.
+
+    Returns:
+        A dictionary containing the aggregated analysis results for each video.
+    """
+    
+    # Helper functions
+    
+    def _create_masked_video(frames_dir: str, masks_dir: str, output_video: str, width: int, height: int, 
+                            framerate: float, mask_mode: str = 'foreground') -> bool:
+        """
+        Creates a video with either foreground or background masked out (set to black).
+        
+        Args:
+            frames_dir: Directory containing input frames
+            masks_dir: Directory containing mask frames
+            output_video: Output video path
+            width: Video width
+            height: Video height
+            framerate: Video framerate
+            mask_mode: Either 'foreground' (keep FG, black BG) or 'background' (keep BG, black FG)
+        """
+        try:
+            masked_frames_dir = output_video.replace('.mp4', '_frames')
+            os.makedirs(masked_frames_dir, exist_ok=True)
+            
+            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith('.png')])
+            
+            for frame_idx, frame_file in enumerate(frame_files, start=1):
+                frame_path = os.path.join(frames_dir, frame_file)
+                # UFO masks are numbered sequentially (00001.png, 00002.png, etc.)
+                mask_path = os.path.join(masks_dir, f"{frame_idx:05d}.png")
+                
+                frame = cv2.imread(frame_path)
+                if not os.path.exists(mask_path):
+                    print(f"Warning: Mask not found for frame {frame_idx} ({frame_file}), using original frame")
+                    cv2.imwrite(os.path.join(masked_frames_dir, frame_file), frame)
+                    continue
+                
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                
+                # Create masked frame
+                masked_frame = frame.copy()
+                if mask_mode == 'foreground':
+                    # Keep foreground (mask > 128), black out background
+                    masked_frame[mask <= 128] = 0
+                else:  # background
+                    # Keep background (mask <= 128), black out foreground
+                    masked_frame[mask > 128] = 0
+                
+                cv2.imwrite(os.path.join(masked_frames_dir, frame_file), masked_frame)
+            
+            # Encode masked frames to video
+            encode_cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-framerate', str(framerate),
+                '-i', os.path.join(masked_frames_dir, '%05d.png'),
+                '-vf', f'scale={width}:{height}:flags=lanczos,format=yuv420p',
+                '-color_primaries', 'bt709',
+                '-color_trc', 'bt709',
+                '-colorspace', 'bt709',
+                '-c:v', 'libx265',
+                '-preset', 'veryslow',
+                '-x265-params', 'lossless=1',
+                '-y', output_video
+            ]
+            result = subprocess.run(encode_cmd, capture_output=True, text=True, check=True)
+            
+            # Clean up frames
+            shutil.rmtree(masked_frames_dir, ignore_errors=True)
+            return True
+            
+        except Exception as e:
+            print(f"Error creating masked video: {e}")
+            return False
+    
+    def _decode_video_to_frames(video_path: str, output_dir: str) -> bool:
+        """Decodes a video into frames using FFmpeg. Returns True on success."""
+        return decode_video(video_path, output_dir, quality=2)
+
+    def _get_mask_bounding_box(masks_dir: str, width: int, height: int) -> Tuple[int, int, int, int]:
+        """
+        Calculate the bounding box that encompasses all foreground regions across all masks.
+        
+        Args:
+            masks_dir: Directory containing mask images
+            width: Frame width
+            height: Frame height
+            
+        Returns:
+            Tuple of (x, y, w, h) representing the bounding box
+        """
+        mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith('.png')])
+        if not mask_files:
+            return (0, 0, width, height)
+        
+        # Initialize bounds to find the union of all masks
+        min_x, min_y = width, height
+        max_x, max_y = 0, 0
+        
+        for mask_file in mask_files:
+            mask_path = os.path.join(masks_dir, mask_file)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            
+            # Find foreground pixels (mask > 128)
+            fg_pixels = np.where(mask > 128)
+            
+            if len(fg_pixels[0]) > 0:
+                min_y = min(min_y, fg_pixels[0].min())
+                max_y = max(max_y, fg_pixels[0].max())
+                min_x = min(min_x, fg_pixels[1].min())
+                max_x = max(max_x, fg_pixels[1].max())
+        
+        # If no foreground found, return full frame
+        if min_x >= max_x or min_y >= max_y:
+            return (0, 0, width, height)
+        
+        # Add a small padding (5% on each side)
+        padding_x = max(1, int((max_x - min_x) * 0.05))
+        padding_y = max(1, int((max_y - min_y) * 0.05))
+        
+        x = max(0, min_x - padding_x)
+        y = max(0, min_y - padding_y)
+        w = min(width - x, max_x - min_x + 2 * padding_x)
+        h = min(height - y, max_y - min_y + 2 * padding_y)
+        
+        return (x, y, w, h)
+
+    def _generate_and_save_heatmap(
+        ref_frame: np.ndarray,
+        decoded_frame: np.ndarray,
+        mask: np.ndarray,
+        metric_maps: Dict[str, np.ndarray],
+        video_name: str,
+        frame_idx: int,
+        output_path: str,
+        block_size: int
+    ) -> None:
+        """Generates and saves a 2x3 visualization grid for a single frame."""
+        try:
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            fig.suptitle(f'{video_name} - Frame {frame_idx+1}', fontsize=16)
+            
+            height, width, _ = ref_frame.shape
+
+            # Row 1: Images
+            axes[0, 0].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
+            axes[0, 0].set_title('Reference Frame')
+            axes[0, 0].axis('off')
+
+            axes[0, 1].imshow(cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2RGB))
+            axes[0, 1].set_title('Encoded Frame')
+            axes[0, 1].axis('off')
+
+            mask_colored = np.zeros_like(ref_frame)
+            mask_colored[mask > 128] = [255, 0, 0] # Red for FG
+            overlay = cv2.addWeighted(ref_frame, 0.7, mask_colored, 0.3, 0)
+            axes[0, 2].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            axes[0, 2].set_title('UFO Mask (Red=FG)')
+            axes[0, 2].axis('off')
+
+            # Row 2: Heatmaps
+            ssim_map = metric_maps.get('SSIM', np.zeros(list(metric_maps.values())[0].shape))
+            psnr_map = metric_maps.get('PSNR', np.zeros(list(metric_maps.values())[0].shape))
+
+            im1 = axes[1, 0].imshow(ssim_map, cmap='viridis', vmin=0, vmax=1)
+            axes[1, 0].set_title(f'SSIM (Mean: {np.mean(ssim_map):.3f})')
+            plt.colorbar(im1, ax=axes[1, 0])
+
+            psnr_capped = np.clip(psnr_map, 0, 50)
+            im2 = axes[1, 1].imshow(psnr_capped, cmap='viridis', vmin=0, vmax=50)
+            axes[1, 1].set_title(f'PSNR (Mean: {np.mean(psnr_map[np.isfinite(psnr_map)]):.1f} dB)')
+            plt.colorbar(im2, ax=axes[1, 1])
+
+            # Quality overlay
+            axes[1, 2].imshow(cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB))
+            num_blocks_y, num_blocks_x = ssim_map.shape
+            for i in range(num_blocks_y):
+                for j in range(num_blocks_x):
+                    if ssim_map[i, j] < 0.7:
+                        color = 'red' if ssim_map[i, j] < 0.5 else 'yellow'
+                        alpha = 0.6 if ssim_map[i, j] < 0.5 else 0.4
+                        rect = patches.Rectangle((j * block_size, i * block_size), block_size, block_size, 
+                                            linewidth=0, facecolor=color, alpha=alpha)
+                        axes[1, 2].add_patch(rect)
+            axes[1, 2].set_title('Low Quality Overlay')
+            axes[1, 2].axis('off')
+
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"Error generating heatmap for {video_name} frame {frame_idx+1}: {e}")
+
+    def _print_summary_report(results: Dict) -> None:
+        """Prints a unified summary report with all metrics in one table."""
+        print(f"\n{'='*160}")
+        print(f"{'COMPREHENSIVE ANALYSIS SUMMARY':^160}")
+        print(f"{'='*160}")
+
+        if not results:
+            print("No results to display.")
+            return
+
+        # Unified metrics table
+        print(f"\n{'QUALITY METRICS (Foreground / Background)':^160}")
+        print(f"{'Method':<20} {'PSNR (dB)':<25} {'SSIM':<25} {'LPIPS':<25} {'VMAF':<25} {'Bitrate (Mbps)':<15}")
+        print(f"{'-'*160}")
+
+        for video_name, data in results.items():
+            fg_data = data['foreground']
+            bg_data = data['background']
+            
+            # Format metric strings (FG / BG)
+            psnr_str = f"{fg_data.get('psnr_mean', 0):.2f} / {bg_data.get('psnr_mean', 0):.2f}"
+            ssim_str = f"{fg_data.get('ssim_mean', 0):.4f} / {bg_data.get('ssim_mean', 0):.4f}"
+            lpips_str = f"{fg_data.get('lpips_mean', 0):.4f} / {bg_data.get('lpips_mean', 0):.4f}"
+            vmaf_str = f"{fg_data.get('vmaf_mean', 0):.2f} / {bg_data.get('vmaf_mean', 0):.2f}"
+            bitrate_str = f"{data['bitrate_mbps']:.2f}"
+            
+            print(f"{video_name:<20} {psnr_str:<25} {ssim_str:<25} {lpips_str:<25} {vmaf_str:<25} {bitrate_str:<15}")
+        
+        print(f"{'-'*160}")
+
+        # Trade-off analysis against the first video as baseline
+        if len(results) > 1:
+            baseline_name = list(results.keys())[0]
+            print(f"\n{'TRADE-OFF ANALYSIS (vs. ' + baseline_name + ')':^160}")
+            print(f"{'Method':<20} {'PSNR FG %':<15} {'PSNR BG %':<15} {'SSIM FG %':<15} {'SSIM BG %':<15} {'LPIPS FG %':<15} {'LPIPS BG %':<15} {'VMAF FG %':<15} {'VMAF BG %':<15}")
+            print(f"{'-'*160}")
+            
+            for video_name in list(results.keys())[1:]:
+                # Calculate changes for all metrics
+                psnr_fg_change = 0
+                psnr_bg_change = 0
+                ssim_fg_change = 0
+                ssim_bg_change = 0
+                lpips_fg_change = 0
+                lpips_bg_change = 0
+                vmaf_fg_change = 0
+                vmaf_bg_change = 0
+                
+                for metric in ['psnr', 'ssim', 'lpips', 'vmaf']:
+                    for region in ['foreground', 'background']:
+                        baseline_val = results[baseline_name][region].get(f'{metric}_mean', 0)
+                        current_val = results[video_name][region].get(f'{metric}_mean', 0)
+                        
+                        if baseline_val > 0:
+                            # For LPIPS, lower is better, so invert the change
+                            if metric == 'lpips':
+                                change = ((baseline_val / current_val) - 1) * 100 if current_val > 0 else 0
+                            else:
+                                change = ((current_val / baseline_val) - 1) * 100
+                            
+                            # Store changes
+                            if metric == 'psnr' and region == 'foreground':
+                                psnr_fg_change = change
+                            elif metric == 'psnr' and region == 'background':
+                                psnr_bg_change = change
+                            elif metric == 'ssim' and region == 'foreground':
+                                ssim_fg_change = change
+                            elif metric == 'ssim' and region == 'background':
+                                ssim_bg_change = change
+                            elif metric == 'lpips' and region == 'foreground':
+                                lpips_fg_change = change
+                            elif metric == 'lpips' and region == 'background':
+                                lpips_bg_change = change
+                            elif metric == 'vmaf' and region == 'foreground':
+                                vmaf_fg_change = change
+                            elif metric == 'vmaf' and region == 'background':
+                                vmaf_bg_change = change
+                
+                # Print table row
+                print(f"{video_name:<20} {psnr_fg_change:+.2f}%{' '*8} {psnr_bg_change:+.2f}%{' '*8} {ssim_fg_change:+.2f}%{' '*8} {ssim_bg_change:+.2f}%{' '*8} {lpips_fg_change:+.2f}%{' '*8} {lpips_bg_change:+.2f}%{' '*8} {vmaf_fg_change:+.2f}%{' '*8} {vmaf_bg_change:+.2f}%{' '*8}")
+            
+            print(f"{'-'*160}")
+    
+    # --- Setup ---
+    os.makedirs(temp_dir, exist_ok=True)
+    masked_videos_dir = os.path.join(temp_dir, "masked_videos")
+    frames_root = os.path.join(temp_dir, "frames")
+    heatmaps_dir = os.path.join(temp_dir, "performance_figures")
+    os.makedirs(masked_videos_dir, exist_ok=True)
+    os.makedirs(frames_root, exist_ok=True)
+    os.makedirs(heatmaps_dir, exist_ok=True)
+    
+    if not os.path.isdir(masks_dir):
+        print(f"Warning: Masks directory not found at '{masks_dir}'. Cannot perform FG/BG analysis.")
+        return {}
+    
+    # Create masked reference video
+    print("Creating masked reference videos...")
+    reference_frames_dir = os.path.join(temp_dir, "reference_frames_temp")
+    os.makedirs(reference_frames_dir, exist_ok=True)
+    for i, frame in enumerate(reference_frames):
+        cv2.imwrite(os.path.join(reference_frames_dir, f"{i+1:05d}.png"), frame)
+    
+    ref_fg_video = os.path.join(masked_videos_dir, "reference_fg.mp4")
+    ref_bg_video = os.path.join(masked_videos_dir, "reference_bg.mp4")
+    
+    _create_masked_video(reference_frames_dir, masks_dir, ref_fg_video, width, height, framerate, 'foreground')
+    _create_masked_video(reference_frames_dir, masks_dir, ref_bg_video, width, height, framerate, 'background')
+    
+    analysis_results = {}
+    
+    # Calculate the bounding box for foreground region once
+    print("Calculating foreground bounding box from masks...")
+    fg_bbox = _get_mask_bounding_box(masks_dir, width, height)
+    print(f"  - Foreground bounding box: x={fg_bbox[0]}, y={fg_bbox[1]}, w={fg_bbox[2]}, h={fg_bbox[3]}")
+
+    # --- Main Loop: Process each video ---
+    for video_name, video_path in encoded_videos.items():
+        print(f"\nProcessing '{video_name}'...")
+        if not os.path.exists(video_path):
+            print(f"  - Video not found, skipping.")
+            continue
+
+        # 1. Create masked versions of the encoded video
+        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
+        if not _decode_video_to_frames(video_path, video_decoded_dir):
+            continue
+        
+        print(f"  - Creating masked versions of '{video_name}'...")
+        enc_fg_video = os.path.join(masked_videos_dir, f"{video_name.replace(' ', '_')}_fg.mp4")
+        enc_bg_video = os.path.join(masked_videos_dir, f"{video_name.replace(' ', '_')}_bg.mp4")
+        
+        _create_masked_video(video_decoded_dir, masks_dir, enc_fg_video, width, height, framerate, 'foreground')
+        _create_masked_video(video_decoded_dir, masks_dir, enc_bg_video, width, height, framerate, 'background')
+        
+        decoded_frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
+        num_frames = min(len(reference_frames), len(decoded_frame_files))
+        
+        # 2. Calculate all metrics using masked videos for foreground and background
+        analysis_results[video_name] = {
+            'foreground': {},
+            'background': {},
+            'bitrate_mbps': video_bitrates.get(video_name, 0) / 1000000
+        }
+        
+        # Calculate metrics for FOREGROUND
+        print(f"  - Calculating foreground metrics...")
+        
+        # Decode masked videos for frame-by-frame metrics
+        ref_fg_frames_dir = os.path.join(temp_dir, "ref_fg_frames")
+        enc_fg_frames_dir = os.path.join(temp_dir, f"{video_name.replace(' ', '_')}_fg_frames")
+        os.makedirs(ref_fg_frames_dir, exist_ok=True)
+        os.makedirs(enc_fg_frames_dir, exist_ok=True)
+        
+        _decode_video_to_frames(ref_fg_video, ref_fg_frames_dir)
+        _decode_video_to_frames(enc_fg_video, enc_fg_frames_dir)
+        
+        # Load frames
+        ref_fg_frame_files = sorted([f for f in os.listdir(ref_fg_frames_dir) if f.endswith('.png')])
+        enc_fg_frame_files = sorted([f for f in os.listdir(enc_fg_frames_dir) if f.endswith('.png')])
+        num_fg_frames = min(len(ref_fg_frame_files), len(enc_fg_frame_files))
+        
+        # Calculate PSNR and SSIM frame-by-frame
+        psnr_scores_fg = []
+        ssim_scores_fg = []
+        for i in range(num_fg_frames):
+            ref_frame = cv2.imread(os.path.join(ref_fg_frames_dir, ref_fg_frame_files[i]))
+            enc_frame = cv2.imread(os.path.join(enc_fg_frames_dir, enc_fg_frame_files[i]))
+            
+            if ref_frame is not None and enc_frame is not None:
+                # Crop frames to foreground bounding box to exclude black background
+                x, y, w, h = fg_bbox
+                ref_frame_cropped = ref_frame[y:y+h, x:x+w]
+                enc_frame_cropped = enc_frame[y:y+h, x:x+w]
+                
+                # Calculate PSNR for the cropped frame
+                psnr_val = psnr(ref_frame_cropped, enc_frame_cropped)
+                if np.isfinite(psnr_val):
+                    psnr_scores_fg.append(psnr_val)
+                
+                # Calculate SSIM for the cropped frame
+                ssim_val = ssim(ref_frame_cropped, enc_frame_cropped, gaussian_weights=True, data_range=255, channel_axis=-1)
+                if np.isfinite(ssim_val):
+                    ssim_scores_fg.append(ssim_val)
+        
+        analysis_results[video_name]['foreground']['psnr_mean'] = np.mean(psnr_scores_fg) if psnr_scores_fg else 0
+        analysis_results[video_name]['foreground']['psnr_std'] = np.std(psnr_scores_fg) if psnr_scores_fg else 0
+        analysis_results[video_name]['foreground']['ssim_mean'] = np.mean(ssim_scores_fg) if ssim_scores_fg else 0
+        analysis_results[video_name]['foreground']['ssim_std'] = np.std(ssim_scores_fg) if ssim_scores_fg else 0
+        
+        # Calculate LPIPS for foreground (crop to bounding box)
+        x, y, w, h = fg_bbox
+        ref_fg_frames_list = [cv2.imread(os.path.join(ref_fg_frames_dir, f))[y:y+h, x:x+w] for f in ref_fg_frame_files[:num_fg_frames]]
+        enc_fg_frames_list = [cv2.imread(os.path.join(enc_fg_frames_dir, f))[y:y+h, x:x+w] for f in enc_fg_frame_files[:num_fg_frames]]
+        lpips_scores_fg = calculate_lpips_per_frame(ref_fg_frames_list, enc_fg_frames_list)
+        analysis_results[video_name]['foreground']['lpips_mean'] = np.mean(lpips_scores_fg) if lpips_scores_fg else 0
+        analysis_results[video_name]['foreground']['lpips_std'] = np.std(lpips_scores_fg) if lpips_scores_fg else 0
+        
+        # Calculate VMAF for foreground (crop videos to bounding box)
+        x, y, w, h = fg_bbox
+        ref_fg_cropped_video = os.path.join(masked_videos_dir, "reference_fg_cropped.mp4")
+        enc_fg_cropped_video = os.path.join(masked_videos_dir, f"{video_name.replace(' ', '_')}_fg_cropped.mp4")
+        
+        # Create cropped versions of the videos using FFmpeg
+        crop_filter = f"crop={w}:{h}:{x}:{y}"
+        for input_video, output_video in [(ref_fg_video, ref_fg_cropped_video), (enc_fg_video, enc_fg_cropped_video)]:
+            crop_cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', input_video,
+                '-vf', crop_filter,
+                '-c:v', 'libx265', '-preset', 'veryslow', '-x265-params', 'lossless=1',
+                output_video
+            ]
+            subprocess.run(crop_cmd, capture_output=True, text=True, check=True)
+        
+        vmaf_fg = calculate_vmaf(ref_fg_cropped_video, enc_fg_cropped_video, w, h, framerate)
+        analysis_results[video_name]['foreground']['vmaf_mean'] = vmaf_fg.get('mean', 0)
+        analysis_results[video_name]['foreground']['vmaf_std'] = vmaf_fg.get('std', 0)
+        
+        # Clean up FG temp directories
+        shutil.rmtree(ref_fg_frames_dir, ignore_errors=True)
+        shutil.rmtree(enc_fg_frames_dir, ignore_errors=True)
+        
+        # Calculate metrics for BACKGROUND
+        print(f"  - Calculating background metrics...")
+        
+        ref_bg_frames_dir = os.path.join(temp_dir, "ref_bg_frames")
+        enc_bg_frames_dir = os.path.join(temp_dir, f"{video_name.replace(' ', '_')}_bg_frames")
+        os.makedirs(ref_bg_frames_dir, exist_ok=True)
+        os.makedirs(enc_bg_frames_dir, exist_ok=True)
+        
+        _decode_video_to_frames(ref_bg_video, ref_bg_frames_dir)
+        _decode_video_to_frames(enc_bg_video, enc_bg_frames_dir)
+        
+        ref_bg_frame_files = sorted([f for f in os.listdir(ref_bg_frames_dir) if f.endswith('.png')])
+        enc_bg_frame_files = sorted([f for f in os.listdir(enc_bg_frames_dir) if f.endswith('.png')])
+        num_bg_frames = min(len(ref_bg_frame_files), len(enc_bg_frame_files))
+        
+        # Calculate PSNR and SSIM frame-by-frame
+        psnr_scores_bg = []
+        ssim_scores_bg = []
+        for i in range(num_bg_frames):
+            ref_frame = cv2.imread(os.path.join(ref_bg_frames_dir, ref_bg_frame_files[i]))
+            enc_frame = cv2.imread(os.path.join(enc_bg_frames_dir, enc_bg_frame_files[i]))
+            
+            if ref_frame is not None and enc_frame is not None:
+                psnr_val = psnr(ref_frame, enc_frame)
+                if np.isfinite(psnr_val):
+                    psnr_scores_bg.append(psnr_val)
+                
+                ssim_val = ssim(ref_frame, enc_frame, gaussian_weights=True, data_range=255, channel_axis=-1)
+                if np.isfinite(ssim_val):
+                    ssim_scores_bg.append(ssim_val)
+        
+        analysis_results[video_name]['background']['psnr_mean'] = np.mean(psnr_scores_bg) if psnr_scores_bg else 0
+        analysis_results[video_name]['background']['psnr_std'] = np.std(psnr_scores_bg) if psnr_scores_bg else 0
+        analysis_results[video_name]['background']['ssim_mean'] = np.mean(ssim_scores_bg) if ssim_scores_bg else 0
+        analysis_results[video_name]['background']['ssim_std'] = np.std(ssim_scores_bg) if ssim_scores_bg else 0
+        
+        # Calculate LPIPS for background
+        ref_bg_frames_list = [cv2.imread(os.path.join(ref_bg_frames_dir, f)) for f in ref_bg_frame_files[:num_bg_frames]]
+        enc_bg_frames_list = [cv2.imread(os.path.join(enc_bg_frames_dir, f)) for f in enc_bg_frame_files[:num_bg_frames]]
+        lpips_scores_bg = calculate_lpips_per_frame(ref_bg_frames_list, enc_bg_frames_list)
+        analysis_results[video_name]['background']['lpips_mean'] = np.mean(lpips_scores_bg) if lpips_scores_bg else 0
+        analysis_results[video_name]['background']['lpips_std'] = np.std(lpips_scores_bg) if lpips_scores_bg else 0
+        
+        # Calculate VMAF for background
+        vmaf_bg = calculate_vmaf(ref_bg_video, enc_bg_video, width, height, framerate)
+        analysis_results[video_name]['background']['vmaf_mean'] = vmaf_bg.get('mean', 0)
+        analysis_results[video_name]['background']['vmaf_std'] = vmaf_bg.get('std', 0)
+        
+        # Clean up BG temp directories
+        shutil.rmtree(ref_bg_frames_dir, ignore_errors=True)
+        shutil.rmtree(enc_bg_frames_dir, ignore_errors=True)
+
+    # --- Generate Visualizations ---
+    print("\nGenerating quality visualization charts...")
+    
+    def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
+        """Generate comprehensive quality visualization charts."""
+        if not results:
+            return
+        
+        video_names = list(results.keys())
+        
+        # 1. Overall Quality Comparison Bar Chart
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
+        
+        metrics = [
+            ('psnr_mean', 'PSNR (dB)', [20, 50]),
+            ('ssim_mean', 'SSIM', [0, 1]),
+            ('lpips_mean', 'LPIPS (lower is better)', [0, 0.5]),
+            ('vmaf_mean', 'VMAF', [0, 100])
+        ]
+        
+        for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
+            ax = axes[idx // 2, idx % 2]
+            
+            fg_values = [results[name]['foreground'].get(metric_key, 0) for name in video_names]
+            bg_values = [results[name]['background'].get(metric_key, 0) for name in video_names]
+            
+            x = np.arange(len(video_names))
+            width = 0.35
+            
+            bars1 = ax.bar(x - width/2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
+            bars2 = ax.bar(x + width/2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
+            
+            # Set precision for y-axis ticks
+            if metric_key in ['psnr_mean', 'vmaf_mean']:
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
+            else:
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
+                
+            ax.set_ylabel(metric_label, fontsize=11, fontweight='bold')
+            ax.set_title(metric_label, fontsize=12, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(video_names, rotation=45, ha='right')
+            ax.legend()
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            ax.set_ylim(ylim)
+            
+            # Add value labels on bars
+            for bars in [bars1, bars2]:
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.2f}',
+                           ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(heatmaps_dir, '1_overall_quality_comparison.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  ✓ Generated quality comparison visualization in {heatmaps_dir}")
+    
+    _generate_quality_visualizations(analysis_results, heatmaps_dir)
+
+    # --- Generate Visual Patch Comparison ---
+    def _generate_patch_comparison(
+        reference_frames: List[np.ndarray],
+        encoded_videos: Dict[str, str],
+        results: Dict,
+        masks_dir: str,
+        heatmaps_dir: str,
+        decoded_frames_root: str,
+        sample_frame_idx: int = None,
+        patch_size: int = 128
+    ) -> None:
+        """Generate visual comparison of FG/BG patches from each method with VMAF scores."""
+        if not results or not reference_frames:
+            return
+        
+        # Use middle frame if not specified
+        if sample_frame_idx is None:
+            sample_frame_idx = len(reference_frames) // 2
+        
+        print(f"  - Generating patch comparison visualization for frame {sample_frame_idx}...")
+        
+        # Load reference frame
+        ref_frame = reference_frames[sample_frame_idx]
+        
+        # Load mask for this frame
+        mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith('.png')])
+        if sample_frame_idx >= len(mask_files):
+            print(f"    Warning: Mask for frame {sample_frame_idx} not found. Skipping patch comparison.")
+            return
+        
+        mask_path = os.path.join(masks_dir, mask_files[sample_frame_idx])
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f"    Warning: Could not load mask from {mask_path}. Skipping patch comparison.")
+            return
+        
+        # Find a good foreground patch (center of mass of mask)
+        mask_binary = (mask > 127).astype(np.uint8)
+        moments = cv2.moments(mask_binary)
+        if moments['m00'] > 0:
+            fg_center_x = int(moments['m10'] / moments['m00'])
+            fg_center_y = int(moments['m01'] / moments['m00'])
+        else:
+            # Fallback to center of frame
+            fg_center_x = ref_frame.shape[1] // 2
+            fg_center_y = ref_frame.shape[0] // 2
+        
+        # Find good background patches (two different areas)
+        mask_inverted = 1 - mask_binary
+        
+        # First background patch: center of mass of inverted mask
+        moments_bg = cv2.moments(mask_inverted)
+        if moments_bg['m00'] > 0:
+            bg1_center_x = int(moments_bg['m10'] / moments_bg['m00'])
+            bg1_center_y = int(moments_bg['m01'] / moments_bg['m00'])
+        else:
+            # Fallback to top-left corner
+            bg1_center_x = ref_frame.shape[1] // 4
+            bg1_center_y = ref_frame.shape[0] // 4
+        
+        # Second background patch: find another area away from first patch
+        # Try top-right corner area first
+        bg2_center_x = ref_frame.shape[1] * 3 // 4
+        bg2_center_y = ref_frame.shape[0] // 4
+        
+        # If that's too close to the first patch, try bottom-left
+        if abs(bg2_center_x - bg1_center_x) < patch_size and abs(bg2_center_y - bg1_center_y) < patch_size:
+            bg2_center_x = ref_frame.shape[1] // 4
+            bg2_center_y = ref_frame.shape[0] * 3 // 4
+        
+        # Extract patches from reference frame
+        def extract_patch(frame, center_x, center_y, size):
+            h, w = frame.shape[:2]
+            x1 = max(0, center_x - size // 2)
+            y1 = max(0, center_y - size // 2)
+            x2 = min(w, x1 + size)
+            y2 = min(h, y1 + size)
+            x1 = max(0, x2 - size)
+            y1 = max(0, y2 - size)
+            return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
+        
+        ref_fg_patch, fg_coords = extract_patch(ref_frame, fg_center_x, fg_center_y, patch_size)
+        ref_bg1_patch, bg1_coords = extract_patch(ref_frame, bg1_center_x, bg1_center_y, patch_size)
+        ref_bg2_patch, bg2_coords = extract_patch(ref_frame, bg2_center_x, bg2_center_y, patch_size)
+        
+        # Load decoded frames for each method and extract patches
+        video_names = list(encoded_videos.keys())
+        num_methods = len(video_names)
+        
+        # Create figure: 3 rows (FG/BG1/BG2) x (num_methods + 1) columns (reference + methods)
+        fig, axes = plt.subplots(3, num_methods + 1, figsize=(4 * (num_methods + 1), 12))
+        fig.suptitle(f'Visual Patch Comparison (Frame {sample_frame_idx + 1})', fontsize=16, fontweight='bold')
+        
+        # Plot reference patches
+        axes[0, 0].imshow(cv2.cvtColor(ref_fg_patch, cv2.COLOR_BGR2RGB))
+        axes[0, 0].set_title('Reference\nForeground', fontsize=10, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        axes[1, 0].imshow(cv2.cvtColor(ref_bg1_patch, cv2.COLOR_BGR2RGB))
+        axes[1, 0].set_title('Reference\nBackground 1', fontsize=10, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        axes[2, 0].imshow(cv2.cvtColor(ref_bg2_patch, cv2.COLOR_BGR2RGB))
+        axes[2, 0].set_title('Reference\nBackground 2', fontsize=10, fontweight='bold')
+        axes[2, 0].axis('off')
+        
+        # Plot patches from each method
+        for idx, video_name in enumerate(video_names):
+            # Load decoded frame
+            video_decoded_dir = os.path.join(decoded_frames_root, f"{video_name.replace(' ', '_')}_decoded")
+            frame_files = sorted([f for f in os.listdir(video_decoded_dir) if f.endswith('.png')])
+            
+            if sample_frame_idx >= len(frame_files):
+                continue
+            
+            decoded_frame = cv2.imread(os.path.join(video_decoded_dir, frame_files[sample_frame_idx]))
+            if decoded_frame is None:
+                continue
+            
+            # Extract patches
+            dec_fg_patch, _ = extract_patch(decoded_frame, fg_center_x, fg_center_y, patch_size)
+            dec_bg1_patch, _ = extract_patch(decoded_frame, bg1_center_x, bg1_center_y, patch_size)
+            dec_bg2_patch, _ = extract_patch(decoded_frame, bg2_center_x, bg2_center_y, patch_size)
+            
+            # Get VMAF scores from results
+            fg_vmaf = results[video_name]['foreground'].get('vmaf_mean', 0)
+            bg_vmaf = results[video_name]['background'].get('vmaf_mean', 0)
+            
+            # Plot foreground patch
+            axes[0, idx + 1].imshow(cv2.cvtColor(dec_fg_patch, cv2.COLOR_BGR2RGB))
+            axes[0, idx + 1].set_title(f'{video_name}\nFG VMAF: {fg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[0, idx + 1].axis('off')
+            
+            # Plot background patch 1
+            axes[1, idx + 1].imshow(cv2.cvtColor(dec_bg1_patch, cv2.COLOR_BGR2RGB))
+            axes[1, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[1, idx + 1].axis('off')
+            
+            # Plot background patch 2
+            axes[2, idx + 1].imshow(cv2.cvtColor(dec_bg2_patch, cv2.COLOR_BGR2RGB))
+            axes[2, idx + 1].set_title(f'{video_name}\nBG VMAF: {bg_vmaf:.1f}', 
+                                       fontsize=10, fontweight='bold')
+            axes[2, idx + 1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(heatmaps_dir, f'2_patch_comparison_frame_{sample_frame_idx + 1}.png'), 
+                   dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  ✓ Generated patch comparison visualization")
+    
+    # Generate patch comparison for middle frame
+    _generate_patch_comparison(
+        reference_frames=reference_frames,
+        encoded_videos=encoded_videos,
+        results=analysis_results,
+        masks_dir=masks_dir,
+        heatmaps_dir=heatmaps_dir,
+        decoded_frames_root=frames_root,
+        sample_frame_idx=len(reference_frames) // 2,
+        patch_size=128
+    )
+
+    # --- Finalization ---
+    _print_summary_report(analysis_results)
+    
+    # Cleanup - clean up decoded frame directories
+    for video_name in encoded_videos.keys():
+        video_decoded_dir = os.path.join(frames_root, f"{video_name.replace(' ', '_')}_decoded")
+        shutil.rmtree(video_decoded_dir, ignore_errors=True)
+    shutil.rmtree(reference_frames_dir, ignore_errors=True)
+    print(f"\nAnalysis complete. Masked videos saved to: {masked_videos_dir}")
+    print(f"Quality visualizations saved to: {heatmaps_dir}")
+    
+    return analysis_results
+
 
 
 if __name__ == "__main__":
