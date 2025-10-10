@@ -905,6 +905,110 @@ def inpaint_with_propainter(stretched_frames_dir: str, removal_masks_dir: str, o
         # Always return to original directory
         os.chdir(original_dir)
 
+def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, output_frames_dir: str, width: int, height: int, framerate: float, e2fgvi_dir: str = "E2FGVI", model: str = "e2fgvi_hq", ckpt: str = None, ref_stride: int = 10, neighbor_stride: int = 5, num_ref: int = -1, mask_dilation: int = 4) -> None:
+    """
+    Uses E2FGVI to inpaint stretched frames with removed blocks.
+    
+    This function:
+    1. Runs E2FGVI test.py directly on stretched frames and masks
+    2. Extracts inpainted frames to the output directory
+    
+    Args:
+        stretched_frames_dir: Directory containing stretched frames with black regions
+        removal_masks_dir: Directory containing binary mask images (white = regions to inpaint)
+        output_frames_dir: Directory where inpainted frames will be saved
+        width: Video width
+        height: Video height
+        framerate: Video framerate
+        e2fgvi_dir: Path to E2FGVI directory (default: "E2FGVI")
+        model: Model type ('e2fgvi' or 'e2fgvi_hq', default: 'e2fgvi_hq')
+        ckpt: Path to model checkpoint (default: None, uses default path)
+        ref_stride: Stride of reference frames (default: 10)
+        neighbor_stride: Stride of neighboring frames (default: 5)
+        num_ref: Number of reference frames (default: -1 for all)
+        mask_dilation: Mask dilation iterations (default: 4)
+    """
+    
+    # Save current directory
+    original_dir = os.getcwd()
+    
+    # Get absolute paths
+    stretched_frames_abs = os.path.abspath(stretched_frames_dir)
+    removal_masks_abs = os.path.abspath(removal_masks_dir)
+    output_frames_abs = os.path.abspath(output_frames_dir)
+    e2fgvi_abs = os.path.abspath(e2fgvi_dir)
+    
+    # Set default checkpoint if not provided
+    if ckpt is None:
+        ckpt = os.path.join(e2fgvi_abs, "release_model", "E2FGVI-HQ-CVPR22.pth")
+    else:
+        ckpt = os.path.abspath(ckpt)
+    
+    try:
+        # Change to E2FGVI directory (required for imports)
+        os.chdir(e2fgvi_abs)
+        
+        # Build E2FGVI test.py command
+        e2fgvi_cmd = [
+            "python", "test.py",
+            "--model", model,
+            "--video", stretched_frames_abs,
+            "--mask", removal_masks_abs,
+            "--ckpt", ckpt,
+            "--step", str(ref_stride),
+            "--num_ref", str(num_ref),
+            "--neighbor_stride", str(neighbor_stride),
+            "--set_size",
+            "--width", str(width),
+            "--height", str(height),
+            "--savefps", str(int(framerate))
+        ]
+        
+        print(f"Running E2FGVI inference...")
+        result = subprocess.run(e2fgvi_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"E2FGVI stdout: {result.stdout}")
+            print(f"E2FGVI stderr: {result.stderr}")
+            raise RuntimeError(f"E2FGVI inference failed: {result.stderr}")
+        
+        print(f"E2FGVI output: {result.stdout}")
+        
+        # E2FGVI saves results in its results/ directory
+        # Find the output video (it will be named based on the input)
+        results_dir = os.path.join(e2fgvi_abs, "results")
+        if not os.path.exists(results_dir):
+            raise RuntimeError(f"E2FGVI results directory not found at {results_dir}")
+        
+        # Find the most recent result video
+        result_videos = [f for f in os.listdir(results_dir) if f.endswith('.mp4')]
+        if not result_videos:
+            raise RuntimeError(f"No result video found in {results_dir}")
+        
+        # Use the most recently modified video
+        result_videos.sort(key=lambda x: os.path.getmtime(os.path.join(results_dir, x)), reverse=True)
+        result_video_path = os.path.join(results_dir, result_videos[0])
+        
+        # Decode the result video to frames
+        print(f"Decoding E2FGVI result video to frames...")
+        os.makedirs(output_frames_abs, exist_ok=True)
+        
+        if not decode_video(result_video_path, output_frames_abs, framerate=framerate, start_number=1, quality=1):
+            raise RuntimeError(f"Failed to decode E2FGVI result video: {result_video_path}")
+        
+        print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
+        
+        # Clean up the result video
+        os.remove(result_video_path)
+    
+    except Exception as e:
+        print(f"Error in inpaint_with_e2fgvi: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        # Always return to original directory
+        os.chdir(original_dir)
+
 def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """
     Selects and removes blocks from a single image based on removability scores.
@@ -2273,6 +2377,37 @@ if __name__ == "__main__":
         lossless=True
     )
 
+    # --- Inpainting with E2FGVI ---
+    start = time.time()
+    print(f"Inpainting stretched frames with E2FGVI...")
+
+    # Inpaint the stretched frames to fill in removed blocks using E2FGVI
+    inpainted_e2fgvi_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_e2fgvi")
+    
+    inpaint_with_e2fgvi(
+        stretched_frames_dir=stretched_frames_dir,
+        removal_masks_dir=removal_masks_dir,
+        output_frames_dir=inpainted_e2fgvi_frames_dir,
+        width=width,
+        height=height,
+        framerate=framerate
+    )
+
+    end = time.time()
+    execution_times["elvis_v1_inpainting_e2fgvi"] = end - start
+    print(f"ELVIS v1 E2FGVI inpainting completed in {end - start:.2f} seconds.\n")
+
+    # Encode the E2FGVI inpainted frames losslessly TODO: this is not needed in practice
+    inpainted_e2fgvi_video = os.path.join(experiment_dir, "inpainted_e2fgvi.mp4")
+    encode_video(
+        input_frames_dir=inpainted_e2fgvi_frames_dir,
+        output_video=inpainted_e2fgvi_video,
+        framerate=framerate,
+        width=width,
+        height=height,
+        lossless=True
+    )
+
 
 
     # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with OpenCV (TODO: use SOTA model) ---
@@ -2404,6 +2539,7 @@ if __name__ == "__main__":
         "Adaptive": adaptive_video,
         "ELVIS v1 CV2": inpainted_cv2_video,
         "ELVIS v1 ProPainter": inpainted_video,
+        "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
         "ELVIS v2 DCT": dct_restored_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
         "ELVIS v2 Blur": blurred_restored_video
