@@ -212,23 +212,16 @@ def map_score_to_qp(score: float, min_qp: int = 1, max_qp: int = 50) -> int:
     """
     return int(min_qp + (score * (max_qp - min_qp)))
 
-def encode_video(input_frames_dir: str, output_video: str, framerate: float, width: int, height: int, lossless: bool = False, target_bitrate: int = None, **extra_params) -> None:
+def encode_video(input_frames_dir: str, output_video: str, framerate: float, width: int, height: int, target_bitrate: int = None, preset: str = "medium", pix_fmt: str = "yuv420p", **extra_params) -> None:
     """
     Encodes a video using a two-pass process with libx265.
-    
-    This function provides a unified interface for both lossless and lossy encoding:
-    - Lossless: Uses veryslow preset with lossless=1 parameter
-    - Lossy: Uses medium preset with bitrate control
-    
-    Both modes use two-pass encoding for optimal quality/size trade-off.
     
     Args:
         input_frames_dir: Directory containing input frames (e.g., '%05d.png').
         output_video: The path for the final encoded video file.
-        framerate: The framerate of the output video.
+        framerate: The framerate of the output video. If None, encode losslessly.
         width: The width of the video.
         height: The height of the video.
-        lossless: If True, encode losslessly. If False, use target_bitrate.
         target_bitrate: The target bitrate for lossy encoding in bits per second.
         **extra_params: Additional x265 parameters to append (e.g., qpfile path).
     """
@@ -242,17 +235,15 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
     
     try:
         # Base command shared by both passes
+
         base_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-framerate", str(framerate),
             "-i", f"{input_frames_dir}/%05d.png",
-            "-vf", f"scale={width}:{height}:flags=lanczos,format=yuv420p",
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-colorspace", "bt709",
+            "-vf", f"scale={width}:{height}:flags=lanczos,format={pix_fmt}",
         ]
-        
-        if lossless:
+
+        if target_bitrate is None:
             # Lossless encoding with two passes
             preset = "veryslow"
             x265_base_params = "lossless=1"
@@ -278,13 +269,11 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
                 "-x265-params", pass2_params,
                 "-y", output_video
             ]
-            subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error in pass 2 encoding: {result.stderr}")
         else:
             # Lossy encoding with bitrate control and two passes
-            if target_bitrate is None:
-                raise ValueError("target_bitrate must be specified for lossy encoding")
-            
-            preset = "medium"
             
             # Pass 1
             pass1_cmd = base_cmd + [
@@ -294,7 +283,7 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
                 "-maxrate", str(int(target_bitrate * 1.1)),
                 "-bufsize", str(target_bitrate),
                 "-preset", preset,
-                "-g", "10",
+                "-g", str(framerate),  # Set GOP size to framerate for approx 1-second keyframes
                 "-x265-params", f"pass=1:stats={passlog_file}",
                 "-f", "mp4", "-y", null_device
             ]
@@ -313,12 +302,14 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
                 "-maxrate", str(int(target_bitrate * 1.1)),
                 "-bufsize", str(target_bitrate),
                 "-preset", preset,
-                "-g", "10",
+                "-g", str(framerate),  # Set GOP size to framerate for approx 1-second keyframes
                 "-x265-params", pass2_params,
                 "-y", output_video
             ]
-            subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
-        
+            result = subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error in pass 2 encoding: {result.stderr}")
+
     except subprocess.CalledProcessError as e:
         print("--- FFMPEG COMMAND FAILED ---")
         print("STDOUT:", e.stdout)
@@ -431,7 +422,6 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
             framerate=framerate,
             width=width,
             height=height,
-            lossless=False,
             target_bitrate=target_bitrate,
             ctu=ctu_size,
             qpfile=qpfile_path
@@ -1071,7 +1061,7 @@ def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_s
     
     return new_image, removal_mask, block_coords_to_remove
 
-def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, mapping_type: str = 'linear', dtype: type = np.float32, save_maps: bool = False, maps_dir: str = None, width: int = None, height: int = None, map_name: str = 'strength') -> np.ndarray:
+def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, mapping_type: str = 'linear', dtype: type = np.float32) -> np.ndarray:
     """
     Maps normalized scores [0, 1] to strength values using different mapping strategies.
     
@@ -1084,11 +1074,6 @@ def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, map
         max_value: Maximum strength/factor value
         mapping_type: Type of mapping ('linear' or 'power_of_2')
         dtype: Data type for the output array (e.g., np.float32, np.int32)
-        save_maps: Whether to save visualization maps
-        maps_dir: Directory to save maps to
-        width: Frame width (required if save_maps is True)
-        height: Frame height (required if save_maps is True)
-        map_name: Name for saved maps (e.g., 'blur_strength', 'dct_cutoff', 'downsample_factor')
     
     Returns:
         3D array of strength values with the specified dtype
@@ -1115,19 +1100,189 @@ def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, map
     else:
         raise ValueError(f"Unknown mapping_type: {mapping_type}. Use 'linear' or 'power_of_2'.")
     
-    # Save visualization maps if requested
-    if save_maps and maps_dir is not None and width is not None and height is not None:
-        strength_maps_dir = os.path.join(maps_dir, f"{map_name}_maps")
-        os.makedirs(strength_maps_dir, exist_ok=True)
-        print(f"  - Saving {map_name} maps to {strength_maps_dir}...")
-        for i, strengths in enumerate(strength_maps):
-            # Normalize strengths to 0-255 range for visualization
-            strength_normalized = (strengths / strengths.max() * 255).astype(np.uint8) if strengths.max() > 0 else strengths.astype(np.uint8)
-            # Resize to match frame dimensions for easier visualization
-            strength_img = cv2.resize(strength_normalized, (width, height), interpolation=cv2.INTER_NEAREST)
-            cv2.imwrite(os.path.join(strength_maps_dir, f"frame_{i+1:05d}.png"), strength_img)
-    
     return strength_maps
+
+def encode_strength_maps_to_video(strength_maps: np.ndarray, output_video: str, framerate: float, target_bitrate: int = 50000) -> None:
+    """
+    Encodes strength maps as a grayscale video for compression.
+    
+    This allows leveraging video codecs to compress the strength maps efficiently.
+    The maps are kept at block resolution (one pixel per block) and encoded as grayscale.
+    Min/max values are encoded in the filename for later denormalization.
+    
+    Args:
+        strength_maps: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
+        output_video: Path to output video file (should be in maps directory)
+        framerate: Video framerate
+        target_bitrate: Target bitrate for lossy compression (default: 50kbps, sufficient for small maps)
+    """
+    temp_maps_dir = tempfile.mkdtemp()
+    try:
+        # Find min/max for normalization
+        min_val = float(strength_maps.min())
+        max_val = float(strength_maps.max())
+        
+        # Encode min/max in filename: base_name_min{min_val}_max{max_val}.mp4
+        base_name = output_video.replace('.mp4', '')
+        output_video_with_params = f"{base_name}_min{min_val:.6f}_max{max_val:.6f}.mp4"
+        
+        # Normalize to 0-255 and save as grayscale images at block resolution
+        for i, strengths in enumerate(strength_maps):
+            # Normalize to 0-255
+            if max_val > min_val:
+                normalized = ((strengths - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            else:
+                normalized = np.zeros_like(strengths, dtype=np.uint8)
+            
+            # Save at block resolution (one pixel per block)
+            cv2.imwrite(os.path.join(temp_maps_dir, f"{i+1:05d}.png"), normalized)
+        
+        # Encode as grayscale video with Y-only format
+        encode_video(
+            input_frames_dir=temp_maps_dir,
+            output_video=output_video_with_params,
+            framerate=framerate,
+            width=strength_maps.shape[2],
+            height=strength_maps.shape[1],
+            target_bitrate=target_bitrate,
+            pix_fmt='gray'  # Grayscale pixel format
+        )
+        
+        print(f"  - Encoded strength maps to {output_video_with_params} (min={min_val:.6f}, max={max_val:.6f})")
+        
+    finally:
+        shutil.rmtree(temp_maps_dir, ignore_errors=True)
+
+def decode_strength_maps_from_video(video_path: str, dtype: type = np.float32) -> np.ndarray:
+    """
+    Decodes strength maps from a compressed video.
+    Min/max values are decoded from the filename.
+    
+    Args:
+        video_path: Path to encoded strength maps video (with min/max in filename)
+                   Format: base_name_min{min_val}_max{max_val}.mp4
+        dtype: Data type to restore (e.g., np.float32, np.int32)
+    
+    Returns:
+        3D array of strength values with shape (num_frames, num_blocks_y, num_blocks_x)
+    """
+    # Find the actual video file with min/max parameters in filename
+    # The video_path passed in may not have the params, so we need to find it
+    base_path = video_path.replace('.mp4', '')
+    import glob
+    matching_files = glob.glob(f"{base_path}_min*_max*.mp4")
+    
+    if not matching_files:
+        raise FileNotFoundError(f"No strength maps video found matching pattern: {base_path}_min*_max*.mp4")
+    
+    actual_video_path = matching_files[0]
+    
+    # Extract min/max from filename
+    import re
+    match = re.search(r'_min([-+]?[0-9]*\.?[0-9]+)_max([-+]?[0-9]*\.?[0-9]+)\.mp4$', actual_video_path)
+    if not match:
+        raise ValueError(f"Could not extract min/max values from filename: {actual_video_path}")
+    
+    min_val = float(match.group(1))
+    max_val = float(match.group(2))
+    
+    # Decode video to frames (already at block resolution)
+    temp_frames_dir = tempfile.mkdtemp()
+    try:
+        if not decode_video(actual_video_path, temp_frames_dir, quality=1):
+            raise RuntimeError(f"Failed to decode strength maps video: {actual_video_path}")
+        
+        # Load frames and denormalize
+        frame_files = sorted([f for f in os.listdir(temp_frames_dir) if f.endswith('.png')])
+        strength_maps = []
+        
+        for frame_file in frame_files:
+            # Load grayscale map (already at block resolution - one pixel per block)
+            map_img = cv2.imread(os.path.join(temp_frames_dir, frame_file), cv2.IMREAD_GRAYSCALE)
+            
+            # Denormalize from 0-255 back to original range
+            if max_val > min_val:
+                denormalized = (map_img.astype(np.float32) / 255.0) * (max_val - min_val) + min_val
+            else:
+                denormalized = np.full_like(map_img, min_val, dtype=np.float32)
+            
+            strength_maps.append(denormalized.astype(dtype))
+        
+        strength_maps = np.array(strength_maps)
+        print(f"  - Decoded strength maps from {actual_video_path} (shape: {strength_maps.shape}, min={min_val:.6f}, max={max_val:.6f})")
+        
+        return strength_maps
+        
+    finally:
+        shutil.rmtree(temp_frames_dir, ignore_errors=True)
+
+def apply_adaptive_deblocking(image: np.ndarray, strengths: np.ndarray, block_size: int, filter_func: Callable[[np.ndarray, float], np.ndarray], min_strength_threshold: float = 0.1) -> np.ndarray:
+    """
+    Applies adaptive restoration/deblocking to an image based on strength maps.
+    
+    This is similar to apply_adaptive_filtering but designed for client-side restoration.
+    It applies restoration filters with varying strength based on the decoded strength maps.
+    
+    Args:
+        image: The degraded image to restore (H, W, C)
+        strengths: 2D array of restoration strengths for each block (num_blocks_y, num_blocks_x)
+        block_size: The side length of each block
+        filter_func: A restoration function that takes a block and strength and returns restored block
+        min_strength_threshold: Minimum strength threshold below which no restoration is applied
+    
+    Returns:
+        The restored image
+    """
+    # Use the same logic as apply_adaptive_filtering
+    return apply_adaptive_filtering(image, strengths, block_size, filter_func, min_strength_threshold)
+
+def apply_bilateral_deblocking(block: np.ndarray, strength: float) -> np.ndarray:
+    """
+    Applies bilateral filtering for deblocking. Strength controls the filter parameters.
+    Higher strength means more aggressive filtering.
+    """
+    if strength < 0.1:
+        return block
+    
+    # Map strength to bilateral filter parameters
+    d = max(5, min(15, int(strength * 3)))  # Diameter: 5-15
+    sigma_color = max(10, min(150, strength * 30))  # Color sigma: 10-150
+    sigma_space = max(10, min(150, strength * 30))  # Space sigma: 10-150
+    
+    return cv2.bilateralFilter(block, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+
+def apply_unsharp_mask(block: np.ndarray, strength: float) -> np.ndarray:
+    """
+    Applies unsharp masking for deblurring. Strength controls the sharpening amount.
+    """
+    if strength < 0.1:
+        return block
+    
+    # Map strength to unsharp mask parameters
+    sigma = max(1.0, min(10.0, strength * 2))
+    amount = max(0.5, min(2.0, strength * 0.5))
+    
+    gaussian = cv2.GaussianBlur(block, (0, 0), sigma)
+    sharpened = cv2.addWeighted(block, 1.0 + amount, gaussian, -amount, 0)
+    
+    return sharpened
+
+def apply_super_resolution(block: np.ndarray, strength: float) -> np.ndarray:
+    """
+    Applies simple super-resolution (Lanczos upscaling). Strength controls the method.
+    For now, this is a placeholder that uses Lanczos interpolation.
+    In practice, you'd use a SOTA SR model with strength controlling the model complexity.
+    """
+    # For downsampling restoration, we don't need per-block SR since the image is already full size
+    # This is a no-op placeholder that could be replaced with edge enhancement or sharpening
+    if strength < 1.0:
+        return block
+    
+    # Apply slight sharpening based on strength
+    kernel = np.array([[-1,-1,-1], [-1, 9+strength,-1], [-1,-1,-1]]) / (strength + 1)
+    sharpened = cv2.filter2D(block, -1, kernel)
+    
+    return sharpened
 
 def apply_gaussian_blur(block: np.ndarray, strength: float) -> np.ndarray:
     """
@@ -1334,9 +1489,6 @@ def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_vid
                 '-framerate', str(framerate),
                 '-i', os.path.join(masked_frames_dir, '%05d.png'),
                 '-vf', f'scale={width}:{height}:flags=lanczos,format=yuv420p',
-                '-color_primaries', 'bt709',
-                '-color_trc', 'bt709',
-                '-colorspace', 'bt709',
                 '-c:v', 'libx265',
                 '-preset', 'veryslow',
                 '-x265-params', 'lossless=1',
@@ -2081,7 +2233,6 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=False,
         target_bitrate=target_bitrate
     )
 
@@ -2137,7 +2288,6 @@ if __name__ == "__main__":
         framerate=framerate,
         width=shrunk_width,
         height=height,
-        lossless=False,
         target_bitrate=target_bitrate
     )
 
@@ -2162,12 +2312,7 @@ if __name__ == "__main__":
     dct_strengths = map_scores_to_strengths(removability_scores, 
                                             max_value=block_size * 0.99,
                                             mapping_type='linear',
-                                            dtype=np.int32,
-                                            save_maps=True, 
-                                            maps_dir=maps_dir, 
-                                            width=width, 
-                                            height=height,
-                                            map_name='dct_strength')
+                                            dtype=np.int32)
     dct_filtered_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                                    filter_func=apply_dct_damping,
                                                    min_strength_threshold=1.0)
@@ -2182,8 +2327,15 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=False,
         target_bitrate=target_bitrate
+    )
+    
+    # Encode DCT strength maps as video for client-side adaptive restoration
+    dct_strengths_video = os.path.join(maps_dir, "dct_strengths.mp4")
+    encode_strength_maps_to_video(
+        strength_maps=dct_strengths,
+        output_video=dct_strengths_video,
+        framerate=framerate
     )
 
     end = time.time()
@@ -2202,12 +2354,7 @@ if __name__ == "__main__":
     downsample_strengths = map_scores_to_strengths(removability_scores, 
                                                    max_value=8,
                                                    mapping_type='power_of_2',
-                                                   dtype=np.int32,
-                                                   save_maps=True, 
-                                                   maps_dir=maps_dir, 
-                                                   width=width, 
-                                                   height=height,
-                                                   map_name='downsample_strength')
+                                                   dtype=np.int32)
     downsampled_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                                   filter_func=apply_downsampling,
                                                   min_strength_threshold=1.0)
@@ -2222,8 +2369,15 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=False,
         target_bitrate=target_bitrate
+    )
+    
+    # Encode downsampling strength maps as video for client-side adaptive restoration
+    downsample_strengths_video = os.path.join(maps_dir, "downsample_strengths.mp4")
+    encode_strength_maps_to_video(
+        strength_maps=downsample_strengths,
+        output_video=downsample_strengths_video,
+        framerate=framerate
     )
 
     end = time.time()
@@ -2242,12 +2396,7 @@ if __name__ == "__main__":
     blur_strengths = map_scores_to_strengths(removability_scores, 
                                             max_value=3.0,
                                             mapping_type='linear',
-                                            dtype=np.float32,
-                                            save_maps=True, 
-                                            maps_dir=maps_dir, 
-                                            width=width, 
-                                            height=height,
-                                            map_name='blur_strength')
+                                            dtype=np.float32)
     blurred_frames = [apply_adaptive_filtering(img, strengths, block_size,
                                              filter_func=apply_gaussian_blur,
                                              min_strength_threshold=0.1)
@@ -2262,8 +2411,15 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=False,
         target_bitrate=target_bitrate
+    )
+    
+    # Encode blur strength maps as video for client-side adaptive restoration
+    blur_strengths_video = os.path.join(maps_dir, "blur_strengths.mp4")
+    encode_strength_maps_to_video(
+        strength_maps=blur_strengths,
+        output_video=blur_strengths_video,
+        framerate=framerate
     )
 
     end = time.time()
@@ -2315,7 +2471,7 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     # --- Inpainting with CV2 ---
@@ -2343,7 +2499,7 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     # --- Inpainting with ProPainter ---
@@ -2374,7 +2530,7 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     # --- Inpainting with E2FGVI ---
@@ -2405,26 +2561,39 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
 
 
-    # --- DCT Damping-based ELVIS v2: Decode the DCT filtered video to frames and restore it with OpenCV (TODO: use SOTA model) ---
+    # --- DCT Damping-based ELVIS v2: Decode video and apply adaptive restoration ---
     start = time.time()
-    print(f"Decoding DCT filtered ELVIS v2 video...")
+    print(f"Decoding DCT filtered ELVIS v2 video and strength maps...")
     dct_decoded_frames_dir = os.path.join(experiment_dir, "frames", "dct_decoded")
     if not decode_video(dct_filtered_video, dct_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode DCT filtered video: {dct_filtered_video}")
+    
+    # Decode strength maps from compressed video
+    dct_strengths_decoded = decode_strength_maps_from_video(
+        video_path=dct_strengths_video,
+        dtype=np.float32
+    )
 
-    # Restoration: Deblock using a simple bilateral filter (placeholder for a SOTA model)
-    print("Restoring DCT filtered frames using bilateral filter...")
+    # Adaptive restoration: Apply bilateral filtering with varying strength based on decoded maps
+    print("Restoring DCT filtered frames using adaptive bilateral filtering...")
     dct_restored_frames_dir = os.path.join(experiment_dir, "frames", "dct_restored")
     os.makedirs(dct_restored_frames_dir, exist_ok=True)
-    for i in range(len(removability_scores)):
-        dct_frame = cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.png"))
-        restored_frame = cv2.bilateralFilter(dct_frame, d=9, sigmaColor=75, sigmaSpace=75)
-        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    
+    dct_decoded_frames = [cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.png")) 
+                          for i in range(len(dct_strengths_decoded))]
+    
+    dct_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
+                                                      filter_func=apply_bilateral_deblocking,
+                                                      min_strength_threshold=0.1)
+                           for img, strengths in zip(dct_decoded_frames, dct_strengths_decoded)]
+    
+    for i, frame in enumerate(dct_restored_frames):
+        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.png"), frame)
 
     # Encode the restored frames
     dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
@@ -2434,30 +2603,43 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     end = time.time()
     execution_times["elvis_v2_dct_restoration"] = end - start
-    print(f"DCT damping-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+    print(f"DCT damping-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
 
 
 
-    # --- Downsampling-based ELVIS v2: Decode the downsampled video to frames and restore it with OpenCV (TODO: use SOTA model) ---
+    # --- Downsampling-based ELVIS v2: Decode video and apply adaptive restoration ---
     start = time.time()
-    print(f"Decoding downsampled ELVIS v2 video...")
+    print(f"Decoding downsampled ELVIS v2 video and strength maps...")
     downsampled_decoded_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
     if not decode_video(downsampled_video, downsampled_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode downsampled video: {downsampled_video}")
+    
+    # Decode strength maps from compressed video
+    downsample_strengths_decoded = decode_strength_maps_from_video(
+        video_path=downsample_strengths_video,
+        dtype=np.int32
+    )
 
-    # Restoration: Upscale using a simple Lanczos interpolation (placeholder for a SOTA model)
-    print("Restoring downsampled frames using Lanczos interpolation...")
+    # Adaptive restoration: Apply super-resolution/sharpening with varying strength
+    print("Restoring downsampled frames using adaptive super-resolution...")
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
-    for i in range(len(removability_scores)):
-        downsampled_frame = cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.png"))
-        restored_frame = cv2.resize(downsampled_frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
-        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    
+    downsampled_decoded_frames = [cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.png")) 
+                                  for i in range(len(downsample_strengths_decoded))]
+    
+    downsampled_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
+                                                             filter_func=apply_super_resolution,
+                                                             min_strength_threshold=1.0)
+                                   for img, strengths in zip(downsampled_decoded_frames, downsample_strengths_decoded)]
+    
+    for i, frame in enumerate(downsampled_restored_frames):
+        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), frame)
 
     # Encode the restored frames
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
@@ -2467,31 +2649,43 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     end = time.time()
     execution_times["elvis_v2_downsampling_restoration"] = end - start
-    print(f"Downsampling-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+    print(f"Downsampling-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
 
 
 
-    # --- Gaussian Blur-based ELVIS v2: Decode the blurred video to frames and restore it with OpenCV (TODO: use SOTA model) ---
+    # --- Gaussian Blur-based ELVIS v2: Decode video and apply adaptive restoration ---
     start = time.time()
-    print(f"Decoding blurred ELVIS v2 video...")
+    print(f"Decoding blurred ELVIS v2 video and strength maps...")
     blurred_decoded_frames_dir = os.path.join(experiment_dir, "frames", "blurred_decoded")
     if not decode_video(blurred_video, blurred_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode blurred video: {blurred_video}")
+    
+    # Decode strength maps from compressed video
+    blur_strengths_decoded = decode_strength_maps_from_video(
+        video_path=blur_strengths_video,
+        dtype=np.float32
+    )
 
-    # Restoration: Deblur using a simple unsharp mask (placeholder for a SOTA model)
-    print("Restoring blurred frames using unsharp masking...")
+    # Adaptive restoration: Apply unsharp masking with varying strength based on decoded maps
+    print("Restoring blurred frames using adaptive unsharp masking...")
     blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "blurred_restored")
     os.makedirs(blurred_restored_frames_dir, exist_ok=True)
-    for i in range(len(removability_scores)):
-        blurred_frame = cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.png"))
-        gaussian = cv2.GaussianBlur(blurred_frame, (9, 9), 10.0)
-        restored_frame = cv2.addWeighted(blurred_frame, 1.5, gaussian, -0.5, 0)
-        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    
+    blurred_decoded_frames = [cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.png")) 
+                              for i in range(len(blur_strengths_decoded))]
+    
+    blurred_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
+                                                         filter_func=apply_unsharp_mask,
+                                                         min_strength_threshold=0.1)
+                               for img, strengths in zip(blurred_decoded_frames, blur_strengths_decoded)]
+    
+    for i, frame in enumerate(blurred_restored_frames):
+        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), frame)
 
     # Encode the restored frames
     blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
@@ -2501,12 +2695,12 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        lossless=True
+        target_bitrate=None
     )
 
     end = time.time()
     execution_times["elvis_v2_gaussian_blur_restoration"] = end - start
-    print(f"Gaussian blur-based ELVIS v2 restoration completed in {end - start:.2f} seconds.\n")
+    print(f"Gaussian blur-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
 
 
 
