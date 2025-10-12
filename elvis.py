@@ -17,7 +17,7 @@ import lpips
 import platform
 import tempfile
 
-
+# Core functions
 
 def calculate_target_bitrate(width: int, height: int, framerate: float, quality_factor: float = 1.0) -> int:
     """
@@ -203,16 +203,7 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         # Always return to original directory
         os.chdir(original_dir)
 
-def map_score_to_qp(score: float, min_qp: int = 1, max_qp: int = 50) -> int:
-    """Maps a normalized score [0, 1] to a QP value.
-    
-    A low score (important region) maps to a low QP (high quality).
-    A high score (removable region) maps to a high QP (low quality).
-    The QP range is chosen to provide a good quality spread.
-    """
-    return int(min_qp + (score * (max_qp - min_qp)))
-
-def encode_video(input_frames_dir: str, output_video: str, framerate: float, width: int, height: int, target_bitrate: int = None, preset: str = "medium", pix_fmt: str = "yuv420p", **extra_params) -> None:
+def encode_video(input_frames_dir: str, output_video: str, framerate: float, width: int, height: int, target_bitrate: int = None, preset: str = "veryslow", pix_fmt: str = "yuv420p", **extra_params) -> None:
     """
     Encodes a video using a two-pass process with libx265.
     
@@ -324,126 +315,6 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
                 except:
                     pass
 
-def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, target_bitrate: int = 1000000, save_qp_maps: bool = False, qp_maps_dir: str = None) -> None:
-    """
-    Encodes a video using a two-pass process with a detailed qpfile for per-block QP control.
-
-    This method provides the ultimate control:
-    1.  **Per-Block Quality:** Assigns a specific Quantization Parameter (QP) to each
-        individual block in every frame based on its removability score.
-    2.  **Bitrate Adherence:** Uses a standard two-pass encode to ensure the final
-        video file accurately meets the target bitrate.
-
-    Args:
-        input_frames_dir: Directory containing input frames (e.g., '%05d.png').
-        output_video: The path for the final encoded video file.
-        removability_scores: A 3D numpy array of shape (num_frames, num_blocks_y, num_blocks_x)
-                             containing the importance score for each block.
-        block_size: The side length of the square blocks used for scoring (e.g., 64).
-                    This must match the block size used to generate the scores.
-        framerate: The framerate of the output video.
-        width: The width of the video.
-        height: The height of the video.
-        target_bitrate: The target bitrate for the video in bits per second.
-        save_qp_maps: Whether to save QP maps as grayscale images for debugging.
-        qp_maps_dir: Directory to save QP maps. If None, uses temp_dir/qp_maps.
-    """
-    num_frames, num_blocks_y, num_blocks_x = removability_scores.shape
-    temp_dir = os.path.dirname(output_video) or '.'
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    qpfile_path = os.path.join(temp_dir, "qpfile_per_block.txt")
-    passlog_file = os.path.join(temp_dir, "ffmpeg_2pass_log")
-    
-    # Use platform-specific null device for the first pass output
-    null_device = "NUL" if platform.system() == "Windows" else "/dev/null"
-
-    try:
-        # --- Part 1: Generate the detailed per-block qpfile ---
-        print("Generating detailed qpfile for per-block quality control...")
-
-        # Create QP map array for visualization
-        qp_maps = np.zeros((num_frames, num_blocks_y, num_blocks_x), dtype=np.uint8)
-        
-        with open(qpfile_path, 'w') as f:
-            for frame_idx in range(num_frames):
-                # Start the line with frame index and a generic frame type ('P')
-                # The '-1' for QP indicates we are providing per-block QPs
-                line_parts = [f"{frame_idx} P -1"]
-                
-                # Append QP for each block in raster-scan order (left-to-right, top-to-bottom)
-                for y in range(num_blocks_y):
-                    for x in range(num_blocks_x):
-                        score = removability_scores[frame_idx, y, x]
-                        qp = map_score_to_qp(score)
-                        line_parts.append(str(qp))
-                        qp_maps[frame_idx, y, x] = qp
-                
-                f.write(" ".join(line_parts) + "\n")
-        print(f"qpfile generated at {qpfile_path}")
-        
-        # --- Save QP maps as images if requested ---
-        if save_qp_maps:
-            if qp_maps_dir is None:
-                qp_maps_dir = os.path.join(temp_dir, "qp_maps")
-            os.makedirs(qp_maps_dir, exist_ok=True)
-            
-            print(f"Saving QP maps to {qp_maps_dir}...")
-            for frame_idx in range(num_frames):
-                # Create a full-resolution image by upscaling the block-level QP map
-                qp_map_blocks = qp_maps[frame_idx]
-                
-                # Scale QP values to grayscale range [0, 255] for visualization
-                # Lower QP (high quality) = darker, Higher QP (low quality) = brighter
-                qp_map_normalized = (qp_map_blocks / 50.0 * 255).astype(np.uint8)
-                
-                # Upscale each block to full resolution using nearest neighbor
-                qp_map_fullres = np.kron(qp_map_normalized, np.ones((block_size, block_size), dtype=np.uint8))
-                
-                # Ensure the dimensions match exactly
-                qp_map_fullres = qp_map_fullres[:height, :width]
-                
-                # Save as grayscale image
-                qp_map_path = os.path.join(qp_maps_dir, f"qp_map_{frame_idx+1:05d}.png")
-                cv2.imwrite(qp_map_path, qp_map_fullres)
-            
-            print(f"QP maps saved to {qp_maps_dir}")
-
-        # --- Part 2: Run Global Two-Pass Encode with QP file ---
-        # x265 requires CTU size to be 16, 32, or 64. Map block_size to nearest valid CTU.
-        # The qpfile will still use the block_size grid, but CTU sets the encoding block size.
-        valid_ctu_sizes = [16, 32, 64]
-        ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
-        
-        print("Starting two-pass encoding with per-block QP control...")
-        encode_video(
-            input_frames_dir=input_frames_dir,
-            output_video=output_video,
-            framerate=framerate,
-            width=width,
-            height=height,
-            target_bitrate=target_bitrate,
-            ctu=ctu_size,
-            qpfile=qpfile_path
-        )
-
-        print(f"\nTwo-pass per-block encoding complete. Output saved to {output_video}")
-
-    except subprocess.CalledProcessError as e:
-        print("--- FFMPEG COMMAND FAILED ---")
-        print("STDOUT:", e.stdout)
-        print("STDERR:", e.stderr)
-        raise RuntimeError(f"FFmpeg command failed with exit code {e.returncode}") from e
-    finally:
-        # --- Part 3: Clean up temporary files ---
-        print("Cleaning up temporary files...")
-        if os.path.exists(qpfile_path):
-            os.remove(qpfile_path)
-        # FFmpeg might create multiple log files (e.g., .log, .log.mbtree)
-        for f in os.listdir(temp_dir):
-            if f.startswith(os.path.basename(passlog_file)):
-                 os.remove(os.path.join(temp_dir, f))
-
 def decode_video(video_path: str, output_dir: str, framerate: float = None, start_number: int = 1, quality: int = 1) -> bool:
     """
     Decodes a video file to PNG frames with proper color space handling.
@@ -484,229 +355,7 @@ def decode_video(video_path: str, output_dir: str, framerate: float = None, star
         return False
     return True
 
-def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
-    """
-    Calculates the PSNR for a single pair of image blocks.
-    """
-    ref_block_f = ref_block.astype(np.float64)
-    test_block_f = test_block.astype(np.float64)
-    
-    mse = np.mean((ref_block_f - test_block_f) ** 2)
-    
-    if mse < 1e-10:
-        return 100.0
-        
-    max_pixel_value = 255.0
-    psnr_val = 20 * np.log10(max_pixel_value / np.sqrt(mse))
-    
-    return min(psnr_val, 100.0)
-
-def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
-    """
-    Applies a given metric function to each pair of blocks in parallel.
-    """
-    num_blocks_y, num_blocks_x, block_h, block_w, channels = ref_blocks.shape
-    
-    # Reshape for easy iteration: (total_num_blocks, h, w, c)
-    ref_blocks_list = ref_blocks.reshape(-1, block_h, block_w, channels)
-    test_blocks_list = test_blocks.reshape(-1, block_h, block_w, channels)
-    
-    # Create pairs of (ref_block, test_block) for starmap
-    block_pairs = zip(ref_blocks_list, test_blocks_list)
-    
-    # Use a multiprocessing pool to parallelize the metric calculation
-    # By default, this uses all available CPU cores.
-    with multiprocessing.Pool() as pool:
-        scores_flat = pool.starmap(metric_func, block_pairs)
-        
-    # Reshape the flat list of scores back into a 2D map
-    metric_map = np.array(scores_flat).reshape(num_blocks_y, num_blocks_x)
-    
-    return metric_map
-
-def calculate_lpips_per_frame(reference_frames: List[np.ndarray], decoded_frames: List[np.ndarray], 
-                               device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> List[float]:
-    """
-    Calculate LPIPS (Learned Perceptual Image Patch Similarity) for each frame pair.
-    
-    Args:
-        reference_frames: List of reference frames (BGR format from OpenCV)
-        decoded_frames: List of decoded frames (BGR format from OpenCV)
-        device: Device to run LPIPS on ('cuda' or 'cpu')
-    
-    Returns:
-        List of LPIPS scores (lower is better, range typically 0-1)
-    """
-    # Initialize LPIPS model (using Alex network by default, can also use 'vgg' or 'squeeze')
-    lpips_model = lpips.LPIPS(net='alex').to(device)
-    lpips_scores = []
-    
-    with torch.no_grad():
-        for ref_frame, dec_frame in zip(reference_frames, decoded_frames):
-            # Convert BGR to RGB
-            ref_rgb = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)
-            dec_rgb = cv2.cvtColor(dec_frame, cv2.COLOR_BGR2RGB)
-            
-            # Convert to tensor and normalize to [-1, 1]
-            ref_tensor = torch.from_numpy(ref_rgb).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
-            dec_tensor = torch.from_numpy(dec_rgb).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
-            
-            # Move to device
-            ref_tensor = ref_tensor.to(device)
-            dec_tensor = dec_tensor.to(device)
-            
-            # Calculate LPIPS
-            lpips_score = lpips_model(ref_tensor, dec_tensor).item()
-            lpips_scores.append(lpips_score)
-    
-    return lpips_scores
-
-def calculate_vmaf(reference_video: str, distorted_video: str, width: int, height: int, 
-                   framerate: float, model_path: str = None) -> Dict[str, float]:
-    """
-    Calculate VMAF (Video Multimethod Assessment Fusion) using the standalone vmaf command-line tool.
-    Automatically converts videos to YUV format if needed.
-    
-    Args:
-        reference_video: Path to the reference video file
-        distorted_video: Path to the distorted/encoded video file
-        width: Video width
-        height: Video height
-        framerate: Video framerate
-        model_path: Optional path to VMAF model file
-    
-    Returns:
-        Dictionary containing VMAF statistics (mean, min, max, etc.)
-    """
-    
-    # Helper function to convert video to YUV
-    def _convert_to_yuv(video_path: str, output_yuv: str, width: int, height: int) -> bool:
-        """Convert a video to YUV420p format."""
-        try:
-            convert_cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'error',
-                '-i', video_path,
-                '-pix_fmt', 'yuv420p',
-                '-s', f'{width}x{height}',
-                '-y', output_yuv
-            ]
-            result = subprocess.run(convert_cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error converting video to YUV: {e.stderr}")
-            return False
-    
-    try:
-        # Check if videos are already in YUV format
-        ref_yuv = reference_video
-        dist_yuv = distorted_video
-        temp_ref_yuv = None
-        temp_dist_yuv = None
-        
-        # Convert reference video if needed
-        if not reference_video.endswith('.yuv'):
-            temp_ref_yuv = tempfile.NamedTemporaryFile(suffix='.yuv', delete=False)
-            temp_ref_yuv.close()
-            ref_yuv = temp_ref_yuv.name
-            print(f"  - Converting reference video to YUV format...")
-            if not _convert_to_yuv(reference_video, ref_yuv, width, height):
-                return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
-        
-        # Convert distorted video if needed
-        if not distorted_video.endswith('.yuv'):
-            temp_dist_yuv = tempfile.NamedTemporaryFile(suffix='.yuv', delete=False)
-            temp_dist_yuv.close()
-            dist_yuv = temp_dist_yuv.name
-            print(f"  - Converting distorted video to YUV format...")
-            if not _convert_to_yuv(distorted_video, dist_yuv, width, height):
-                return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
-        
-        # Create a temporary file for the JSON output
-        with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as temp_file:
-            output_json = temp_file.name
-        
-        # Build the vmaf command
-        vmaf_cmd = [
-            '/opt/local/bin/vmaf',
-            '-r', ref_yuv,
-            '-d', dist_yuv,
-            '-w', str(width),
-            '-h', str(height),
-            '-p', '420',
-            '-b', '8',
-            '--json',
-            '-o', output_json
-        ]
-        
-        # Add model path if provided
-        if model_path:
-            vmaf_cmd.extend(['--model', model_path])
-        
-        # Run the vmaf command
-        result = subprocess.run(vmaf_cmd, capture_output=True, text=True, check=True)
-        
-        # Read and parse the JSON output
-        with open(output_json, 'r') as f:
-            vmaf_data = json.load(f)
-        
-        # Extract VMAF scores from the JSON structure
-        if 'frames' in vmaf_data:
-            vmaf_scores = [frame['metrics']['vmaf'] for frame in vmaf_data['frames']]
-        elif 'pooled_metrics' in vmaf_data:
-            pooled = vmaf_data['pooled_metrics']['vmaf']
-            return {
-                'mean': pooled.get('mean', 0),
-                'min': pooled.get('min', 0),
-                'max': pooled.get('max', 0),
-                'std': pooled.get('stddev', 0),
-                'harmonic_mean': pooled.get('harmonic_mean', 0)
-            }
-        else:
-            print(f"Warning: Unexpected VMAF output format for {distorted_video}")
-            return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
-        
-        # Calculate statistics
-        vmaf_array = np.array(vmaf_scores)
-        harmonic_mean = len(vmaf_scores) / np.sum([1.0/max(score, 0.001) for score in vmaf_scores])
-        
-        # Clean up temp files
-        os.unlink(output_json)
-        if temp_ref_yuv:
-            os.unlink(temp_ref_yuv.name)
-        if temp_dist_yuv:
-            os.unlink(temp_dist_yuv.name)
-        
-        return {
-            'mean': float(np.mean(vmaf_array)),
-            'min': float(np.min(vmaf_array)),
-            'max': float(np.max(vmaf_array)),
-            'std': float(np.std(vmaf_array)),
-            'harmonic_mean': float(harmonic_mean)
-        }
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Error running VMAF command: {e.stderr}")
-        return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
-    except Exception as e:
-        print(f"Error calculating VMAF: {str(e)}")
-        return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
-    finally:
-        # Ensure temp files are cleaned up even if there's an error
-        if 'output_json' in locals() and os.path.exists(output_json):
-            try:
-                os.unlink(output_json)
-            except:
-                pass
-        if 'temp_ref_yuv' in locals() and temp_ref_yuv and os.path.exists(temp_ref_yuv.name):
-            try:
-                os.unlink(temp_ref_yuv.name)
-            except:
-                pass
-        if 'temp_dist_yuv' in locals() and temp_dist_yuv and os.path.exists(temp_dist_yuv.name):
-            try:
-                os.unlink(temp_dist_yuv.name)
-            except:
-                pass
+# Elvis v1 functions
 
 def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     """
@@ -725,6 +374,68 @@ def split_image_into_blocks(image: np.ndarray, block_size: int) -> np.ndarray:
     blocks = image.reshape(num_blocks_y, block_size, num_blocks_x, block_size, c)
     blocks = blocks.swapaxes(1, 2)
     return blocks
+
+def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
+    """
+    Selects and removes blocks from a single image based on removability scores.
+
+    This function combines the logic of:
+    1. Selecting the N blocks with the highest scores in each row.
+    2. Splitting the image into blocks.
+    3. Removing the selected blocks.
+    4. Reconstructing the image from the remaining blocks.
+
+    Args:
+        image: The original image for the frame (H, W, C).
+        frame_scores: The 2D array of final scores for this frame (num_blocks_y, num_blocks_x).
+        block_size: The side length (l) of each block block.
+        shrink_amount: The number of blocks to remove per row. If < 1, it's a percentage.
+
+    Returns:
+        A tuple containing:
+        - new_image: The reconstructed image with blocks removed.
+        - removal_mask: A 2D array indicating removed (1) vs. kept (0) blocks.
+        - block_coords_to_remove: The list of lists of column indices that were removed.
+    """
+    num_blocks_y, num_blocks_x = frame_scores.shape
+    
+    # --- 1. Selection Step ---
+    if shrink_amount < 1.0:
+        num_blocks_to_remove = int(shrink_amount * num_blocks_x)
+    else:
+        num_blocks_to_remove = int(shrink_amount)
+    num_blocks_to_remove = min(num_blocks_to_remove, num_blocks_x)
+
+    block_coords_to_remove = []
+    for j in range(num_blocks_y):
+        row_scores = frame_scores[j, :]
+        indices_to_remove = np.argsort(-row_scores)[:num_blocks_to_remove]
+        indices_to_remove.sort()
+        block_coords_to_remove.append(indices_to_remove.tolist())
+
+    # --- 2. Action Step ---
+    
+    # Split image into blocks
+    blocks = split_image_into_blocks(image, block_size)
+    
+    # Create a 2D mask of which blocks to remove
+    removal_mask = np.zeros((num_blocks_y, num_blocks_x), dtype=np.int8)
+    rows_indices = np.arange(num_blocks_y).repeat([len(cols) for cols in block_coords_to_remove])
+    if len(rows_indices) > 0:
+        cols_indices = np.concatenate(block_coords_to_remove)
+        removal_mask[rows_indices, cols_indices] = 1
+
+    # Filter out the blocks marked for removal
+    kept_blocks_list = [
+        blocks[i, np.where(removal_mask[i] == 0)[0]]
+        for i in range(num_blocks_y)
+    ]
+    kept_blocks = np.stack(kept_blocks_list, axis=0)
+
+    # Reconstruct the final image from the remaining blocks
+    new_image = combine_blocks_into_image(kept_blocks)
+    
+    return new_image, removal_mask, block_coords_to_remove
 
 def combine_blocks_into_image(blocks: np.ndarray) -> np.ndarray:
     """
@@ -999,116 +710,192 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
         # Always return to original directory
         os.chdir(original_dir)
 
-def apply_selective_removal(image: np.ndarray, frame_scores: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
+# Elvis v2 functions
+
+def encode_with_roi(input_frames_dir: str, output_video: str, removability_scores: np.ndarray, block_size: int, framerate: float, width: int, height: int, target_bitrate: int = 1000000, save_qp_maps: bool = False, qp_maps_dir: str = None) -> None:
     """
-    Selects and removes blocks from a single image based on removability scores.
+    Encodes a video using a two-pass process with a detailed qpfile for per-block QP control.
 
-    This function combines the logic of:
-    1. Selecting the N blocks with the highest scores in each row.
-    2. Splitting the image into blocks.
-    3. Removing the selected blocks.
-    4. Reconstructing the image from the remaining blocks.
+    This method provides the ultimate control:
+    1.  **Per-Block Quality:** Assigns a specific Quantization Parameter (QP) to each
+        individual block in every frame based on its removability score.
+    2.  **Bitrate Adherence:** Uses a standard two-pass encode to ensure the final
+        video file accurately meets the target bitrate.
 
+    Args:
+        input_frames_dir: Directory containing input frames (e.g., '%05d.png').
+        output_video: The path for the final encoded video file.
+        removability_scores: A 3D numpy array of shape (num_frames, num_blocks_y, num_blocks_x)
+                             containing the importance score for each block.
+        block_size: The side length of the square blocks used for scoring (e.g., 64).
+                    This must match the block size used to generate the scores.
+        framerate: The framerate of the output video.
+        width: The width of the video.
+        height: The height of the video.
+        target_bitrate: The target bitrate for the video in bits per second.
+        save_qp_maps: Whether to save QP maps as grayscale images for debugging.
+        qp_maps_dir: Directory to save QP maps. If None, uses temp_dir/qp_maps.
+    """
+    num_frames, num_blocks_y, num_blocks_x = removability_scores.shape
+    temp_dir = os.path.dirname(output_video) or '.'
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    qpfile_path = os.path.join(temp_dir, "qpfile_per_block.txt")
+    passlog_file = os.path.join(temp_dir, "ffmpeg_2pass_log")
+    
+    # Use platform-specific null device for the first pass output
+    null_device = "NUL" if platform.system() == "Windows" else "/dev/null"
+
+    try:
+        # --- Part 1: Generate the detailed per-block qpfile ---
+        print("Generating detailed qpfile for per-block quality control...")
+
+        # Map normalized scores [0, 1] to QP values [1, 50]
+        qp_maps = np.round(removability_scores * 49 + 1).astype(int)
+
+        with open(qpfile_path, 'w') as f:
+            for frame_idx in range(num_frames):
+                # Start the line with frame index and a generic frame type ('P')
+                # The '-1' for QP indicates we are providing per-block QPs
+                line_parts = [f"{frame_idx} P -1"]
+                
+                # Append QP for each block in raster-scan order (left-to-right, top-to-bottom)
+                for by in range(num_blocks_y):
+                    for bx in range(num_blocks_x):
+                        qp_value = qp_maps[frame_idx, by, bx]
+                        line_parts.append(f"{bx},{by},{qp_value}")
+
+                f.write(" ".join(line_parts) + "\n")
+        print(f"qpfile generated at {qpfile_path}")
+        
+        # --- Save QP maps as images if requested ---
+        if save_qp_maps:
+            if qp_maps_dir is None:
+                qp_maps_dir = os.path.join(temp_dir, "qp_maps")
+            os.makedirs(qp_maps_dir, exist_ok=True)
+            for frame_idx in range(num_frames):
+                qp_map_image = (qp_maps[frame_idx] / 50.0 * 255).astype(np.uint8)  # Scale to [0, 255]
+                cv2.imwrite(os.path.join(qp_maps_dir, f"qp_map_{frame_idx:05d}.png"), qp_map_image)
+            print(f"QP maps saved to {qp_maps_dir}")
+
+        # --- Part 2: Run Global Two-Pass Encode with QP file ---
+        # x265 requires CTU size to be 16, 32, or 64. Map block_size to nearest valid CTU.
+        # The qpfile will still use the block_size grid, but CTU sets the encoding block size.
+        valid_ctu_sizes = [16, 32, 64]
+        ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
+        
+        print("Starting two-pass encoding with per-block QP control...")
+        encode_video(
+            input_frames_dir=input_frames_dir,
+            output_video=output_video,
+            framerate=framerate,
+            width=width,
+            height=height,
+            target_bitrate=target_bitrate,
+            ctu=ctu_size,
+            qpfile=qpfile_path
+        )
+
+        print(f"\nTwo-pass per-block encoding complete. Output saved to {output_video}")
+
+    except subprocess.CalledProcessError as e:
+        print("--- FFMPEG COMMAND FAILED ---")
+        print("STDOUT:", e.stdout)
+        print("STDERR:", e.stderr)
+        raise RuntimeError(f"FFmpeg command failed with exit code {e.returncode}") from e
+    finally:
+        # --- Part 3: Clean up temporary files ---
+        print("Cleaning up temporary files...")
+        if os.path.exists(qpfile_path):
+            os.remove(qpfile_path)
+        # FFmpeg might create multiple log files (e.g., .log, .log.mbtree)
+        for f in os.listdir(temp_dir):
+            if f.startswith(os.path.basename(passlog_file)):
+                 os.remove(os.path.join(temp_dir, f))
+
+def filter_frame_downsample(image: np.ndarray, frame_scores: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Simplifies a frame by adaptively downsampling each block.
+    Removability scores control the downsampling factor.
     Args:
         image: The original image for the frame (H, W, C).
         frame_scores: The 2D array of final scores for this frame (num_blocks_y, num_blocks_x).
-        block_size: The side length (l) of each block block.
-        shrink_amount: The number of blocks to remove per row. If < 1, it's a percentage.
-
+        block_size: The side length (l) of each block.
     Returns:
-        A tuple containing:
-        - new_image: The reconstructed image with blocks removed.
-        - removal_mask: A 2D array indicating removed (1) vs. kept (0) blocks.
-        - block_coords_to_remove: The list of lists of column indices that were removed.
+        The reconstructed image with blocks adaptively downsampled.
+        The downsample maps (for encoding).
     """
-    num_blocks_y, num_blocks_x = frame_scores.shape
-    
-    # --- 1. Selection Step ---
-    if shrink_amount < 1.0:
-        num_blocks_to_remove = int(shrink_amount * num_blocks_x)
-    else:
-        num_blocks_to_remove = int(shrink_amount)
-    num_blocks_to_remove = min(num_blocks_to_remove, num_blocks_x)
-
-    block_coords_to_remove = []
-    for j in range(num_blocks_y):
-        row_scores = frame_scores[j, :]
-        indices_to_remove = np.argsort(-row_scores)[:num_blocks_to_remove]
-        indices_to_remove.sort()
-        block_coords_to_remove.append(indices_to_remove.tolist())
-
-    # --- 2. Action Step ---
-    
     # Split image into blocks
     blocks = split_image_into_blocks(image, block_size)
-    
-    # Create a 2D mask of which blocks to remove
-    removal_mask = np.zeros((num_blocks_y, num_blocks_x), dtype=np.int8)
-    rows_indices = np.arange(num_blocks_y).repeat([len(cols) for cols in block_coords_to_remove])
-    if len(rows_indices) > 0:
-        cols_indices = np.concatenate(block_coords_to_remove)
-        removal_mask[rows_indices, cols_indices] = 1
 
-    # Filter out the blocks marked for removal
-    kept_blocks_list = [
-        blocks[i, np.where(removal_mask[i] == 0)[0]]
-        for i in range(num_blocks_y)
-    ]
-    kept_blocks = np.stack(kept_blocks_list, axis=0)
+    # Map removability scores to downsampling factors (powers of 2, from 1 to block_size)
+    downsample_maps = np.round(frame_scores * (int(np.log2(block_size)))).astype(np.int32)
+    downsample_strengths = np.power(2.0, downsample_maps).astype(np.float32)
 
-    # Reconstruct the final image from the remaining blocks
-    new_image = combine_blocks_into_image(kept_blocks)
-    
-    return new_image, removal_mask, block_coords_to_remove
+    # Downsample each block based on its strength
+    processed_blocks = np.zeros_like(blocks)
+    for by in range(blocks.shape[0]):
+        for bx in range(blocks.shape[1]):
+            block = blocks[by, bx]
+            strength = downsample_strengths[by, bx]
+            if strength > 1:
+                # Downscale
+                small_size = max(1, int(block_size / strength))
+                small_block = cv2.resize(block, (small_size, small_size), interpolation=cv2.INTER_AREA)
+                # Upscale back to original block size
+                upsampled_block = cv2.resize(small_block, (block_size, block_size), interpolation=cv2.INTER_LINEAR)
+                processed_blocks[by, bx] = upsampled_block
+            else:
+                # No downsampling
+                processed_blocks[by, bx] = block
 
-def map_scores_to_strengths(normalized_scores: np.ndarray, max_value: float, mapping_type: str = 'linear', dtype: type = np.float32) -> np.ndarray:
+    # Reconstruct the final image from the processed blocks
+    new_image = combine_blocks_into_image(processed_blocks)
+
+    return new_image, downsample_maps
+
+def filter_frame_bilateral(image: np.ndarray, frame_scores: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Maps normalized scores [0, 1] to strength values using different mapping strategies.
-    
-    This unified function supports multiple mapping types:
-    - 'linear': Simple linear mapping to [0, max_value]
-    - 'power_of_2': Maps to discrete power-of-2 values [1, 2, 4, ..., max_value]
-    
+    Applies adaptive bilateral filtering. Higher scores indicate more aggressive filtering.
     Args:
-        normalized_scores: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
-        max_value: Maximum strength/factor value
-        mapping_type: Type of mapping ('linear' or 'power_of_2')
-        dtype: Data type for the output array (e.g., np.float32, np.int32)
-    
+        image: The original image for the frame (H, W, C).
+        frame_scores: The 2D array of final scores for this frame (num_blocks_y, num_blocks_x).
+        block_size: The side length (l) of each block.
     Returns:
-        3D array of strength values with the specified dtype
+        The reconstructed image with blocks adaptively filtered.
+        The filtering strengths (for encoding).
     """
-    if mapping_type == 'linear':
-        # Simple linear mapping: score * max_value
-        strength_maps = (normalized_scores * max_value).astype(dtype)
-        
-    elif mapping_type == 'power_of_2':
-        # Validate that max_value is a power of 2
-        if max_value < 1 or (max_value & (max_value - 1) != 0):
-            raise ValueError(f"max_value must be a power of 2 for 'power_of_2' mapping, got {max_value}")
-        
-        # Define the possible power-of-2 factors (e.g., [1, 2, 4, 8])
-        levels = int(np.log2(max_value)) + 1
-        pow2_factors = np.logspace(0, levels - 1, levels, base=2, dtype=np.int32)
-        
-        # Map normalized scores to indices of these factors
-        indices = np.floor(normalized_scores * (levels - 1)).astype(np.int32)
-        
-        # Use the indices to look up the corresponding factor
-        strength_maps = pow2_factors[indices].astype(dtype)
-        
-    else:
-        raise ValueError(f"Unknown mapping_type: {mapping_type}. Use 'linear' or 'power_of_2'.")
-    
-    return strength_maps
+    # Split image into blocks
+    blocks = split_image_into_blocks(image, block_size)
 
-def encode_strength_maps_to_video(strength_maps: np.ndarray, output_video: str, framerate: float, target_bitrate: int = 50000) -> None:
+    # Map removability scores to filtering strengths (0 to 15)
+    filter_strengths = np.round(frame_scores * 15).astype(np.int32)
+
+    # Apply bilateral filter to each block based on its strength
+    processed_blocks = np.zeros_like(blocks)
+    for by in range(blocks.shape[0]):
+        for bx in range(blocks.shape[1]):
+            block = blocks[by, bx]
+            strength = filter_strengths[by, bx]
+            if strength > 0:
+                # Apply bilateral filter
+                filtered_block = cv2.bilateralFilter(block, d=5, sigmaColor=strength*10, sigmaSpace=strength*10)
+                processed_blocks[by, bx] = filtered_block
+            else:
+                # No filtering
+                processed_blocks[by, bx] = block
+
+    # Reconstruct the final image from the processed blocks
+    new_image = combine_blocks_into_image(processed_blocks)
+
+    return new_image, filter_strengths
+# TODO: check how quality is impacted by different bitrates
+def encode_strength_maps(strength_maps: np.ndarray, output_video: str, framerate: float, target_bitrate: int = 50000) -> None:
     """
     Encodes strength maps as a grayscale video for compression.
     
     This allows leveraging video codecs to compress the strength maps efficiently.
     The maps are kept at block resolution (one pixel per block) and encoded as grayscale.
-    Min/max values are encoded in the filename for later denormalization.
     
     Args:
         strength_maps: 3D array of shape (num_frames, num_blocks_y, num_blocks_x)
@@ -1116,298 +903,432 @@ def encode_strength_maps_to_video(strength_maps: np.ndarray, output_video: str, 
         framerate: Video framerate
         target_bitrate: Target bitrate for lossy compression (default: 50kbps, sufficient for small maps)
     """
-    temp_maps_dir = tempfile.mkdtemp()
-    try:
-        # Find min/max for normalization
-        min_val = float(strength_maps.min())
-        max_val = float(strength_maps.max())
-        
-        # Encode min/max in filename: base_name_min{min_val}_max{max_val}.mp4
-        base_name = output_video.replace('.mp4', '')
-        output_video_with_params = f"{base_name}_min{min_val:.6f}_max{max_val:.6f}.mp4"
-        
-        # Normalize to 0-255 and save as grayscale images at block resolution
-        for i, strengths in enumerate(strength_maps):
-            # Normalize to 0-255
-            if max_val > min_val:
-                normalized = ((strengths - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-            else:
-                normalized = np.zeros_like(strengths, dtype=np.uint8)
-            
-            # Save at block resolution (one pixel per block)
-            cv2.imwrite(os.path.join(temp_maps_dir, f"{i+1:05d}.png"), normalized)
-        
-        # Encode as grayscale video with Y-only format
-        encode_video(
-            input_frames_dir=temp_maps_dir,
-            output_video=output_video_with_params,
-            framerate=framerate,
-            width=strength_maps.shape[2],
-            height=strength_maps.shape[1],
-            target_bitrate=target_bitrate,
-            pix_fmt='gray'  # Grayscale pixel format
-        )
-        
-        print(f"  - Encoded strength maps to {output_video_with_params} (min={min_val:.6f}, max={max_val:.6f})")
-        
-    finally:
-        shutil.rmtree(temp_maps_dir, ignore_errors=True)
+    # Normalize strength maps to 0-255 for encoding
+    min_val = np.min(strength_maps)
+    max_val = np.max(strength_maps)
+    normalized_maps = ((strength_maps - min_val) / (max_val - min_val) * 255.0).astype(np.uint8)
 
-def decode_strength_maps_from_video(video_path: str, dtype: type = np.float32) -> np.ndarray:
+    # Save normalized maps as PNG frames in folder with same name as output video
+    frames_dir = os.path.splitext(output_video)[0]
+    os.makedirs(frames_dir, exist_ok=True)
+    for i in range(normalized_maps.shape[0]):
+        map_img = normalized_maps[i]
+        cv2.imwrite(os.path.join(frames_dir, f"{i+1:05d}.png"), map_img)
+
+    # Encode frames to video
+    encode_video(
+        input_frames_dir=frames_dir,
+        output_video=output_video,
+        framerate=framerate,
+        width=normalized_maps.shape[2],
+        height=normalized_maps.shape[1],
+        target_bitrate=target_bitrate,
+        pix_fmt="gray"
+    )
+# TODO: apply slight median or bilateral filter before normalization to reduce compression artifacts?
+def decode_strength_maps(video_path: str, block_size: int, frames_dir: str) -> np.ndarray:
     """
-    Decodes strength maps from a compressed video.
-    Min/max values are decoded from the filename.
+    Decodes strength maps from a compressed video and attempts to revert encoding artifacts.
+    Min/max values are set:
+    For bilateral filtering: min=0, max=15
+    For downsampling: min=0, max=int(log2(block_size))
     
     Args:
-        video_path: Path to encoded strength maps video (with min/max in filename)
-                   Format: base_name_min{min_val}_max{max_val}.mp4
-        dtype: Data type to restore (e.g., np.float32, np.int32)
-    
+        video_path: Path to encoded strength maps video
+        block_size: The side length of each block (used to determine max downsampling)
+        frames_dir: Directory to save decoded frames
+
     Returns:
         3D array of strength values with shape (num_frames, num_blocks_y, num_blocks_x)
     """
-    # Find the actual video file with min/max parameters in filename
-    # The video_path passed in may not have the params, so we need to find it
-    base_path = video_path.replace('.mp4', '')
-    import glob
-    matching_files = glob.glob(f"{base_path}_min*_max*.mp4")
+    # Figure out whether it's bilateral or downsampling based on filename
+    if "bilateral" in video_path:
+        min_val, max_val = 0.0, 15.0
+    elif "downsample" in video_path:
+        min_val, max_val = 0.0, int(np.log2(block_size))
+
+    # Decode video to frames in the specified directory
+    os.makedirs(frames_dir, exist_ok=True)
+    decode_video(video_path, frames_dir, quality=1)
+
+    # Load frames and reconstruct strength maps
+    frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(('.png', '.jpg'))])
+    strength_maps = []
+    for frame_file in frame_files:
+        img = cv2.imread(os.path.join(frames_dir, frame_file), cv2.IMREAD_GRAYSCALE)
+        # Normalize back to original strength range
+        strength_map = img.astype(np.float32) / 255.0 * (max_val - min_val) + min_val
+        # Round to nearest possible value
+        strength_map = np.round(strength_map).astype(np.uint8)
+        strength_maps.append(strength_map)
+
+    # Stack all strength maps into a 3D array
+    return np.stack(strength_maps, axis=0)
+
+def upscale_realesrgan_2x(image: np.ndarray, realesrgan_dir: str = "Real-ESRGAN", temp_dir: str = None) -> np.ndarray:
+    """
+    Applies Real-ESRGAN 2x upscaling to an image using the realesrgan-ncnn-vulkan executable.
     
-    if not matching_files:
-        raise FileNotFoundError(f"No strength maps video found matching pattern: {base_path}_min*_max*.mp4")
+    Args:
+        image: Input image (H, W, C) in BGR format
+        realesrgan_dir: Path to Real-ESRGAN directory containing the executable
+        temp_dir: Temporary directory for intermediate files (if None, creates one)
     
-    actual_video_path = matching_files[0]
+    Returns:
+        Upscaled image (2*H, 2*W, C) in BGR format
+    """
+    cleanup_temp = False
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        cleanup_temp = True
     
-    # Extract min/max from filename
-    import re
-    match = re.search(r'_min([-+]?[0-9]*\.?[0-9]+)_max([-+]?[0-9]*\.?[0-9]+)\.mp4$', actual_video_path)
-    if not match:
-        raise ValueError(f"Could not extract min/max values from filename: {actual_video_path}")
-    
-    min_val = float(match.group(1))
-    max_val = float(match.group(2))
-    
-    # Decode video to frames (already at block resolution)
-    temp_frames_dir = tempfile.mkdtemp()
     try:
-        if not decode_video(actual_video_path, temp_frames_dir, quality=1):
-            raise RuntimeError(f"Failed to decode strength maps video: {actual_video_path}")
+        # Get absolute paths
+        realesrgan_dir_abs = os.path.abspath(realesrgan_dir)
+        temp_dir_abs = os.path.abspath(temp_dir)
         
-        # Load frames and denormalize
-        frame_files = sorted([f for f in os.listdir(temp_frames_dir) if f.endswith('.png')])
-        strength_maps = []
+        # Save input image
+        input_path = os.path.join(temp_dir_abs, "input.png")
+        output_path = os.path.join(temp_dir_abs, "output.png")
+        cv2.imwrite(input_path, image)
         
-        for frame_file in frame_files:
-            # Load grayscale map (already at block resolution - one pixel per block)
-            map_img = cv2.imread(os.path.join(temp_frames_dir, frame_file), cv2.IMREAD_GRAYSCALE)
-            
-            # Denormalize from 0-255 back to original range
-            if max_val > min_val:
-                denormalized = (map_img.astype(np.float32) / 255.0) * (max_val - min_val) + min_val
-            else:
-                denormalized = np.full_like(map_img, min_val, dtype=np.float32)
-            
-            strength_maps.append(denormalized.astype(dtype))
+        # Path to Real-ESRGAN executable (absolute)
+        realesrgan_exec = os.path.join(realesrgan_dir_abs, "realesrgan-ncnn-vulkan")
         
-        strength_maps = np.array(strength_maps)
-        print(f"  - Decoded strength maps from {actual_video_path} (shape: {strength_maps.shape}, min={min_val:.6f}, max={max_val:.6f})")
+        # Check if executable exists
+        if not os.path.exists(realesrgan_exec):
+            raise FileNotFoundError(f"Real-ESRGAN executable not found at: {realesrgan_exec}")
         
-        return strength_maps
+        # Run Real-ESRGAN with 2x scale
+        # The model files (.bin and .param) must be in the same directory as the executable
+        cmd = [
+            realesrgan_exec,
+            "-i", input_path,
+            "-o", output_path,
+            "-s", "2",  # 2x upscaling
+            "-n", "realesrgan-x4plus"  # Model name (will look for realesrgan-x4plus.bin/.param in cwd)
+        ]
+        
+        # Run from the realesrgan directory so it can find the model files
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=realesrgan_dir_abs)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Real-ESRGAN failed: {result.stderr}\nStdout: {result.stdout}")
+        
+        # Load upscaled image
+        upscaled = cv2.imread(output_path)
+        
+        if upscaled is None:
+            raise RuntimeError(f"Failed to read upscaled image from {output_path}")
+        
+        return upscaled
         
     finally:
-        shutil.rmtree(temp_frames_dir, ignore_errors=True)
+        if cleanup_temp:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-def apply_adaptive_deblocking(image: np.ndarray, strengths: np.ndarray, block_size: int, filter_func: Callable[[np.ndarray, float], np.ndarray], min_strength_threshold: float = 0.1) -> np.ndarray:
+def upscale_realesrgan_adaptive(downsampled_image: np.ndarray, downscale_maps: np.ndarray, block_size: int, realesrgan_dir: str = "Real-ESRGAN") -> np.ndarray:
     """
-    Applies adaptive restoration/deblocking to an image based on strength maps.
+    Applies adaptive Real-ESRGAN upscaling to restore an image where different blocks
+    were downsampled by different factors (powers of 2).
+
+    The algorithm works in multiple stages:
+    1. Find max downscaling factor and downscale image to that resolution.
+    2. Apply Real-ESRGAN 2x to entire frame and update maps.
+    3. Restore blocks that were originally downsampled by a factor smaller or equal to the current stage.
+    4. Repeat for next stage until full resolution is reached and all blocks are restored.
     
-    This is similar to apply_adaptive_filtering but designed for client-side restoration.
-    It applies restoration filters with varying strength based on the decoded strength maps.
+    This allows blocks to see their neighbors during upscaling for proper context,
+    while avoiding applying unnecessary upscaling artifacts to higher-quality blocks.
     
     Args:
-        image: The degraded image to restore (H, W, C)
-        strengths: 2D array of restoration strengths for each block (num_blocks_y, num_blocks_x)
-        block_size: The side length of each block
-        filter_func: A restoration function that takes a block and strength and returns restored block
-        min_strength_threshold: Minimum strength threshold below which no restoration is applied
+        downsampled_image: The downsampled image (non-uniform block sizes) in BGR format
+        downscale_maps: 2D array (num_blocks_y, num_blocks_x) indicating the downscale factor applied to each block.
+        block_size: The side length of each block in the original resolution
+        realesrgan_dir: Path to Real-ESRGAN directory
+        temp_dir: Temporary directory for intermediate files
     
     Returns:
-        The restored image
+        The adaptively upscaled image at original resolution
     """
-    # Use the same logic as apply_adaptive_filtering
-    return apply_adaptive_filtering(image, strengths, block_size, filter_func, min_strength_threshold)
 
-def apply_bilateral_deblocking(block: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Applies bilateral filtering for deblocking. Strength controls the filter parameters.
-    Higher strength means more aggressive filtering.
-    """
-    if strength < 0.1:
-        return block
+    # Convert upscale factors into upscale values (1, 2, 4, 8, ...)
+    downscale_maps = np.power(2, downscale_maps).astype(np.int32)
     
-    # Map strength to bilateral filter parameters
-    d = max(5, min(15, int(strength * 3)))  # Diameter: 5-15
-    sigma_color = max(10, min(150, strength * 30))  # Color sigma: 10-150
-    sigma_space = max(10, min(150, strength * 30))  # Space sigma: 10-150
-    
-    return cv2.bilateralFilter(block, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    # Find max downscaling factor
+    max_factor = int(downscale_maps.max())
 
-def apply_unsharp_mask(block: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Applies unsharp masking for deblurring. Strength controls the sharpening amount.
-    """
-    if strength < 0.1:
-        return block
-    
-    # Map strength to unsharp mask parameters
-    sigma = max(1.0, min(10.0, strength * 2))
-    amount = max(0.5, min(2.0, strength * 0.5))
-    
-    gaussian = cv2.GaussianBlur(block, (0, 0), sigma)
-    sharpened = cv2.addWeighted(block, 1.0 + amount, gaussian, -amount, 0)
-    
-    return sharpened
+    # Downscale the image to the lowest resolution
+    height, width, _ = downsampled_image.shape
+    current_image = cv2.resize(downsampled_image, (width // max_factor, height // max_factor), interpolation=cv2.INTER_AREA)
 
-def apply_super_resolution(block: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Applies simple super-resolution (Lanczos upscaling). Strength controls the method.
-    For now, this is a placeholder that uses Lanczos interpolation.
-    In practice, you'd use a SOTA SR model with strength controlling the model complexity.
-    """
-    # For downsampling restoration, we don't need per-block SR since the image is already full size
-    # This is a no-op placeholder that could be replaced with edge enhancement or sharpening
-    if strength < 1.0:
-        return block
-    
-    # Apply slight sharpening based on strength
-    kernel = np.array([[-1,-1,-1], [-1, 9+strength,-1], [-1,-1,-1]]) / (strength + 1)
-    sharpened = cv2.filter2D(block, -1, kernel)
-    
-    return sharpened
+    # Process in stages, doubling resolution each time
+    num_blocks_y, num_blocks_x = downscale_maps.shape
+    current_factor = max_factor / 2
+    while current_factor >= 1:
 
-def apply_gaussian_blur(block: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Applies a Gaussian blur. Strength controls the sigma and kernel size.
-    """
-    # Ensure strength is at least a small positive number
-    sigma = max(strength, 0.1)
-    
-    # Kernel size should be an odd number and proportional to sigma
-    ksize = int(sigma * 4) # Rule of thumb: kernel size around 4-6x sigma
-    ksize = ksize + 1 if ksize % 2 == 0 else ksize
-    ksize = max(ksize, 1) # Must be at least 1
-    
-    return cv2.GaussianBlur(block, (ksize, ksize), sigma)
+        current_block_size = block_size // int(current_factor)
 
-def apply_downsampling(block: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Simplifies a block by downsampling and then upsampling it.
-    Strength controls the downsampling factor.
-    """
-    height, width, _ = block.shape
-    
-    # Map strength [0-inf] to a downscale factor [1x - 8x]
-    # Using a non-linear mapping like log can give better perceptual results
-    scale_factor = 1 + int(strength)
-    
-    if scale_factor <= 1:
-        return block
+        # Debug: Ensure current_image is expected size and is not black
+        print(f"Size {current_image.shape} Average color before upscaling: {current_image.mean(axis=(0,1))}")
         
-    # Calculate new dimensions, ensuring they are at least 1 pixel
-    new_height, new_width = max(1, height // scale_factor), max(1, width // scale_factor)
-    
-    # Downsample using an averaging interpolator
-    downsampled = cv2.resize(block, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    
-    # Upsample back to the original size
-    upsampled = cv2.resize(downsampled, (width, height), interpolation=cv2.INTER_LINEAR)
-    
-    return upsampled
+        # 1. Apply Real-ESRGAN 2x to the entire current image
+        current_image = upscale_realesrgan_2x(current_image, realesrgan_dir)
 
-def apply_dct_damping(block: np.ndarray, strength: float) -> np.ndarray:
+        # Debug: Ensure current_image is expected size and is not black
+        print(f"Size {current_image.shape} Average color after upscaling: {current_image.mean(axis=(0,1))}")
+
+        # 2. Restore blocks that were downsampled by <= current_factor
+        blocks = split_image_into_blocks(current_image, current_block_size)
+
+        # Downscale original image and split into blocks for restoration
+        downscaled_image = cv2.resize(downsampled_image, (current_image.shape[1], current_image.shape[0]), interpolation=cv2.INTER_AREA)
+        downsampled_blocks = split_image_into_blocks(downscaled_image, current_block_size) # Original blocks at current resolution
+
+        for i in range(num_blocks_y):
+            for j in range(num_blocks_x):
+                block_factor = downscale_maps[i, j]
+                if block_factor <= current_factor:
+                    # This block was downsampled by <= current_factor, so restore it to original
+                    blocks[i, j] = downsampled_blocks[i, j]
+                else:
+                    # Update downscale map for next iteration
+                    downscale_maps[i, j] = current_factor
+
+        # Combine blocks back into the current image
+        current_image = combine_blocks_into_image(blocks)
+        
+        # Update current factor (halve it)
+        current_factor /= 2
+
+    return current_image
+
+# TODO: add VRT for bilateral restoration (works on other filtering methods too)
+
+# TODO: not used anymore, but we should bring back the blockwise figures at some point
+def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
     """
-    Simplifies a block by damping its high-frequency DCT coefficients.
-    A higher strength zeros out more coefficients, simplifying the block more.
+    Applies a given metric function to each pair of blocks in parallel.
+    """
+    num_blocks_y, num_blocks_x, block_h, block_w, channels = ref_blocks.shape
+    
+    # Reshape for easy iteration: (total_num_blocks, h, w, c)
+    ref_blocks_list = ref_blocks.reshape(-1, block_h, block_w, channels)
+    test_blocks_list = test_blocks.reshape(-1, block_h, block_w, channels)
+    
+    # Create pairs of (ref_block, test_block) for starmap
+    block_pairs = zip(ref_blocks_list, test_blocks_list)
+    
+    # Use a multiprocessing pool to parallelize the metric calculation
+    # By default, this uses all available CPU cores.
+    with multiprocessing.Pool() as pool:
+        scores_flat = pool.starmap(metric_func, block_pairs)
+        
+    # Reshape the flat list of scores back into a 2D map
+    metric_map = np.array(scores_flat).reshape(num_blocks_y, num_blocks_x)
+    
+    return metric_map
+
+def psnr(ref_block: np.ndarray, test_block: np.ndarray) -> float:
+    """
+    Calculates the PSNR for a single pair of image blocks.
+    """
+    ref_block_f = ref_block.astype(np.float64)
+    test_block_f = test_block.astype(np.float64)
+    
+    mse = np.mean((ref_block_f - test_block_f) ** 2)
+    
+    if mse < 1e-10:
+        return 100.0
+        
+    max_pixel_value = 255.0
+    psnr_val = 20 * np.log10(max_pixel_value / np.sqrt(mse))
+    
+    return min(psnr_val, 100.0)
+
+def calculate_lpips_per_frame(reference_frames: List[np.ndarray], decoded_frames: List[np.ndarray], 
+                               device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> List[float]:
+    """
+    Calculate LPIPS (Learned Perceptual Image Patch Similarity) for each frame pair.
     
     Args:
-        block: The input block (l, l, C), likely in uint8 format.
-        strength: A float, typically in a range like [0, 64], indicating how many
-                  high-frequency components to cut.
-    """
-    if strength < 1:
-        return block
-
-    block_size = block.shape[0]
+        reference_frames: List of reference frames (BGR format from OpenCV)
+        decoded_frames: List of decoded frames (BGR format from OpenCV)
+        device: Device to run LPIPS on ('cuda' or 'cpu')
     
-    # DCT works on float32, single-channel images. We process each channel.
-    block_float = block.astype(np.float32)
-    processed_channels = []
-    
-    for channel in cv2.split(block_float):
-        # 1. Apply forward DCT
-        dct_channel = cv2.dct(channel)
-        
-        # 2. Determine the cutoff
-        # A higher strength means a smaller cutoff, keeping fewer coefficients.
-        # We ensure we always keep at least the DC component (top-left).
-        cutoff = max(1, int(block_size - strength))
-        
-        # 3. Create a mask and apply it
-        # This zeros out a bottom-right block of high-frequency coefficients
-        mask = np.zeros((block_size, block_size), dtype=np.float32)
-        mask[:cutoff, :cutoff] = 1.0
-        dct_channel *= mask
-        
-        # 4. Apply inverse DCT
-        idct_channel = cv2.idct(dct_channel)
-        processed_channels.append(idct_channel)
-        
-    # Merge channels, clip to valid range, and convert back to uint8
-    merged = cv2.merge(processed_channels)
-    final_block = np.clip(merged, 0, 255).astype(np.uint8)
-    
-    return final_block
-
-def apply_adaptive_filtering(image: np.ndarray, strengths: np.ndarray, block_size: int, filter_func: Callable[[np.ndarray, float], np.ndarray], min_strength_threshold: float = 0.1) -> np.ndarray:
-    """
-    Applies a variable-strength filter to each block of an image based on 
-    a pre-calculated 2D array of filter strengths.
-
-    Args:
-        image: The original image for the frame (H, W, C).
-        strengths: The 2D array of filter strengths for each block 
-                   (num_blocks_y, num_blocks_x).
-        block_size: The side length (l) of each block.
-        filter_func: A function that takes a block (l, l, C) and a strength 
-                     (float or int) and returns a filtered block.
-        min_strength_threshold: A value below which the filter is not applied.
-
     Returns:
-        The new image with adaptive filtering applied to its blocks.
+        List of LPIPS scores (lower is better, range typically 0-1)
     """
+    # Initialize LPIPS model (using Alex network by default, can also use 'vgg' or 'squeeze')
+    lpips_model = lpips.LPIPS(net='alex').to(device)
+    lpips_scores = []
     
-    # Split the image into an array of blocks
-    blocks = split_image_into_blocks(image, block_size)
-    # Create a copy to store the filtered results
-    filtered_blocks = blocks.copy()
-    
-    num_blocks_y, num_blocks_x, _, _, _ = blocks.shape
-
-    # Iterate over each block to apply the corresponding filter
-    for i in range(num_blocks_y):
-        for j in range(num_blocks_x):
-            strength = strengths[i, j]
+    with torch.no_grad():
+        for ref_frame, dec_frame in zip(reference_frames, decoded_frames):
+            # Convert BGR to RGB
+            ref_rgb = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)
+            dec_rgb = cv2.cvtColor(dec_frame, cv2.COLOR_BGR2RGB)
             
-            # Apply the filter function if strength is above the threshold
-            if strength > min_strength_threshold:
-                block = blocks[i, j]
-                # Filter function is called with the pre-calculated strength
-                filtered_block = filter_func(block, strength)
-                filtered_blocks[i, j] = filtered_block
-
-    # Reconstruct the image from the (partially) filtered blocks
-    new_image = combine_blocks_into_image(filtered_blocks)
+            # Convert to tensor and normalize to [-1, 1]
+            ref_tensor = torch.from_numpy(ref_rgb).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
+            dec_tensor = torch.from_numpy(dec_rgb).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
+            
+            # Move to device
+            ref_tensor = ref_tensor.to(device)
+            dec_tensor = dec_tensor.to(device)
+            
+            # Calculate LPIPS
+            lpips_score = lpips_model(ref_tensor, dec_tensor).item()
+            lpips_scores.append(lpips_score)
     
-    return new_image
+    return lpips_scores
+
+def calculate_vmaf(reference_video: str, distorted_video: str, width: int, height: int, 
+                   framerate: float, model_path: str = None) -> Dict[str, float]:
+    """
+    Calculate VMAF (Video Multimethod Assessment Fusion) using the standalone vmaf command-line tool.
+    Automatically converts videos to YUV format if needed.
+    
+    Args:
+        reference_video: Path to the reference video file
+        distorted_video: Path to the distorted/encoded video file
+        width: Video width
+        height: Video height
+        framerate: Video framerate
+        model_path: Optional path to VMAF model file
+    
+    Returns:
+        Dictionary containing VMAF statistics (mean, min, max, etc.)
+    """
+    
+    # Helper function to convert video to YUV
+    def _convert_to_yuv(video_path: str, output_yuv: str, width: int, height: int) -> bool:
+        """Convert a video to YUV420p format."""
+        try:
+            convert_cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-i', video_path,
+                '-pix_fmt', 'yuv420p',
+                '-s', f'{width}x{height}',
+                '-y', output_yuv
+            ]
+            result = subprocess.run(convert_cmd, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error converting video to YUV: {e.stderr}")
+            return False
+    
+    try:
+        # Check if videos are already in YUV format
+        ref_yuv = reference_video
+        dist_yuv = distorted_video
+        temp_ref_yuv = None
+        temp_dist_yuv = None
+        
+        # Convert reference video if needed
+        if not reference_video.endswith('.yuv'):
+            temp_ref_yuv = tempfile.NamedTemporaryFile(suffix='.yuv', delete=False)
+            temp_ref_yuv.close()
+            ref_yuv = temp_ref_yuv.name
+            print(f"  - Converting reference video to YUV format...")
+            if not _convert_to_yuv(reference_video, ref_yuv, width, height):
+                return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
+        
+        # Convert distorted video if needed
+        if not distorted_video.endswith('.yuv'):
+            temp_dist_yuv = tempfile.NamedTemporaryFile(suffix='.yuv', delete=False)
+            temp_dist_yuv.close()
+            dist_yuv = temp_dist_yuv.name
+            print(f"  - Converting distorted video to YUV format...")
+            if not _convert_to_yuv(distorted_video, dist_yuv, width, height):
+                return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
+        
+        # Create a temporary file for the JSON output
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as temp_file:
+            output_json = temp_file.name
+        
+        # Build the vmaf command
+        vmaf_cmd = [
+            '/opt/local/bin/vmaf',
+            '-r', ref_yuv,
+            '-d', dist_yuv,
+            '-w', str(width),
+            '-h', str(height),
+            '-p', '420',
+            '-b', '8',
+            '--json',
+            '-o', output_json
+        ]
+        
+        # Add model path if provided
+        if model_path:
+            vmaf_cmd.extend(['--model', model_path])
+        
+        # Run the vmaf command
+        result = subprocess.run(vmaf_cmd, capture_output=True, text=True, check=True)
+        
+        # Read and parse the JSON output
+        with open(output_json, 'r') as f:
+            vmaf_data = json.load(f)
+        
+        # Extract VMAF scores from the JSON structure
+        if 'frames' in vmaf_data:
+            vmaf_scores = [frame['metrics']['vmaf'] for frame in vmaf_data['frames']]
+        elif 'pooled_metrics' in vmaf_data:
+            pooled = vmaf_data['pooled_metrics']['vmaf']
+            return {
+                'mean': pooled.get('mean', 0),
+                'min': pooled.get('min', 0),
+                'max': pooled.get('max', 0),
+                'std': pooled.get('stddev', 0),
+                'harmonic_mean': pooled.get('harmonic_mean', 0)
+            }
+        else:
+            print(f"Warning: Unexpected VMAF output format for {distorted_video}")
+            return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
+        
+        # Calculate statistics
+        vmaf_array = np.array(vmaf_scores)
+        harmonic_mean = len(vmaf_scores) / np.sum([1.0/max(score, 0.001) for score in vmaf_scores])
+        
+        # Clean up temp files
+        os.unlink(output_json)
+        if temp_ref_yuv:
+            os.unlink(temp_ref_yuv.name)
+        if temp_dist_yuv:
+            os.unlink(temp_dist_yuv.name)
+        
+        return {
+            'mean': float(np.mean(vmaf_array)),
+            'min': float(np.min(vmaf_array)),
+            'max': float(np.max(vmaf_array)),
+            'std': float(np.std(vmaf_array)),
+            'harmonic_mean': float(harmonic_mean)
+        }
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error running VMAF command: {e.stderr}")
+        return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
+    except Exception as e:
+        print(f"Error calculating VMAF: {str(e)}")
+        return {'mean': 0, 'min': 0, 'max': 0, 'std': 0, 'harmonic_mean': 0}
+    finally:
+        # Ensure temp files are cleaned up even if there's an error
+        if 'output_json' in locals() and os.path.exists(output_json):
+            try:
+                os.unlink(output_json)
+            except:
+                pass
+        if 'temp_ref_yuv' in locals() and temp_ref_yuv and os.path.exists(temp_ref_yuv.name):
+            try:
+                os.unlink(temp_ref_yuv.name)
+            except:
+                pass
+        if 'temp_dist_yuv' in locals() and temp_dist_yuv and os.path.exists(temp_dist_yuv.name):
+            try:
+                os.unlink(temp_dist_yuv.name)
+            except:
+                pass
 
 def analyze_encoding_performance(reference_frames: List[np.ndarray], encoded_videos: Dict[str, str], block_size: int, width: int, height: int, temp_dir: str, masks_dir: str, sample_frames: List[int] = [0, 20, 40], video_bitrates: Dict[str, float] = {}, reference_video_path: str = None, framerate: float = 30.0) -> Dict:
     """
@@ -2148,6 +2069,9 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+    # Move to script directory
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
     # Example usage parameters
     reference_video = "davis_test/bear.mp4"
     width, height = 640, 360
@@ -2193,7 +2117,8 @@ if __name__ == "__main__":
 
     print("Extracting reference frames...")
     os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png")
-    
+    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
+
     end = time.time()
     execution_times["preprocessing"] = end - start
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
@@ -2226,7 +2151,7 @@ if __name__ == "__main__":
     
     print(f"Encoding reference frames with two-pass for baseline comparison...")
     baseline_video = os.path.join(experiment_dir, "baseline.mp4")
-    
+    # Encode the baseline video
     encode_video(
         input_frames_dir=reference_frames_dir,
         output_video=baseline_video,
@@ -2235,10 +2160,43 @@ if __name__ == "__main__":
         height=height,
         target_bitrate=target_bitrate
     )
-
     end = time.time()
     execution_times["baseline_encoding"] = end - start
     print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
+
+
+
+    # --- ELVIS v1 (shrinking and extracting metadata) ---
+    start = time.time()
+    print(f"Shrinking and encoding frames with ELVIS v1...")
+    # Shrink frames based on removability scores
+    shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
+    os.makedirs(shrunk_frames_dir, exist_ok=True)
+    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
+    for i, frame in enumerate(shrunk_frames):
+        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
+    # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
+    shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
+    shrunk_width = shrunk_frames[0].shape[1]  # Width is reduced due to removed blocks
+    encode_video(
+        input_frames_dir=shrunk_frames_dir,
+        output_video=shrunk_video,
+        framerate=framerate,
+        width=shrunk_width,
+        height=height,
+        target_bitrate=target_bitrate
+    )
+    # Save compressed metadata about removed blocks
+    removal_masks = np.array(removal_masks, dtype=np.uint8)
+    masks_packed = np.packbits(removal_masks)
+    np.savez(
+        os.path.join(experiment_dir, 
+        f"shrink_masks_{block_size}.npz"), 
+        packed=masks_packed, shape=removal_masks.shape
+    )
+    end = time.time()
+    execution_times["elvis_v1_shrinking"] = end - start
+    print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -2260,87 +2218,9 @@ if __name__ == "__main__":
         save_qp_maps=True,
         qp_maps_dir=qp_maps_dir
     )
-
     end = time.time()
     execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
-
-
-
-    # --- ELVIS v1 (shrinking and extracting metadata) ---
-    start = time.time()
-    print(f"Shrinking and encoding frames with ELVIS v1...")
-
-    # Shrink frames based on removability scores
-    shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
-    os.makedirs(shrunk_frames_dir, exist_ok=True)
-    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
-    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
-    for i, frame in enumerate(shrunk_frames):
-        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
-
-    # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
-    shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
-    shrunk_width = shrunk_frames[0].shape[1]  # Width is reduced due to removed blocks
-    encode_video(
-        input_frames_dir=shrunk_frames_dir,
-        output_video=shrunk_video,
-        framerate=framerate,
-        width=shrunk_width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
-
-    # Save compressed metadata about removed blocks
-    removal_masks = np.array(removal_masks, dtype=np.uint8)
-    masks_packed = np.packbits(removal_masks)
-    np.savez(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"), packed=masks_packed, shape=removal_masks.shape)
-
-    end = time.time()
-    execution_times["elvis_v1_shrinking"] = end - start
-    print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
-
-
-
-    # --- DCT Damping-based ELVIS v2 (adaptive filtering and encoding) ---
-    start = time.time()
-    print(f"Applying DCT damping-based ELVIS v2 adaptive filtering and encoding...")
-    dct_filtered_frames_dir = os.path.join(experiment_dir, "frames", "dct_filtered")
-    os.makedirs(dct_filtered_frames_dir, exist_ok=True)
-    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
-    dct_strengths = map_scores_to_strengths(removability_scores, 
-                                            max_value=block_size * 0.99,
-                                            mapping_type='linear',
-                                            dtype=np.int32)
-    dct_filtered_frames = [apply_adaptive_filtering(img, strengths, block_size,
-                                                   filter_func=apply_dct_damping,
-                                                   min_strength_threshold=1.0)
-                           for img, strengths in zip(reference_frames, dct_strengths)]
-    for i, frame in enumerate(dct_filtered_frames):
-        cv2.imwrite(os.path.join(dct_filtered_frames_dir, f"{i+1:05d}.png"), frame)
-
-    dct_filtered_video = os.path.join(experiment_dir, "dct_filtered.mp4")
-    encode_video(
-        input_frames_dir=dct_filtered_frames_dir,
-        output_video=dct_filtered_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
-    
-    # Encode DCT strength maps as video for client-side adaptive restoration
-    dct_strengths_video = os.path.join(maps_dir, "dct_strengths.mp4")
-    encode_strength_maps_to_video(
-        strength_maps=dct_strengths,
-        output_video=dct_strengths_video,
-        framerate=framerate
-    )
-
-    end = time.time()
-    execution_times["elvis_v2_dct_filtering"] = end - start
-    print(f"DCT damping-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -2349,20 +2229,11 @@ if __name__ == "__main__":
     print(f"Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
     downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
-    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
-    downsample_strengths = map_scores_to_strengths(removability_scores, 
-                                                   max_value=8,
-                                                   mapping_type='power_of_2',
-                                                   dtype=np.int32)
-    downsampled_frames = [apply_adaptive_filtering(img, strengths, block_size,
-                                                  filter_func=apply_downsampling,
-                                                  min_strength_threshold=1.0)
-                         for img, strengths in zip(reference_frames, downsample_strengths)]
+    # Downsample frames based on removability scores
+    downsampled_frames, downsample_maps = zip(*(filter_frame_downsample(img, scores, block_size) for img, scores in zip(reference_frames, removability_scores)))
     for i, frame in enumerate(downsampled_frames):
         cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.png"), frame)
-
-    downsampled_video = os.path.join(experiment_dir, "downsampled.mp4")
+    downsampled_video = os.path.join(experiment_dir, "downsampled_encoded.mp4")
     encode_video(
         input_frames_dir=downsampled_frames_dir,
         output_video=downsampled_video,
@@ -2371,60 +2242,47 @@ if __name__ == "__main__":
         height=height,
         target_bitrate=target_bitrate
     )
-    
-    # Encode downsampling strength maps as video for client-side adaptive restoration
-    downsample_strengths_video = os.path.join(maps_dir, "downsample_strengths.mp4")
-    encode_strength_maps_to_video(
-        strength_maps=downsample_strengths,
-        output_video=downsample_strengths_video,
+    # Encode downsampling maps as video for client-side adaptive restoration
+    downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
+    encode_strength_maps(
+        strength_maps=list(downsample_maps),
+        output_video=downsample_maps_video,
         framerate=framerate
     )
-
     end = time.time()
     execution_times["elvis_v2_downsampling"] = end - start
     print(f"Downsampling-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
 
 
-    # --- Gaussian Blur-based ELVIS v2 (adaptive filtering and encoding) ---
+    # --- Bilateral Filtering-based ELVIS v2 (adaptive filtering and encoding) ---
     start = time.time()
-    print(f"Applying Gaussian blur-based ELVIS v2 adaptive filtering and encoding...")
-    blurred_frames_dir = os.path.join(experiment_dir, "frames", "blurred")
-    os.makedirs(blurred_frames_dir, exist_ok=True)
-    reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f
-                        in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
-    blur_strengths = map_scores_to_strengths(removability_scores, 
-                                            max_value=3.0,
-                                            mapping_type='linear',
-                                            dtype=np.float32)
-    blurred_frames = [apply_adaptive_filtering(img, strengths, block_size,
-                                             filter_func=apply_gaussian_blur,
-                                             min_strength_threshold=0.1)
-                      for img, strengths in zip(reference_frames, blur_strengths)]
-    for i, frame in enumerate(blurred_frames):
-        cv2.imwrite(os.path.join(blurred_frames_dir, f"{i+1:05d}.png"), frame)
-    
-    blurred_video = os.path.join(experiment_dir, "blurred.mp4")
+    print(f"Applying bilateral filtering-based ELVIS v2 adaptive filtering and encoding...")
+    bilateral_frames_dir = os.path.join(experiment_dir, "frames", "bilateral")
+    os.makedirs(bilateral_frames_dir, exist_ok=True)
+    # Apply bilateral filtering to frames based on removability scores
+    bilateral_frames, bilateral_maps = zip(*(filter_frame_bilateral(img, scores, block_size) for img, scores in zip(reference_frames, removability_scores)))
+    for i, frame in enumerate(bilateral_frames):
+        cv2.imwrite(os.path.join(bilateral_frames_dir, f"{i+1:05d}.png"), frame)
+    bilateral_video = os.path.join(experiment_dir, "bilateral_encoded.mp4")
     encode_video(
-        input_frames_dir=blurred_frames_dir,
-        output_video=blurred_video,
+        input_frames_dir=bilateral_frames_dir,
+        output_video=bilateral_video,
         framerate=framerate,
         width=width,
         height=height,
         target_bitrate=target_bitrate
     )
-    
-    # Encode blur strength maps as video for client-side adaptive restoration
-    blur_strengths_video = os.path.join(maps_dir, "blur_strengths.mp4")
-    encode_strength_maps_to_video(
-        strength_maps=blur_strengths,
-        output_video=blur_strengths_video,
+    # Encode bilateral strength maps as video for client-side adaptive restoration
+    bilateral_maps_video = os.path.join(maps_dir, "bilateral_encoded.mp4")
+    encode_strength_maps(
+        strength_maps=list(bilateral_maps),
+        output_video=bilateral_maps_video,
         framerate=framerate
     )
-
     end = time.time()
-    execution_times["elvis_v2_gaussian_blur"] = end - start
-    print(f"Gaussian blur-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+    execution_times["elvis_v2_bilateral"] = end - start
+    print(f"Bilateral filtering-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -2437,20 +2295,17 @@ if __name__ == "__main__":
     # --- ELVIS v1 (stretching and inpainting) ---
     start = time.time()
     print(f"Decoding and stretching ELVIS v1 video...")
-
     # Decode the shrunk video to frames
     removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
     removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
     stretched_frames_dir = os.path.join(experiment_dir, "frames", "stretched")
     if not decode_video(shrunk_video, stretched_frames_dir, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode shrunk video: {shrunk_video}")
-
     # Stretch each frame using the removal masks
     stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")) for i in range(len(removal_masks))]
     stretched_frames = [stretch_frame(img, mask, block_size) for img, mask in zip(stretched_frames, removal_masks)]
     for i, frame in enumerate(stretched_frames):
         cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
-
     # Convert removal_masks to mask images for inpainting (considering block size)
     removal_masks_dir = os.path.join(maps_dir, "removal_masks")
     os.makedirs(removal_masks_dir, exist_ok=True)
@@ -2458,12 +2313,10 @@ if __name__ == "__main__":
         mask_img = (mask * 255).astype(np.uint8)
         mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
         cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
-
     end = time.time()
     execution_times["elvis_v1_stretching"] = end - start
     print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
-
-    # Encode the stretched frames losslessly TODO: this is not needed in practice
+    # Encode the stretched frames losslessly TODO: this is not needed in production
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
     encode_video(
         input_frames_dir=stretched_frames_dir,
@@ -2477,7 +2330,6 @@ if __name__ == "__main__":
     # --- Inpainting with CV2 ---
     start = time.time()
     print(f"Inpainting stretched frames with CV2...")
-
     # Inpaint the stretched frames to fill in removed blocks using CV2
     inpainted_cv2_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_cv2")
     os.makedirs(inpainted_cv2_frames_dir, exist_ok=True)
@@ -2486,12 +2338,10 @@ if __name__ == "__main__":
         mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
         inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
-
     end = time.time()
     execution_times["elvis_v1_inpainting_cv2"] = end - start
     print(f"ELVIS v1 CV2 inpainting completed in {end - start:.2f} seconds.\n")
-
-    # Encode the CV2 inpainted frames losslessly TODO: this is not needed in practice
+    # Encode the CV2 inpainted frames losslessly TODO: this is not needed in production
     inpainted_cv2_video = os.path.join(experiment_dir, "inpainted_cv2.mp4")
     encode_video(
         input_frames_dir=inpainted_cv2_frames_dir,
@@ -2505,10 +2355,8 @@ if __name__ == "__main__":
     # --- Inpainting with ProPainter ---
     start = time.time()
     print(f"Inpainting stretched frames with ProPainter...")
-
     # Inpaint the stretched frames to fill in removed blocks using ProPainter
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
-    
     inpaint_with_propainter(
         stretched_frames_dir=stretched_frames_dir,
         removal_masks_dir=removal_masks_dir,
@@ -2517,12 +2365,10 @@ if __name__ == "__main__":
         height=height,
         framerate=framerate
     )
-
     end = time.time()
     execution_times["elvis_v1_inpainting_propainter"] = end - start
     print(f"ELVIS v1 ProPainter inpainting completed in {end - start:.2f} seconds.\n")
-
-    # Encode the ProPainter inpainted frames losslessly TODO: this is not needed in practice
+    # Encode the ProPainter inpainted frames losslessly TODO: this is not needed in production
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
     encode_video(
         input_frames_dir=inpainted_frames_dir,
@@ -2536,10 +2382,8 @@ if __name__ == "__main__":
     # --- Inpainting with E2FGVI ---
     start = time.time()
     print(f"Inpainting stretched frames with E2FGVI...")
-
     # Inpaint the stretched frames to fill in removed blocks using E2FGVI
     inpainted_e2fgvi_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_e2fgvi")
-    
     inpaint_with_e2fgvi(
         stretched_frames_dir=stretched_frames_dir,
         removal_masks_dir=removal_masks_dir,
@@ -2548,12 +2392,10 @@ if __name__ == "__main__":
         height=height,
         framerate=framerate
     )
-
     end = time.time()
     execution_times["elvis_v1_inpainting_e2fgvi"] = end - start
     print(f"ELVIS v1 E2FGVI inpainting completed in {end - start:.2f} seconds.\n")
-
-    # Encode the E2FGVI inpainted frames losslessly TODO: this is not needed in practice
+    # Encode the E2FGVI inpainted frames losslessly TODO: this is not needed in production
     inpainted_e2fgvi_video = os.path.join(experiment_dir, "inpainted_e2fgvi.mp4")
     encode_video(
         input_frames_dir=inpainted_e2fgvi_frames_dir,
@@ -2566,82 +2408,33 @@ if __name__ == "__main__":
 
 
 
-    # --- DCT Damping-based ELVIS v2: Decode video and apply adaptive restoration ---
-    start = time.time()
-    print(f"Decoding DCT filtered ELVIS v2 video and strength maps...")
-    dct_decoded_frames_dir = os.path.join(experiment_dir, "frames", "dct_decoded")
-    if not decode_video(dct_filtered_video, dct_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
-        raise RuntimeError(f"Failed to decode DCT filtered video: {dct_filtered_video}")
-    
-    # Decode strength maps from compressed video
-    dct_strengths_decoded = decode_strength_maps_from_video(
-        video_path=dct_strengths_video,
-        dtype=np.float32
-    )
-
-    # Adaptive restoration: Apply bilateral filtering with varying strength based on decoded maps
-    print("Restoring DCT filtered frames using adaptive bilateral filtering...")
-    dct_restored_frames_dir = os.path.join(experiment_dir, "frames", "dct_restored")
-    os.makedirs(dct_restored_frames_dir, exist_ok=True)
-    
-    dct_decoded_frames = [cv2.imread(os.path.join(dct_decoded_frames_dir, f"{i+1:05d}.png")) 
-                          for i in range(len(dct_strengths_decoded))]
-    
-    dct_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
-                                                      filter_func=apply_bilateral_deblocking,
-                                                      min_strength_threshold=0.1)
-                           for img, strengths in zip(dct_decoded_frames, dct_strengths_decoded)]
-    
-    for i, frame in enumerate(dct_restored_frames):
-        cv2.imwrite(os.path.join(dct_restored_frames_dir, f"{i+1:05d}.png"), frame)
-
-    # Encode the restored frames
-    dct_restored_video = os.path.join(experiment_dir, "dct_restored.mp4")
-    encode_video(
-        input_frames_dir=dct_restored_frames_dir,
-        output_video=dct_restored_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
-
-    end = time.time()
-    execution_times["elvis_v2_dct_restoration"] = end - start
-    print(f"DCT damping-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
-
-
-
     # --- Downsampling-based ELVIS v2: Decode video and apply adaptive restoration ---
     start = time.time()
     print(f"Decoding downsampled ELVIS v2 video and strength maps...")
-    downsampled_decoded_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
-    if not decode_video(downsampled_video, downsampled_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
+    # Decode the downsampled video to frames
+    downsampled_frames_decoded_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
+    if not decode_video(downsampled_video, downsampled_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode downsampled video: {downsampled_video}")
-    
-    # Decode strength maps from compressed video
-    downsample_strengths_decoded = decode_strength_maps_from_video(
-        video_path=downsample_strengths_video,
-        dtype=np.int32
-    )
-
-    # Adaptive restoration: Apply super-resolution/sharpening with varying strength
-    print("Restoring downsampled frames using adaptive super-resolution...")
+    # Decode the downsampling strength maps video to frames
+    downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
+    strength_maps = decode_strength_maps(downsample_maps_video, block_size, downsampled_maps_decoded_dir)
+    end = time.time()
+    execution_times["elvis_v2_downsampling_decoding"] = end - start
+    print(f"Decoding completed in {end - start:.2f} seconds.\n")
+    start = time.time()
+    print(f"Applying adaptive upsampling restoration for downsampling-based ELVIS v2...")
+    # Apply adaptive upsampling restoration via Real-ESRGAN
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
-    
-    downsampled_decoded_frames = [cv2.imread(os.path.join(downsampled_decoded_frames_dir, f"{i+1:05d}.png")) 
-                                  for i in range(len(downsample_strengths_decoded))]
-    
-    downsampled_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
-                                                             filter_func=apply_super_resolution,
-                                                             min_strength_threshold=1.0)
-                                   for img, strengths in zip(downsampled_decoded_frames, downsample_strengths_decoded)]
-    
-    for i, frame in enumerate(downsampled_restored_frames):
-        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), frame)
-
-    # Encode the restored frames
+    for i in range(len(reference_frames)):
+        decoded_frame = cv2.imread(os.path.join(downsampled_frames_decoded_dir, f"{i+1:05d}.png"))
+        downscale_map = strength_maps[i]
+        restored_frame = upscale_realesrgan_adaptive(decoded_frame, downscale_map, block_size)
+        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    end = time.time()
+    execution_times["elvis_v2_downsampling_restoration"] = end - start
+    print(f"Adaptive upsampling restoration completed in {end - start:.2f} seconds.\n")
+    # Encode the restored frames losslessly TODO: this is not needed in production
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
     encode_video(
         input_frames_dir=downsampled_restored_frames_dir,
@@ -2652,55 +2445,44 @@ if __name__ == "__main__":
         target_bitrate=None
     )
 
-    end = time.time()
-    execution_times["elvis_v2_downsampling_restoration"] = end - start
-    print(f"Downsampling-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
 
 
-
-    # --- Gaussian Blur-based ELVIS v2: Decode video and apply adaptive restoration ---
+    # --- Bilateral Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
     start = time.time()
-    print(f"Decoding blurred ELVIS v2 video and strength maps...")
-    blurred_decoded_frames_dir = os.path.join(experiment_dir, "frames", "blurred_decoded")
-    if not decode_video(blurred_video, blurred_decoded_frames_dir, framerate=framerate, start_number=1, quality=1):
-        raise RuntimeError(f"Failed to decode blurred video: {blurred_video}")
-    
-    # Decode strength maps from compressed video
-    blur_strengths_decoded = decode_strength_maps_from_video(
-        video_path=blur_strengths_video,
-        dtype=np.float32
-    )
-
-    # Adaptive restoration: Apply unsharp masking with varying strength based on decoded maps
-    print("Restoring blurred frames using adaptive unsharp masking...")
-    blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "blurred_restored")
+    print(f"Decoding bilateral ELVIS v2 video and strength maps...")
+    # Decode the bilateral video to frames
+    bilateral_frames_decoded_dir = os.path.join(experiment_dir, "frames", "bilateral_decoded")
+    if not decode_video(bilateral_video, bilateral_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
+        raise RuntimeError(f"Failed to decode bilateral video: {bilateral_video}")
+    # Decode the bilateral strength maps video to frames
+    bilateral_maps_decoded_dir = os.path.join(experiment_dir, "maps", "bilateral_maps_decoded")
+    strength_maps = decode_strength_maps(bilateral_maps_video, block_size, bilateral_maps_decoded_dir)
+    end = time.time()
+    execution_times["elvis_v2_bilateral_decoding"] = end - start
+    print(f"Decoding completed in {end - start:.2f} seconds.\n")
+    start = time.time()
+    print(f"Applying adaptive bilateral filtering restoration for bilateral ELVIS v2...")
+    # Apply adaptive bilateral filtering restoration
+    blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "bilateral_restored")
     os.makedirs(blurred_restored_frames_dir, exist_ok=True)
-    
-    blurred_decoded_frames = [cv2.imread(os.path.join(blurred_decoded_frames_dir, f"{i+1:05d}.png")) 
-                              for i in range(len(blur_strengths_decoded))]
-    
-    blurred_restored_frames = [apply_adaptive_deblocking(img, strengths, block_size,
-                                                         filter_func=apply_unsharp_mask,
-                                                         min_strength_threshold=0.1)
-                               for img, strengths in zip(blurred_decoded_frames, blur_strengths_decoded)]
-    
-    for i, frame in enumerate(blurred_restored_frames):
-        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), frame)
-
-    # Encode the restored frames
-    blurred_restored_video = os.path.join(experiment_dir, "blurred_restored.mp4")
+    for i in range(len(reference_frames)):
+        decoded_frame = cv2.imread(os.path.join(bilateral_frames_decoded_dir, f"{i+1:05d}.png"))
+        bilateral_map = strength_maps[i]
+        restored_frame = adaptive_bilateral_filter(decoded_frame, bilateral_map, block_size)
+        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    end = time.time()
+    execution_times["elvis_v2_bilateral_restoration"] = end - start
+    print(f"Adaptive bilateral filtering restoration completed in {end - start:.2f} seconds.\n")
+    # Encode the restored frames losslessly TODO: this is not needed in production
+    bilateral_restored_video = os.path.join(experiment_dir, "bilateral_restored.mp4")
     encode_video(
         input_frames_dir=blurred_restored_frames_dir,
-        output_video=blurred_restored_video,
+        output_video=bilateral_restored_video,
         framerate=framerate,
         width=width,
         height=height,
         target_bitrate=None
     )
-
-    end = time.time()
-    execution_times["elvis_v2_gaussian_blur_restoration"] = end - start
-    print(f"Gaussian blur-based ELVIS v2 adaptive restoration completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -2711,14 +2493,13 @@ if __name__ == "__main__":
     print("Evaluating and comparing encoding performance...")
     start = time.time()
 
-    # Compare file sizes and quality metrics
+    # Compare file sizes and quality metrics (include metadata)
     video_sizes = {
         "Baseline": os.path.getsize(baseline_video),
+        "ELVIS v1": os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
         "Adaptive": os.path.getsize(adaptive_video),
-        "ELVIS v1": os.path.getsize(shrunk_video),
-        "ELVIS v2 DCT": os.path.getsize(dct_filtered_video),
-        "ELVIS v2 Downsample": os.path.getsize(downsampled_video),
-        "ELVIS v2 Blur": os.path.getsize(blurred_video)
+        "ELVIS v2 Downsample": os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
+        "ELVIS v2 Bilateral": os.path.getsize(bilateral_video) + os.path.getsize(bilateral_maps_video)
     }
 
     duration = len(os.listdir(reference_frames_dir)) / framerate
@@ -2736,7 +2517,7 @@ if __name__ == "__main__":
         "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
         "ELVIS v2 DCT": dct_restored_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
-        "ELVIS v2 Blur": blurred_restored_video
+        "ELVIS v2 Bilateral": bilateral_restored_video
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "maps", "ufo_masks")

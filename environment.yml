@@ -39,6 +39,7 @@ dependencies:
   - conda-forge::matplotlib
   - conda-forge::scikit-image
   - xformers::xformers
+  # Also requires ffmpeg, compatible conda versions are problematic, better to install system-wide
 
   - pip:
     - decord 
@@ -46,3 +47,7 @@ dependencies:
     - dahuffman
     - pytorchvideo
     - lpips
+    # For Real-ESRGAN
+    - basicsr
+    - facexlib
+    - gfpgan
