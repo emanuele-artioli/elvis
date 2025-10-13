@@ -1,6 +1,7 @@
 # conda deactivate && conda remove -n elvis2 --all && cd elvis && conda env create -f environment.yml && conda activate elvis2 && mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain
 # For UFO to work, custom_ufo_test.py needs to be moved to UFO root
 # For Propainter to work, inference_propainter.py needs to be replaced in ProPainter root
+# For Real-ESRGAN to work, version import in Real-ESRGAN/realesrgan/__init__.py needs to be commented out
 name: elvis2
 channels:
   - pytorch
@@ -14,15 +15,15 @@ dependencies:
   - python=3.10
   - pip
 
-  # Pytorch and CUDA (Using 12.4 for better compatibility)
+  # Pytorch and CUDA (Using 12 for compatibility with my GPU, change as needed)
   # Explicitly specify pytorch channel and CUDA version to avoid CPU fallback
-  - pytorch::pytorch=2.5.*
-  - pytorch::torchvision=0.20.*
-  - pytorch::torchaudio=2.5.*
-  - pytorch::pytorch-cuda=12.4
+  - pytorch::pytorch=2.*
+  - pytorch::torchvision=0.16.*
+  - pytorch::torchaudio
+  - pytorch::pytorch-cuda=12.*
   - pytorch::torchtriton
-  - nvidia::cuda-toolkit=12.4
-  - nvidia::cuda-runtime=12.4
+  - nvidia::cuda-toolkit=12.*
+  - nvidia::cuda-runtime=12.*
 
   # Other dependencies
   - conda-forge::pandas 
@@ -38,7 +39,8 @@ dependencies:
   - conda-forge::opencv
   - conda-forge::matplotlib
   - conda-forge::scikit-image
-  - xformers::xformers
+  - conda-forge::numpy<2
+  # - xformers::xformers
   # Also requires ffmpeg, compatible conda versions are problematic, better to install system-wide
 
   - pip:
