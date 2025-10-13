@@ -36,7 +36,7 @@ def calculate_target_bitrate(width: int, height: int, framerate: float, quality_
     pixels_per_second = width * height * framerate
     
     # Base bits per pixel for  (typically 0.1-0.2 for good quality)
-    bits_per_pixel = 0.02 * quality_factor
+    bits_per_pixel = 0.01 * quality_factor
     
     # Calculate target bitrate in bps
     target_bps = int(pixels_per_second * bits_per_pixel)
@@ -889,6 +889,8 @@ def filter_frame_bilateral(image: np.ndarray, frame_scores: np.ndarray, block_si
     new_image = combine_blocks_into_image(processed_blocks)
 
     return new_image, filter_strengths
+
+
 # TODO: check how quality is impacted by different bitrates
 def encode_strength_maps(strength_maps: np.ndarray, output_video: str, framerate: float, target_bitrate: int = 50000) -> None:
     """
@@ -967,11 +969,11 @@ def decode_strength_maps(video_path: str, block_size: int, frames_dir: str) -> n
 
 def upscale_realesrgan_2x(image: np.ndarray, realesrgan_dir: str = "Real-ESRGAN", temp_dir: str = None) -> np.ndarray:
     """
-    Applies Real-ESRGAN 2x upscaling to an image using the realesrgan-ncnn-vulkan executable.
+    Applies Real-ESRGAN 2x upscaling to an image using the Python inference script.
     
     Args:
         image: Input image (H, W, C) in BGR format
-        realesrgan_dir: Path to Real-ESRGAN directory containing the executable
+        realesrgan_dir: Path to Real-ESRGAN directory containing inference_realesrgan.py
         temp_dir: Temporary directory for intermediate files (if None, creates one)
     
     Returns:
@@ -982,40 +984,57 @@ def upscale_realesrgan_2x(image: np.ndarray, realesrgan_dir: str = "Real-ESRGAN"
         temp_dir = tempfile.mkdtemp()
         cleanup_temp = True
     
+    # Save current directory
+    original_dir = os.getcwd()
+    
     try:
         # Get absolute paths
         realesrgan_dir_abs = os.path.abspath(realesrgan_dir)
         temp_dir_abs = os.path.abspath(temp_dir)
         
+        # Create input/output directories
+        input_dir = os.path.join(temp_dir_abs, "input")
+        output_dir = os.path.join(temp_dir_abs, "output")
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        
         # Save input image
-        input_path = os.path.join(temp_dir_abs, "input.png")
-        output_path = os.path.join(temp_dir_abs, "output.png")
+        input_path = os.path.join(input_dir, "input.png")
         cv2.imwrite(input_path, image)
         
-        # Path to Real-ESRGAN executable (absolute)
-        realesrgan_exec = os.path.join(realesrgan_dir_abs, "realesrgan-ncnn-vulkan")
+        # Path to Real-ESRGAN inference script
+        inference_script = os.path.join(realesrgan_dir_abs, "inference_realesrgan.py")
         
-        # Check if executable exists
-        if not os.path.exists(realesrgan_exec):
-            raise FileNotFoundError(f"Real-ESRGAN executable not found at: {realesrgan_exec}")
+        # Check if script exists
+        if not os.path.exists(inference_script):
+            raise FileNotFoundError(f"Real-ESRGAN inference script not found at: {inference_script}")
         
-        # Run Real-ESRGAN with 2x scale
-        # The model files (.bin and .param) must be in the same directory as the executable
+        # Change to Real-ESRGAN directory (may be required for model loading)
+        os.chdir(realesrgan_dir_abs)
+        
+        # Build the command for 2x upscaling
         cmd = [
-            realesrgan_exec,
-            "-i", input_path,
-            "-o", output_path,
-            "-s", "2",  # 2x upscaling
-            "-n", "realesrgan-x4plus"  # Model name (will look for realesrgan-x4plus.bin/.param in cwd)
+            "python", inference_script,
+            "-n", "RealESRGAN_x4plus",  # Model name
+            "-i", input_dir,             # Input folder
+            "-o", output_dir,            # Output folder
+            "-s", "2",                   # 2x upscaling
+            "--suffix", "out",           # Output suffix
+            "--ext", "png"               # Output extension
         ]
         
-        # Run from the realesrgan directory so it can find the model files
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=realesrgan_dir_abs)
+        # Run the inference script
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
             raise RuntimeError(f"Real-ESRGAN failed: {result.stderr}\nStdout: {result.stdout}")
         
-        # Load upscaled image
+        # Load upscaled image (output will be named input_out.png)
+        output_path = os.path.join(output_dir, "input_out.png")
+        
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"Failed to find upscaled image at {output_path}")
+        
         upscaled = cv2.imread(output_path)
         
         if upscaled is None:
@@ -1024,6 +1043,10 @@ def upscale_realesrgan_2x(image: np.ndarray, realesrgan_dir: str = "Real-ESRGAN"
         return upscaled
         
     finally:
+        # Return to original directory
+        os.chdir(original_dir)
+        
+        # Cleanup temp directory if we created it
         if cleanup_temp:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -1069,14 +1092,8 @@ def upscale_realesrgan_adaptive(downsampled_image: np.ndarray, downscale_maps: n
 
         current_block_size = block_size // int(current_factor)
 
-        # Debug: Ensure current_image is expected size and is not black
-        print(f"Size {current_image.shape} Average color before upscaling: {current_image.mean(axis=(0,1))}")
-        
         # 1. Apply Real-ESRGAN 2x to the entire current image
         current_image = upscale_realesrgan_2x(current_image, realesrgan_dir)
-
-        # Debug: Ensure current_image is expected size and is not black
-        print(f"Size {current_image.shape} Average color after upscaling: {current_image.mean(axis=(0,1))}")
 
         # 2. Restore blocks that were downsampled by <= current_factor
         blocks = split_image_into_blocks(current_image, current_block_size)
@@ -1103,7 +1120,70 @@ def upscale_realesrgan_adaptive(downsampled_image: np.ndarray, downscale_maps: n
 
     return current_image
 
-# TODO: add VRT for bilateral restoration (works on other filtering methods too)
+def denoise_vrt_adaptive(frames_folder: str, noise_maps: np.ndarray, block_size: int, vrt_dir: str = "VRT", sigma: float = 10.0) -> np.ndarray:
+    """
+    Applies adaptive VRT denoising to video frames where different blocks may require different levels of denoising.
+    The algorithm works in multiple stages:
+    1. Find max denoising strength and denoise entire video at that level.
+
+    Args:
+        frames_folder: The input folder containing video frames to denoise (BGR format)
+        noise_maps: 2D array (num_blocks_y, num_blocks_x) indicating the noise strength for each block.
+        block_size: The side length of each block in the original resolution
+        vrt_dir: Path to VRT directory
+
+    Returns:
+        The denoised video frames
+    """
+    # Save current directory
+    original_dir = os.getcwd()
+    
+    # Get absolute paths
+    frames_folder_abs = os.path.abspath(frames_folder)
+    vrt_dir_abs = os.path.abspath(vrt_dir)
+    
+    # Create temporary directory for VRT input/output
+    temp_dir = tempfile.mkdtemp()
+    input_dir = os.path.join(temp_dir, "input")
+    output_dir = os.path.join(temp_dir, "output")
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    try:
+        # Copy input frames to VRT input directory
+        frame_files = sorted([f for f in os.listdir(frames_folder_abs) if f.endswith(('.jpg', '.png'))])
+        for i, frame_file in enumerate(frame_files):
+            src_frame = os.path.join(frames_folder_abs, frame_file)
+            dst_frame = os.path.join(input_dir, f"{i+1:05d}.png")
+            shutil.copy(src_frame, dst_frame)
+        
+        # Change to VRT directory (may be required for model loading)
+        os.chdir(vrt_dir_abs)
+        
+        # Build the command for VRT denoising
+        cmd = [
+            "python", "main_test_vrt.py",
+            "--task", "008_VRT_videodenoising_DAVIS",
+            "--sigma", str(sigma),
+            "--folder_lq", input_dir,
+            "--tile", "12", str(block_size), str(block_size),  # Tile size
+            "--tile_overlap", "2", "4", "4",  # Overlap
+            "--save_path", output_dir,
+            "--model_path", "experiments/pretrained_models/001_VRT_videosr_bi_REDS_6frames.pth"
+        ]
+        
+        # Run the VRT denoising script
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"VRT denoising failed: {result.stderr}\nStdout: {result.stdout}")
+        
+        # Load denoised frames
+        denoised_frames = []
+        output_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.png')])
+        for output_file in output_files:
+            img = cv2.imread(os.path.join(output_dir, output_file
+    
 
 # TODO: not used anymore, but we should bring back the blockwise figures at some point
 def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
@@ -2426,11 +2506,11 @@ if __name__ == "__main__":
     # Apply adaptive upsampling restoration via Real-ESRGAN
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
-    for i in range(len(reference_frames)):
-        decoded_frame = cv2.imread(os.path.join(downsampled_frames_decoded_dir, f"{i+1:05d}.png"))
-        downscale_map = strength_maps[i]
-        restored_frame = upscale_realesrgan_adaptive(decoded_frame, downscale_map, block_size)
-        cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    # for i in range(len(reference_frames)):
+    #     decoded_frame = cv2.imread(os.path.join(downsampled_frames_decoded_dir, f"{i+1:05d}.png"))
+    #     downscale_map = strength_maps[i]
+    #     restored_frame = upscale_realesrgan_adaptive(decoded_frame, downscale_map, block_size)
+    #     cv2.imwrite(os.path.join(downsampled_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
     end = time.time()
     execution_times["elvis_v2_downsampling_restoration"] = end - start
     print(f"Adaptive upsampling restoration completed in {end - start:.2f} seconds.\n")
@@ -2447,42 +2527,7 @@ if __name__ == "__main__":
 
 
 
-    # --- Bilateral Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
-    start = time.time()
-    print(f"Decoding bilateral ELVIS v2 video and strength maps...")
-    # Decode the bilateral video to frames
-    bilateral_frames_decoded_dir = os.path.join(experiment_dir, "frames", "bilateral_decoded")
-    if not decode_video(bilateral_video, bilateral_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
-        raise RuntimeError(f"Failed to decode bilateral video: {bilateral_video}")
-    # Decode the bilateral strength maps video to frames
-    bilateral_maps_decoded_dir = os.path.join(experiment_dir, "maps", "bilateral_maps_decoded")
-    strength_maps = decode_strength_maps(bilateral_maps_video, block_size, bilateral_maps_decoded_dir)
-    end = time.time()
-    execution_times["elvis_v2_bilateral_decoding"] = end - start
-    print(f"Decoding completed in {end - start:.2f} seconds.\n")
-    start = time.time()
-    print(f"Applying adaptive bilateral filtering restoration for bilateral ELVIS v2...")
-    # Apply adaptive bilateral filtering restoration
-    blurred_restored_frames_dir = os.path.join(experiment_dir, "frames", "bilateral_restored")
-    os.makedirs(blurred_restored_frames_dir, exist_ok=True)
-    for i in range(len(reference_frames)):
-        decoded_frame = cv2.imread(os.path.join(bilateral_frames_decoded_dir, f"{i+1:05d}.png"))
-        bilateral_map = strength_maps[i]
-        restored_frame = adaptive_bilateral_filter(decoded_frame, bilateral_map, block_size)
-        cv2.imwrite(os.path.join(blurred_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
-    end = time.time()
-    execution_times["elvis_v2_bilateral_restoration"] = end - start
-    print(f"Adaptive bilateral filtering restoration completed in {end - start:.2f} seconds.\n")
-    # Encode the restored frames losslessly TODO: this is not needed in production
-    bilateral_restored_video = os.path.join(experiment_dir, "bilateral_restored.mp4")
-    encode_video(
-        input_frames_dir=blurred_restored_frames_dir,
-        output_video=bilateral_restored_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
+    # --- TODO: Bilateral Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
 
 
 
@@ -2499,7 +2544,7 @@ if __name__ == "__main__":
         "ELVIS v1": os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
         "Adaptive": os.path.getsize(adaptive_video),
         "ELVIS v2 Downsample": os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
-        "ELVIS v2 Bilateral": os.path.getsize(bilateral_video) + os.path.getsize(bilateral_maps_video)
+        # "ELVIS v2 Bilateral": os.path.getsize(bilateral_video) + os.path.getsize(bilateral_maps_video)
     }
 
     duration = len(os.listdir(reference_frames_dir)) / framerate
@@ -2515,9 +2560,8 @@ if __name__ == "__main__":
         "ELVIS v1 CV2": inpainted_cv2_video,
         "ELVIS v1 ProPainter": inpainted_video,
         "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
-        "ELVIS v2 DCT": dct_restored_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
-        "ELVIS v2 Bilateral": bilateral_restored_video
+        # "ELVIS v2 Bilateral": bilateral_restored_video
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "maps", "ufo_masks")
