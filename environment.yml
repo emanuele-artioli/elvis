@@ -40,7 +40,6 @@ dependencies:
   - conda-forge::matplotlib
   - conda-forge::scikit-image
   - conda-forge::numpy<2
-  # - xformers::xformers
   # Also requires ffmpeg, compatible conda versions are problematic, better to install system-wide
 
   - pip:
@@ -53,3 +52,14 @@ dependencies:
     - basicsr
     - facexlib
     - gfpgan
+    # For InstantIR
+    - diffusers==0.30
+    - accelerate
+    - datasets
+    - einops
+    - kornia
+    - peft==0.10.0
+    - pyrallis
+    - tokenizers>=0.14,<0.19
+    - transformers==4.36
+    - gradio

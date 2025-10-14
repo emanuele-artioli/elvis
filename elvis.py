@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from typing import List, Callable, Tuple, Dict
 from skimage.metrics import structural_similarity as ssim
+from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import json
@@ -853,7 +854,7 @@ def filter_frame_downsample(image: np.ndarray, frame_scores: np.ndarray, block_s
     new_image = combine_blocks_into_image(processed_blocks)
 
     return new_image, downsample_maps
-
+# TODO: not in use currently, either implement or remove
 def filter_frame_bilateral(image: np.ndarray, frame_scores: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Applies adaptive bilateral filtering. Higher scores indicate more aggressive filtering.
@@ -890,7 +891,38 @@ def filter_frame_bilateral(image: np.ndarray, frame_scores: np.ndarray, block_si
 
     return new_image, filter_strengths
 
+def filter_frame_gaussian(image: np.ndarray, frame_scores: np.ndarray, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Applies adaptive Gaussian blurring. Higher scores indicate more rounds of blurring.
+    Args:
+        image: The original image for the frame (H, W, C).
+        frame_scores: The 2D array of scores for this frame (num_blocks_y, num_blocks_x).
+        block_size: The side length (l) of each block.
+    Returns:
+        The reconstructed image with blocks adaptively blurred.
+        The blurring strengths (for encoding).
+    """
+    # Split image into blocks
+    blocks = split_image_into_blocks(image, block_size)
 
+    # Map removability scores to blurring rounds (0 to 10)
+    blur_strengths = np.round(frame_scores * 10).astype(np.int32)
+
+    # Apply multiple rounds of Gaussian blur to each block based on its strength
+    processed_blocks = np.zeros_like(blocks)
+    for by in range(blocks.shape[0]):
+        for bx in range(blocks.shape[1]):
+            block = blocks[by, bx]
+            strength = blur_strengths[by, bx]
+            blurred_block = block.copy()
+            for _ in range(strength):
+                blurred_block = cv2.GaussianBlur(blurred_block, (5, 5), sigmaX=1.0)
+            processed_blocks[by, bx] = blurred_block
+
+    # Reconstruct the final image from the processed blocks
+    new_image = combine_blocks_into_image(processed_blocks)
+
+    return new_image, blur_strengths
 # TODO: check how quality is impacted by different bitrates
 def encode_strength_maps(strength_maps: np.ndarray, output_video: str, framerate: float, target_bitrate: int = 50000) -> None:
     """
@@ -927,12 +959,12 @@ def encode_strength_maps(strength_maps: np.ndarray, output_video: str, framerate
         target_bitrate=target_bitrate,
         pix_fmt="gray"
     )
-# TODO: apply slight median or bilateral filter before normalization to reduce compression artifacts?
+# TODO: apply slight median or gaussian filter before normalization to reduce compression artifacts?
 def decode_strength_maps(video_path: str, block_size: int, frames_dir: str) -> np.ndarray:
     """
     Decodes strength maps from a compressed video and attempts to revert encoding artifacts.
     Min/max values are set:
-    For bilateral filtering: min=0, max=15
+    For gaussian filtering: min=0, max=10
     For downsampling: min=0, max=int(log2(block_size))
     
     Args:
@@ -943,9 +975,9 @@ def decode_strength_maps(video_path: str, block_size: int, frames_dir: str) -> n
     Returns:
         3D array of strength values with shape (num_frames, num_blocks_y, num_blocks_x)
     """
-    # Figure out whether it's bilateral or downsampling based on filename
-    if "bilateral" in video_path:
-        min_val, max_val = 0.0, 15.0
+    # Figure out whether it's gaussian or downsampling based on filename
+    if "gaussian" in video_path:
+        min_val, max_val = 0.0, 10.0
     elif "downsample" in video_path:
         min_val, max_val = 0.0, int(np.log2(block_size))
 
@@ -1120,70 +1152,107 @@ def upscale_realesrgan_adaptive(downsampled_image: np.ndarray, downscale_maps: n
 
     return current_image
 
-def denoise_vrt_adaptive(frames_folder: str, noise_maps: np.ndarray, block_size: int, vrt_dir: str = "VRT", sigma: float = 10.0) -> np.ndarray:
+def restore_with_instantir(input_image: np.ndarray, instantir_dir: str = "InstantIR", instantir_weights_dir: str = None, temp_dir: str = None, num_inference_steps: int = 30, cfg: float = 7.0, creative_start: float = 1.0, preview_start: float = 0.0, seed: int = 42) -> np.ndarray:
     """
-    Applies adaptive VRT denoising to video frames where different blocks may require different levels of denoising.
-    The algorithm works in multiple stages:
-    1. Find max denoising strength and denoise entire video at that level.
-
+    Applies InstantIR blind image restoration to a single frame.
+    
+    This function uses InstantIR to restore degraded images (e.g., blurred, low-quality)
+    to high-quality versions using a diffusion-based approach.
+    
     Args:
-        frames_folder: The input folder containing video frames to denoise (BGR format)
-        noise_maps: 2D array (num_blocks_y, num_blocks_x) indicating the noise strength for each block.
-        block_size: The side length of each block in the original resolution
-        vrt_dir: Path to VRT directory
-
+        input_image: Input image (H, W, C) in BGR format (OpenCV format)
+        instantir_dir: Path to InstantIR repository directory
+        instantir_weights_dir: Path to directory containing InstantIR weights (adapter.pt, aggregator.pt)
+                              If None, uses instantir_dir/models
+        temp_dir: Temporary directory for intermediate files (if None, creates one)
+        num_inference_steps: Number of diffusion inference steps (default: 30)
+        cfg: Classifier-Free Guidance scale (default: 7.0)
+        creative_start: Proportion of timesteps for creative restoration (default: 1.0 = no creative)
+        preview_start: Proportion to stop previewing at beginning to enhance fidelity (default: 0.0)
+        seed: Random seed for reproducibility (default: 42)
+    
     Returns:
-        The denoised video frames
+        Restored image (H, W, C) in BGR format
     """
+    cleanup_temp = False
+    if temp_dir is None:
+        temp_dir = tempfile.mkdtemp()
+        cleanup_temp = True
+    
+    if instantir_weights_dir is None:
+        instantir_weights_dir = os.path.join(instantir_dir, "models")
+    
     # Save current directory
     original_dir = os.getcwd()
     
-    # Get absolute paths
-    frames_folder_abs = os.path.abspath(frames_folder)
-    vrt_dir_abs = os.path.abspath(vrt_dir)
-    
-    # Create temporary directory for VRT input/output
-    temp_dir = tempfile.mkdtemp()
-    input_dir = os.path.join(temp_dir, "input")
-    output_dir = os.path.join(temp_dir, "output")
-    os.makedirs(input_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-    
     try:
-        # Copy input frames to VRT input directory
-        frame_files = sorted([f for f in os.listdir(frames_folder_abs) if f.endswith(('.jpg', '.png'))])
-        for i, frame_file in enumerate(frame_files):
-            src_frame = os.path.join(frames_folder_abs, frame_file)
-            dst_frame = os.path.join(input_dir, f"{i+1:05d}.png")
-            shutil.copy(src_frame, dst_frame)
+        # Create temp directories for input/output
+        input_dir = os.path.join(temp_dir, "instantir_input")
+        output_dir = os.path.join(temp_dir, "instantir_output")
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Change to VRT directory (may be required for model loading)
-        os.chdir(vrt_dir_abs)
+        # Save input image (convert BGR to RGB for PIL)
+        input_path = os.path.join(input_dir, "input.png")
+        input_rgb = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+        Image.fromarray(input_rgb).save(input_path)
         
-        # Build the command for VRT denoising
+        # Get absolute paths
+        instantir_abs = os.path.abspath(instantir_dir)
+        instantir_weights_abs = os.path.abspath(instantir_weights_dir)
+        
+        # Use HuggingFace repo IDs instead of local paths for base models
+        sdxl_path = "stabilityai/stable-diffusion-xl-base-1.0"
+        vision_encoder_path = "facebook/dinov2-large"
+        
+        # Change to InstantIR directory to run inference
+        os.chdir(instantir_abs)
+        
+        # Build command
         cmd = [
-            "python", "main_test_vrt.py",
-            "--task", "008_VRT_videodenoising_DAVIS",
-            "--sigma", str(sigma),
-            "--folder_lq", input_dir,
-            "--tile", "12", str(block_size), str(block_size),  # Tile size
-            "--tile_overlap", "2", "4", "4",  # Overlap
-            "--save_path", output_dir,
-            "--model_path", "experiments/pretrained_models/001_VRT_videosr_bi_REDS_6frames.pth"
+            "python", "infer.py",
+            "--sdxl_path", sdxl_path,
+            "--vision_encoder_path", vision_encoder_path,
+            "--instantir_path", instantir_weights_abs,
+            "--test_path", os.path.abspath(input_path),
+            "--out_path", os.path.abspath(output_dir),
+            "--num_inference_steps", str(num_inference_steps),
+            "--cfg", str(cfg),
+            "--creative_start", str(creative_start),
+            "--preview_start", str(preview_start),
+            "--seed", str(seed),
+            "--batch_size", "1"
         ]
         
-        # Run the VRT denoising script
+        # Run InstantIR inference
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            raise RuntimeError(f"VRT denoising failed: {result.stderr}\nStdout: {result.stdout}")
+            print(f"InstantIR stderr: {result.stderr}")
+            raise RuntimeError(f"InstantIR restoration failed: {result.stderr}")
         
-        # Load denoised frames
-        denoised_frames = []
-        output_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.png')])
-        for output_file in output_files:
-            img = cv2.imread(os.path.join(output_dir, output_file
-    
+        # Load restored image
+        output_path = os.path.join(output_dir, "input.png")
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"InstantIR output not found at {output_path}")
+        
+        # Load and convert back to BGR
+        restored_rgb = np.array(Image.open(output_path))
+        restored_bgr = cv2.cvtColor(restored_rgb, cv2.COLOR_RGB2BGR)
+        
+        return restored_bgr
+        
+    except Exception as e:
+        print(f"Error in InstantIR restoration: {str(e)}")
+        raise
+    finally:
+        # Change back to original directory
+        os.chdir(original_dir)
+        
+        # Cleanup temp directory if we created it
+        if cleanup_temp and os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir)
 
 # TODO: not used anymore, but we should bring back the blockwise figures at some point
 def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
@@ -2193,10 +2262,10 @@ if __name__ == "__main__":
 
     print("Converting video to raw YUV format...")
     raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
-    os.system(f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
+    # os.system(f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}")
 
     print("Extracting reference frames...")
-    os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png")
+    # os.system(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png")
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in sorted(os.listdir(reference_frames_dir)) if f.endswith('.png')]
 
     end = time.time()
@@ -2232,14 +2301,14 @@ if __name__ == "__main__":
     print(f"Encoding reference frames with two-pass for baseline comparison...")
     baseline_video = os.path.join(experiment_dir, "baseline.mp4")
     # Encode the baseline video
-    encode_video(
-        input_frames_dir=reference_frames_dir,
-        output_video=baseline_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
+    # encode_video(
+    #     input_frames_dir=reference_frames_dir,
+    #     output_video=baseline_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=target_bitrate
+    # )
     end = time.time()
     execution_times["baseline_encoding"] = end - start
     print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
@@ -2253,27 +2322,27 @@ if __name__ == "__main__":
     shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
     shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
-    for i, frame in enumerate(shrunk_frames):
-        cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
+    # for i, frame in enumerate(shrunk_frames):
+    #     cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
     # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
     shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
     shrunk_width = shrunk_frames[0].shape[1]  # Width is reduced due to removed blocks
-    encode_video(
-        input_frames_dir=shrunk_frames_dir,
-        output_video=shrunk_video,
-        framerate=framerate,
-        width=shrunk_width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
+    # encode_video(
+    #     input_frames_dir=shrunk_frames_dir,
+    #     output_video=shrunk_video,
+    #     framerate=framerate,
+    #     width=shrunk_width,
+    #     height=height,
+    #     target_bitrate=target_bitrate
+    # )
     # Save compressed metadata about removed blocks
     removal_masks = np.array(removal_masks, dtype=np.uint8)
     masks_packed = np.packbits(removal_masks)
-    np.savez(
-        os.path.join(experiment_dir, 
-        f"shrink_masks_{block_size}.npz"), 
-        packed=masks_packed, shape=removal_masks.shape
-    )
+    # np.savez(
+    #     os.path.join(experiment_dir, 
+    #     f"shrink_masks_{block_size}.npz"), 
+    #     packed=masks_packed, shape=removal_masks.shape
+    # )
     end = time.time()
     execution_times["elvis_v1_shrinking"] = end - start
     print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
@@ -2286,18 +2355,18 @@ if __name__ == "__main__":
     adaptive_video = os.path.join(experiment_dir, "adaptive.mp4")
     maps_dir = os.path.join(experiment_dir, "maps")
     qp_maps_dir = os.path.join(maps_dir, "qp_maps")
-    encode_with_roi(
-        input_frames_dir=reference_frames_dir,
-        output_video=adaptive_video,
-        removability_scores=removability_scores,
-        block_size=block_size,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=target_bitrate,
-        save_qp_maps=True,
-        qp_maps_dir=qp_maps_dir
-    )
+    # encode_with_roi(
+    #     input_frames_dir=reference_frames_dir,
+    #     output_video=adaptive_video,
+    #     removability_scores=removability_scores,
+    #     block_size=block_size,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=target_bitrate,
+    #     save_qp_maps=True,
+    #     qp_maps_dir=qp_maps_dir
+    # )
     end = time.time()
     execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
@@ -2311,58 +2380,58 @@ if __name__ == "__main__":
     os.makedirs(downsampled_frames_dir, exist_ok=True)
     # Downsample frames based on removability scores
     downsampled_frames, downsample_maps = zip(*(filter_frame_downsample(img, scores, block_size) for img, scores in zip(reference_frames, removability_scores)))
-    for i, frame in enumerate(downsampled_frames):
-        cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.png"), frame)
+    # for i, frame in enumerate(downsampled_frames):
+    #     cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.png"), frame)
     downsampled_video = os.path.join(experiment_dir, "downsampled_encoded.mp4")
-    encode_video(
-        input_frames_dir=downsampled_frames_dir,
-        output_video=downsampled_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
+    # encode_video(
+    #     input_frames_dir=downsampled_frames_dir,
+    #     output_video=downsampled_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=target_bitrate
+    # )
     # Encode downsampling maps as video for client-side adaptive restoration
     downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
-    encode_strength_maps(
-        strength_maps=list(downsample_maps),
-        output_video=downsample_maps_video,
-        framerate=framerate
-    )
+    # encode_strength_maps(
+    #     strength_maps=list(downsample_maps),
+    #     output_video=downsample_maps_video,
+    #     framerate=framerate
+    # )
     end = time.time()
     execution_times["elvis_v2_downsampling"] = end - start
     print(f"Downsampling-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
 
 
-    # --- Bilateral Filtering-based ELVIS v2 (adaptive filtering and encoding) ---
+    # --- Gaussian blur Filtering-based ELVIS v2 (adaptive filtering and encoding) ---
     start = time.time()
-    print(f"Applying bilateral filtering-based ELVIS v2 adaptive filtering and encoding...")
-    bilateral_frames_dir = os.path.join(experiment_dir, "frames", "bilateral")
-    os.makedirs(bilateral_frames_dir, exist_ok=True)
-    # Apply bilateral filtering to frames based on removability scores
-    bilateral_frames, bilateral_maps = zip(*(filter_frame_bilateral(img, scores, block_size) for img, scores in zip(reference_frames, removability_scores)))
-    for i, frame in enumerate(bilateral_frames):
-        cv2.imwrite(os.path.join(bilateral_frames_dir, f"{i+1:05d}.png"), frame)
-    bilateral_video = os.path.join(experiment_dir, "bilateral_encoded.mp4")
-    encode_video(
-        input_frames_dir=bilateral_frames_dir,
-        output_video=bilateral_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=target_bitrate
-    )
-    # Encode bilateral strength maps as video for client-side adaptive restoration
-    bilateral_maps_video = os.path.join(maps_dir, "bilateral_encoded.mp4")
-    encode_strength_maps(
-        strength_maps=list(bilateral_maps),
-        output_video=bilateral_maps_video,
-        framerate=framerate
-    )
+    print(f"Applying Gaussian blur Filtering-based ELVIS v2 adaptive filtering and encoding...")
+    gaussian_frames_dir = os.path.join(experiment_dir, "frames", "gaussian")
+    os.makedirs(gaussian_frames_dir, exist_ok=True)
+    # Apply Gaussian blur filtering to frames based on removability scores
+    gaussian_frames, gaussian_maps = zip(*(filter_frame_gaussian(img, scores, block_size) for img, scores in zip(reference_frames, removability_scores)))
+    # for i, frame in enumerate(gaussian_frames):
+    #     cv2.imwrite(os.path.join(gaussian_frames_dir, f"{i+1:05d}.png"), frame)
+    gaussian_video = os.path.join(experiment_dir, "gaussian_encoded.mp4")
+    # encode_video(
+    #     input_frames_dir=gaussian_frames_dir,
+    #     output_video=gaussian_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=target_bitrate
+    # )
+    # Encode gaussian strength maps as video for client-side adaptive restoration
+    gaussian_maps_video = os.path.join(maps_dir, "gaussian_encoded.mp4")
+    # encode_strength_maps(
+    #     strength_maps=list(gaussian_maps),
+    #     output_video=gaussian_maps_video,
+    #     framerate=framerate
+    # )
     end = time.time()
-    execution_times["elvis_v2_bilateral"] = end - start
-    print(f"Bilateral filtering-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+    execution_times["elvis_v2_gaussian"] = end - start
+    print(f"Gaussian blur filtering-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
 
 
@@ -2384,28 +2453,28 @@ if __name__ == "__main__":
     # Stretch each frame using the removal masks
     stretched_frames = [cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")) for i in range(len(removal_masks))]
     stretched_frames = [stretch_frame(img, mask, block_size) for img, mask in zip(stretched_frames, removal_masks)]
-    for i, frame in enumerate(stretched_frames):
-        cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
+    # for i, frame in enumerate(stretched_frames):
+    #     cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
     # Convert removal_masks to mask images for inpainting (considering block size)
     removal_masks_dir = os.path.join(maps_dir, "removal_masks")
     os.makedirs(removal_masks_dir, exist_ok=True)
-    for i, mask in enumerate(removal_masks):
-        mask_img = (mask * 255).astype(np.uint8)
-        mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
-        cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
+    # for i, mask in enumerate(removal_masks):
+    #     mask_img = (mask * 255).astype(np.uint8)
+    #     mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
+    #     cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
     end = time.time()
     execution_times["elvis_v1_stretching"] = end - start
     print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
     # Encode the stretched frames losslessly TODO: this is not needed in production
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
-    encode_video(
-        input_frames_dir=stretched_frames_dir,
-        output_video=stretched_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
+    # encode_video(
+    #     input_frames_dir=stretched_frames_dir,
+    #     output_video=stretched_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=None
+    # )
 
     # --- Inpainting with CV2 ---
     start = time.time()
@@ -2413,78 +2482,78 @@ if __name__ == "__main__":
     # Inpaint the stretched frames to fill in removed blocks using CV2
     inpainted_cv2_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_cv2")
     os.makedirs(inpainted_cv2_frames_dir, exist_ok=True)
-    for i in range(len(removal_masks)):
-        stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"))
-        mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
-        inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
+    # for i in range(len(removal_masks)):
+    #     stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"))
+    #     mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
+    #     inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    #     cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
     end = time.time()
     execution_times["elvis_v1_inpainting_cv2"] = end - start
     print(f"ELVIS v1 CV2 inpainting completed in {end - start:.2f} seconds.\n")
     # Encode the CV2 inpainted frames losslessly TODO: this is not needed in production
     inpainted_cv2_video = os.path.join(experiment_dir, "inpainted_cv2.mp4")
-    encode_video(
-        input_frames_dir=inpainted_cv2_frames_dir,
-        output_video=inpainted_cv2_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
+    # encode_video(
+    #     input_frames_dir=inpainted_cv2_frames_dir,
+    #     output_video=inpainted_cv2_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=None
+    # )
 
     # --- Inpainting with ProPainter ---
     start = time.time()
     print(f"Inpainting stretched frames with ProPainter...")
     # Inpaint the stretched frames to fill in removed blocks using ProPainter
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
-    inpaint_with_propainter(
-        stretched_frames_dir=stretched_frames_dir,
-        removal_masks_dir=removal_masks_dir,
-        output_frames_dir=inpainted_frames_dir,
-        width=width,
-        height=height,
-        framerate=framerate
-    )
+    # inpaint_with_propainter(
+    #     stretched_frames_dir=stretched_frames_dir,
+    #     removal_masks_dir=removal_masks_dir,
+    #     output_frames_dir=inpainted_frames_dir,
+    #     width=width,
+    #     height=height,
+    #     framerate=framerate
+    # )
     end = time.time()
     execution_times["elvis_v1_inpainting_propainter"] = end - start
     print(f"ELVIS v1 ProPainter inpainting completed in {end - start:.2f} seconds.\n")
     # Encode the ProPainter inpainted frames losslessly TODO: this is not needed in production
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
-    encode_video(
-        input_frames_dir=inpainted_frames_dir,
-        output_video=inpainted_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
+    # encode_video(
+    #     input_frames_dir=inpainted_frames_dir,
+    #     output_video=inpainted_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=None
+    # )
 
     # --- Inpainting with E2FGVI ---
     start = time.time()
     print(f"Inpainting stretched frames with E2FGVI...")
     # Inpaint the stretched frames to fill in removed blocks using E2FGVI
     inpainted_e2fgvi_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_e2fgvi")
-    inpaint_with_e2fgvi(
-        stretched_frames_dir=stretched_frames_dir,
-        removal_masks_dir=removal_masks_dir,
-        output_frames_dir=inpainted_e2fgvi_frames_dir,
-        width=width,
-        height=height,
-        framerate=framerate
-    )
+    # inpaint_with_e2fgvi(
+    #     stretched_frames_dir=stretched_frames_dir,
+    #     removal_masks_dir=removal_masks_dir,
+    #     output_frames_dir=inpainted_e2fgvi_frames_dir,
+    #     width=width,
+    #     height=height,
+    #     framerate=framerate
+    # )
     end = time.time()
     execution_times["elvis_v1_inpainting_e2fgvi"] = end - start
     print(f"ELVIS v1 E2FGVI inpainting completed in {end - start:.2f} seconds.\n")
     # Encode the E2FGVI inpainted frames losslessly TODO: this is not needed in production
     inpainted_e2fgvi_video = os.path.join(experiment_dir, "inpainted_e2fgvi.mp4")
-    encode_video(
-        input_frames_dir=inpainted_e2fgvi_frames_dir,
-        output_video=inpainted_e2fgvi_video,
-        framerate=framerate,
-        width=width,
-        height=height,
-        target_bitrate=None
-    )
+    # encode_video(
+    #     input_frames_dir=inpainted_e2fgvi_frames_dir,
+    #     output_video=inpainted_e2fgvi_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=None
+    # )
 
 
 
@@ -2516,18 +2585,62 @@ if __name__ == "__main__":
     print(f"Adaptive upsampling restoration completed in {end - start:.2f} seconds.\n")
     # Encode the restored frames losslessly TODO: this is not needed in production
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
+    # encode_video(
+    #     input_frames_dir=downsampled_restored_frames_dir,
+    #     output_video=downsampled_restored_video,
+    #     framerate=framerate,
+    #     width=width,
+    #     height=height,
+    #     target_bitrate=None
+    # )
+
+
+
+    # --- Gaussian blur Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
+    start = time.time()
+    print(f"Decoding Gaussian blur filtered ELVIS v2 video and strength maps...")
+    # Decode the Gaussian video to frames
+    gaussian_frames_decoded_dir = os.path.join(experiment_dir, "frames", "gaussian_decoded")
+    # if not decode_video(gaussian_video, gaussian_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
+    #     raise RuntimeError(f"Failed to decode Gaussian video: {gaussian_video}")
+    # Decode the Gaussian strength maps video to frames
+    gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
+    strength_maps_gaussian = decode_strength_maps(gaussian_maps_video, block_size, gaussian_maps_decoded_dir)
+    end = time.time()
+    execution_times["elvis_v2_gaussian_decoding"] = end - start
+    print(f"Decoding completed in {end - start:.2f} seconds.\n")
+    start = time.time()
+    print(f"Applying adaptive deblurring restoration for Gaussian blur filtering-based ELVIS v2...")
+    # Apply adaptive deblurring restoration via InstantIR
+    gaussian_restored_frames_dir = os.path.join(experiment_dir, "frames", "gaussian_restored")
+    os.makedirs(gaussian_restored_frames_dir, exist_ok=True)
+    
+    # Restore each frame with InstantIR
+    for i in range(len(reference_frames)):
+        decoded_frame = cv2.imread(os.path.join(gaussian_frames_decoded_dir, f"{i+1:05d}.png"))
+        restored_frame = restore_with_instantir(
+            input_image=decoded_frame,
+            instantir_dir="InstantIR",
+            num_inference_steps=2,
+            cfg=7.0,
+            creative_start=1.0,  # No creative restoration, preserve fidelity
+            preview_start=0.0
+        )
+        cv2.imwrite(os.path.join(gaussian_restored_frames_dir, f"{i+1:05d}.png"), restored_frame)
+    
+    end = time.time()
+    execution_times["elvis_v2_gaussian_restoration"] = end - start
+    print(f"Adaptive deblurring restoration completed in {end - start:.2f} seconds.\n")
+    # Encode the restored frames losslessly TODO: this is not needed in production
+    gaussian_restored_video = os.path.join(experiment_dir, "gaussian_restored.mp4")
     encode_video(
-        input_frames_dir=downsampled_restored_frames_dir,
-        output_video=downsampled_restored_video,
+        input_frames_dir=gaussian_restored_frames_dir,
+        output_video=gaussian_restored_video,
         framerate=framerate,
         width=width,
         height=height,
         target_bitrate=None
     )
-
-
-
-    # --- TODO: Bilateral Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
 
 
 
@@ -2544,7 +2657,7 @@ if __name__ == "__main__":
         "ELVIS v1": os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
         "Adaptive": os.path.getsize(adaptive_video),
         "ELVIS v2 Downsample": os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
-        # "ELVIS v2 Bilateral": os.path.getsize(bilateral_video) + os.path.getsize(bilateral_maps_video)
+        "ELVIS v2 Gaussian": os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video)
     }
 
     duration = len(os.listdir(reference_frames_dir)) / framerate
@@ -2561,7 +2674,7 @@ if __name__ == "__main__":
         "ELVIS v1 ProPainter": inpainted_video,
         "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
-        # "ELVIS v2 Bilateral": bilateral_restored_video
+        "ELVIS v2 Gaussian": gaussian_restored_video
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "maps", "ufo_masks")
@@ -2588,6 +2701,7 @@ if __name__ == "__main__":
     analysis_results["execution_times_seconds"] = execution_times
 
     # Add video parameters to the results dictionary
+    analysis_results["video_name"] = reference_video
     analysis_results["video_length_seconds"] = frame_count / framerate
     analysis_results["video_framerate"] = framerate
     analysis_results["video_resolution"] = f"{width}x{height}"
