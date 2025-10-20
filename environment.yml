@@ -63,3 +63,10 @@ dependencies:
     - tokenizers>=0.14,<0.19
     - transformers==4.36
     - gradio
+    # Install repos from git
+    # - git+https://github.com/sczhou/ProPainter.git
+    # - git+https://github.com/MCG-NKU/E2FGVI.git
+    # - git+https://github.com/xinntao/Real-ESRGAN.git
+    # - git+https://github.com/ZiyuGuo99/InstantIR.git
+    # - git+https://github.com/ragor114/PyTorch-Frechet-Video-Distance.git
+    - git+https://github.com/emanuele-artioli/UFO.git@main

@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 import cv2
 import numpy as np
-from typing import List, Callable, Tuple, Dict
+from typing import List, Callable, Tuple, Dict, Optional
 from skimage.metrics import structural_similarity as ssim
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -103,35 +103,107 @@ def calculate_removability_scores(raw_video_file: str, reference_frames_folder: 
         else:
             print("EVCA completed successfully")
         
-        # Calculate ROI with UFO
-        print("Running UFO for object detection...")
-        # Use the internal UFO repository within elvis
-        # UFO expects a class subdirectory structure
-        UFO_class_folder = os.path.join(original_dir, "UFO", "datasets", "elvis", "image", "reference_frames")
-        if os.path.exists(UFO_class_folder):
-            shutil.rmtree(UFO_class_folder)
-        os.makedirs(os.path.dirname(UFO_class_folder), exist_ok=True)
-        shutil.copytree(reference_frames_abs, UFO_class_folder)
-        
-        # Change to the internal UFO directory
-        ufo_dir = os.path.join(original_dir, "UFO")
-        os.chdir(ufo_dir)
-        ufo_cmd = "python custom_ufo_test.py --model='weights/video_best.pth' --data_path='datasets/elvis' --output_dir='VSOD_results/wo_optical_flow/elvis' --task='VSOD'"
-        result = subprocess.run(ufo_cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"UFO command failed: {result.stderr}")
-            raise RuntimeError(f"UFO execution failed: {result.stderr}")
-        
-        # Move UFO masks to working directory
-        mask_source = os.path.join(ufo_dir, "VSOD_results", "wo_optical_flow", "elvis", "reference_frames")
-        if os.path.exists(mask_source):
-            for mask_file in os.listdir(mask_source):
-                src_path = os.path.join(mask_source, mask_file)
-                dst_path = os.path.join(ufo_masks_abs, mask_file)
-                shutil.move(src_path, dst_path)
-        
-        # Return to original directory
-        os.chdir(original_dir)
+        # Calculate ROI with UFO (use installed `ufo` package when possible)
+        print("Running UFO for object detection (using installed package if available)...")
+
+        # Prepare a small temporary dataset structure for UFO under working_dir
+        ufo_dataset_root = os.path.join(working_dir, "ufo_dataset")
+        ufo_image_dir = os.path.join(ufo_dataset_root, "image")
+        ufo_class_dir = os.path.join(ufo_image_dir, "ref")
+        # Ensure clean dataset dir
+        shutil.rmtree(ufo_dataset_root, ignore_errors=True)
+        os.makedirs(ufo_class_dir, exist_ok=True)
+
+        # Copy reference frames into the temporary UFO class folder
+        for fname in sorted(os.listdir(reference_frames_abs)):
+            src = os.path.join(reference_frames_abs, fname)
+            dst = os.path.join(ufo_class_dir, fname)
+            shutil.copy(src, dst)
+
+        # Helper to locate or download UFO weights in the installed package
+        def _find_ufo_weights():
+            candidate_names = [
+                'model_best.pth', 'video_best.pth', 'ufo_weights.pth',
+                'video_weights.pth', 'weights.pth'
+            ]
+            try:
+                import importlib
+                ufo_pkg = importlib.import_module('ufo')
+                pkg_weights_dir = Path(ufo_pkg.__file__).parent / 'weights'
+            except Exception:
+                pkg_weights_dir = Path(working_dir) / 'weights'
+
+            for n in candidate_names:
+                p = pkg_weights_dir / n
+                if p.exists():
+                    return str(p)
+
+            # Try the bundled downloader if available
+            try:
+                downloader = importlib.import_module('ufo.download_ufo_weights')
+                if hasattr(downloader, 'main'):
+                    downloaded = downloader.main()
+                    if downloaded:
+                        return str(downloaded)
+            except Exception:
+                pass
+
+            return None
+
+        model_path_for_ufo = _find_ufo_weights() or 'weights/video_best.pth'
+
+        # Try running the installed package programmatically first
+        device_str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        ran_ufo = False
+        try:
+            import importlib
+            ufo_test = importlib.import_module('ufo.test')
+            # debug_test expects: gpu_id, model_path, datapath(list), save_root_path(list), group_size, img_size, img_dir_name
+            ufo_test.debug_test(device_str, model_path_for_ufo, [ufo_dataset_root], [ufo_masks_abs], 5, 224, 'image')
+            ran_ufo = True
+        except Exception as e:
+            print(f"Programmatic UFO run failed or package not available: {e}")
+
+        # Fallback: try invoking the module as a subprocess (python -m ufo.test)
+        if not ran_ufo:
+            try:
+                ufo_cmd = f"python -m ufo.test --model='{model_path_for_ufo}' --data_path='{ufo_dataset_root}' --output_dir='{ufo_masks_abs}' --task='VSOD' --gpu_id='{device_str}'"
+                result = subprocess.run(ufo_cmd, shell=True, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"UFO subprocess failed: {result.stderr}")
+                    raise RuntimeError(f"UFO execution failed: {result.stderr}")
+            except Exception as e:
+                print(f"UFO execution (programmatic and subprocess) both failed: {e}")
+                raise
+
+        # UFO typically writes outputs into class subdirectories under the output dir
+        # Flatten any nested class folders so mask files are directly inside ufo_masks_abs
+        for root, dirs, files in os.walk(ufo_masks_abs):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                target = os.path.join(ufo_masks_abs, fname)
+                # If file already directly under ufo_masks_abs, skip
+                if os.path.dirname(fpath) == ufo_masks_abs:
+                    continue
+                try:
+                    shutil.move(fpath, target)
+                except Exception:
+                    try:
+                        shutil.copy(fpath, target)
+                    except Exception:
+                        pass
+
+        # Remove any leftover empty directories under ufo_masks_abs
+        for dirpath, dirnames, filenames in os.walk(ufo_masks_abs, topdown=False):
+            if dirpath == ufo_masks_abs:
+                continue
+            try:
+                os.rmdir(dirpath)
+            except Exception:
+                pass
+
+        # Cleanup temporary dataset
+        shutil.rmtree(ufo_dataset_root, ignore_errors=True)
         
         # Load the CSV files from EVCA
         temporal_csv_path = os.path.join(evca_dir, "evca_TC_blocks.csv")
