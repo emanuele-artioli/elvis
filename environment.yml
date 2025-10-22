@@ -1,4 +1,4 @@
-# conda deactivate && conda remove -n elvis2 --all && cd elvis && conda env create -f environment.yml && conda activate elvis2 && mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain
+# conda deactivate && conda remove -n elvis2 --all && cd elvis && conda env create -f environment.yml && conda activate elvis2 && mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain==1.0.2
 # For UFO to work, custom_ufo_test.py needs to be moved to UFO root
 # For Propainter to work, inference_propainter.py needs to be replaced in ProPainter root
 # For Real-ESRGAN to work, version import in Real-ESRGAN/realesrgan/__init__.py needs to be commented out
@@ -36,11 +36,11 @@ dependencies:
   - conda-forge::timm
   - conda-forge::openmim
   - conda-forge::pywavelets
-  - conda-forge::opencv
+  # - conda-forge::opencv
   - conda-forge::matplotlib
   - conda-forge::scikit-image
   - conda-forge::numpy<2
-  # Also requires ffmpeg, compatible conda versions are problematic, better to install system-wide
+  # Also requires ffmpeg, compatible conda versions are old, better to install system-wide
 
   - pip:
     - decord 
@@ -48,6 +48,7 @@ dependencies:
     - dahuffman
     - pytorchvideo
     - lpips
+    - opencv-python==4.8.*
     # For Real-ESRGAN
     - basicsr
     - facexlib
@@ -63,10 +64,12 @@ dependencies:
     - tokenizers>=0.14,<0.19
     - transformers==4.36
     - gradio
+    - fvmd
     # Install repos from git
-    # - git+https://github.com/sczhou/ProPainter.git
-    # - git+https://github.com/MCG-NKU/E2FGVI.git
-    # - git+https://github.com/xinntao/Real-ESRGAN.git
-    # - git+https://github.com/ZiyuGuo99/InstantIR.git
-    # - git+https://github.com/ragor114/PyTorch-Frechet-Video-Distance.git
-    - git+https://github.com/emanuele-artioli/UFO.git@main
+    - git+https://github.com/emanuele-artioli/EVCA.git
+    - git+https://github.com/emanuele-artioli/UFO.git
+    - git+https://github.com/emanuele-artioli/ProPainter.git
+    - git+https://github.com/emanuele-artioli/E2FGVI.git
+    - git+https://github.com/emanuele-artioli/Real-ESRGAN.git
+    - git+https://github.com/emanuele-artioli/InstantIR.git
+    # - git+https://github.com/emanuele-artioli/PyTorch-Frechet-Video-Distance.git
