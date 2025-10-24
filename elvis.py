@@ -1696,8 +1696,7 @@ def restore_with_instantir_adaptive(
     print("  Loading InstantIR runtime...")
 
     weights_dir = Path(instantir_weights_dir or "./InstantIR/models").expanduser()
-    if not weights_dir.exists():
-        raise FileNotFoundError(f"InstantIR weights directory not found: {weights_dir}")
+    weights_dir.mkdir(parents=True, exist_ok=True)
 
     if seed is not None:
         torch.manual_seed(seed)

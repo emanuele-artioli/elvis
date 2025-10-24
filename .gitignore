@@ -163,3 +163,5 @@ cython_debug/
 experiment*/
 *test*/
 Real-ESRGAN/
+*.pt
+*.bin

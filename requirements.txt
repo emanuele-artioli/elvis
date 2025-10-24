@@ -4,12 +4,12 @@
 # This adds the PyTorch CUDA wheel index as an extra source so pip can find
 # the appropriate torch/cu124 wheels. If you prefer to install torch manually
 # you can omit the three torch lines below and install them separately.
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu121
 
 # CUDA-enabled PyTorch (will be resolved using the extra-index-url above)
-torch==2.4.0
-torchvision==0.19.0
-torchaudio==2.4.0
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
 
 # Runtime libraries
 pandas
@@ -60,4 +60,3 @@ git+https://github.com/emanuele-artioli/InstantIR.git
 # mmcv-full has native extensions that must match your CUDA / torch installation.
 # For reliability use OpenMIM to install the correct wheel for your env:
 ## python -m mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain
-
