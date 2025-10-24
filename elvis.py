@@ -670,6 +670,13 @@ def inpaint_with_propainter(stretched_frames_dir: str, removal_masks_dir: str, o
     stretched_frames_abs = os.path.abspath(stretched_frames_dir)
     removal_masks_abs = os.path.abspath(removal_masks_dir)
     output_frames_abs = os.path.abspath(output_frames_dir)
+    output_frames_path = Path(output_frames_abs)
+    os.makedirs(output_frames_abs, exist_ok=True)
+
+    # Clear out stale frames so we can detect fresh output from E2FGVI
+    for stale_frame in output_frames_path.glob("*.png"):
+        if stale_frame.is_file():
+            stale_frame.unlink()
 
     use_installed_package = propainter_dir is None
     if use_installed_package:
@@ -857,6 +864,8 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
         str(height),
         "--savefps",
         str(int(framerate)),
+        "--save_frames",
+        output_frames_abs,
     ])
 
     print("Running E2FGVI inference...")
@@ -867,6 +876,11 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
         raise RuntimeError(f"E2FGVI inference failed: {result.stderr}")
 
     print(f"E2FGVI output: {result.stdout}")
+
+    generated_frames = list(Path(output_frames_abs).glob("*.png"))
+    if generated_frames:
+        print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
+        return
 
     results_dir = package_dir / "results"
     if not results_dir.exists():
@@ -880,7 +894,6 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
     result_video_path = result_videos[0]
 
     print("Decoding E2FGVI result video to frames...")
-    os.makedirs(output_frames_abs, exist_ok=True)
 
     if not decode_video(str(result_video_path), output_frames_abs, framerate=framerate, start_number=1, quality=1):
         raise RuntimeError(f"Failed to decode E2FGVI result video: {result_video_path}")
@@ -1644,8 +1657,7 @@ def restore_with_instantir_adaptive(
     cfg: float = 7.0,
     creative_start: float = 1.0,
     preview_start: float = 0.0,
-    seed: Optional[int] = 42,
-) -> None:
+    seed: Optional[int] = 42,) -> None:
     """
     Applies adaptive InstantIR blind image restoration to frames based on per-block blur maps.
     
@@ -1997,8 +2009,7 @@ def calculate_vmaf(reference_video: str, distorted_video: str, width: int, heigh
 def calculate_fvmd(
     reference_frames: List[np.ndarray],
     decoded_frames: List[np.ndarray],
-    log_root: Optional[str] = None,
-) -> float:
+    log_root: Optional[str] = None) -> float:
     """Calculate FVMD (Fréchet Video Mask Distance) between two frame sequences.
 
     Args:

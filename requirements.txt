@@ -1,0 +1,63 @@
+# Generated from elvis/environment.yml (pip section + pip-installable conda packages)
+
+# IMPORTANT: use the OpenAI/torch wheel index for CUDA-enabled PyTorch wheels
+# This adds the PyTorch CUDA wheel index as an extra source so pip can find
+# the appropriate torch/cu124 wheels. If you prefer to install torch manually
+# you can omit the three torch lines below and install them separately.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# CUDA-enabled PyTorch (will be resolved using the extra-index-url above)
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+# Runtime libraries
+pandas
+tqdm
+regex
+matplotlib
+imageio
+tensorboard
+timm
+openmim
+pywavelets
+scikit-image
+numpy<2
+
+# pip packages from environment.yml
+decord
+pytorch_msssim
+dahuffman
+pytorchvideo
+lpips
+opencv-python==4.8.*
+basicsr
+facexlib
+gfpgan
+
+# InstantIR / diffusion related
+diffusers==0.30
+accelerate
+datasets
+einops
+kornia
+peft==0.10.0
+pyrallis
+tokenizers>=0.14,<0.19
+transformers==4.36
+gradio
+fvmd
+
+# Repos (editable installs from git)
+git+https://github.com/emanuele-artioli/EVCA.git
+git+https://github.com/emanuele-artioli/UFO.git
+git+https://github.com/emanuele-artioli/ProPainter.git
+git+https://github.com/emanuele-artioli/E2FGVI.git
+git+https://github.com/emanuele-artioli/Real-ESRGAN.git
+git+https://github.com/emanuele-artioli/InstantIR.git
+
+# Post-install: mmcv and related OpenMMLab packages
+# mmcv-full has native extensions that must match your CUDA / torch installation.
+# For reliability use OpenMIM to install the correct wheel for your env:
+## python -m mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain
+
