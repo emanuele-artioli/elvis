@@ -165,3 +165,4 @@ experiment*/
 Real-ESRGAN/
 *.pt
 *.bin
+grid_search_results/

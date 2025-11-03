@@ -1,3 +1,4 @@
+import argparse
 import time
 import shutil
 import os
@@ -5,12 +6,14 @@ import subprocess
 import math
 import threading
 import contextlib
+import warnings
+from dataclasses import dataclass, asdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from itertools import islice
 from pathlib import Path
 import cv2
 import numpy as np
-from typing import List, Callable, Tuple, Dict, Optional, Sequence, Union, NamedTuple, Iterator
+from typing import Any, List, Callable, Tuple, Dict, Optional, Sequence, Union, NamedTuple, Iterator
 from skimage.metrics import structural_similarity as ssim
 from PIL import Image
 import matplotlib
@@ -40,6 +43,89 @@ try:
     _diffusers_logging.set_verbosity_error()
 except ImportError:  # pragma: no cover - optional dependency
     _diffusers_logging = None
+
+
+@dataclass
+class ElvisConfig:
+    reference_video: str = "davis_test/bear.mp4"
+    experiment_dir: str = "experiment"
+    width: int = 640
+    height: int = 360
+    block_size: int = 8
+    shrink_amount: float = 0.25
+    quality_factor: float = 1.2
+    target_bitrate_override: Optional[int] = None
+    force_framerate: Optional[float] = None
+    removability_alpha: float = 0.5
+    removability_smoothing_beta: float = 0.5
+    removability_working_dir: Optional[str] = None
+    decode_quality: int = 1
+    decode_start_number: int = 1
+    baseline_encode_preset: str = "medium"
+    baseline_encode_pix_fmt: str = "yuv420p"
+    adaptive_encode_preset: str = "medium"
+    adaptive_encode_pix_fmt: str = "yuv420p"
+    shrunk_encode_preset: str = "medium"
+    shrunk_encode_pix_fmt: str = "yuv420p"
+    downsample_encode_preset: str = "medium"
+    downsample_encode_pix_fmt: str = "yuv420p"
+    gaussian_encode_preset: str = "medium"
+    gaussian_encode_pix_fmt: str = "yuv420p"
+    roi_save_qp_maps: bool = True
+    downsample_strength_target_bitrate: int = 50000
+    gaussian_strength_target_bitrate: int = 50000
+    propainter_dir: Optional[str] = None
+    propainter_resize_ratio: float = 1.0
+    propainter_ref_stride: int = 20
+    propainter_neighbor_length: int = 4
+    propainter_subvideo_length: int = 40
+    propainter_mask_dilation: int = 4
+    propainter_raft_iter: int = 20
+    propainter_fp16: bool = True
+    propainter_devices: Optional[List[Union[int, str]]] = None
+    propainter_parallel_chunk_length: Optional[int] = None
+    propainter_chunk_overlap: Optional[int] = None
+    e2fgvi_dir: Optional[str] = None
+    e2fgvi_model: str = "e2fgvi_hq"
+    e2fgvi_ckpt: Optional[str] = None
+    e2fgvi_ref_stride: int = 10
+    e2fgvi_neighbor_stride: int = 5
+    e2fgvi_num_ref: int = -1
+    e2fgvi_mask_dilation: int = 4
+    realesrgan_dir: Optional[str] = None
+    realesrgan_model_name: str = "RealESRGAN_x4plus"
+    realesrgan_denoise_strength: float = 1.0
+    realesrgan_tile: int = 0
+    realesrgan_tile_pad: int = 10
+    realesrgan_pre_pad: int = 0
+    realesrgan_fp32: bool = False
+    realesrgan_devices: Optional[List[Union[int, str]]] = None
+    realesrgan_parallel_chunk_length: Optional[int] = None
+    realesrgan_per_device_workers: int = 1
+    realesrgan_model_path: Optional[str] = None
+    instantir_weights_dir: Optional[str] = None
+    instantir_cfg: float = 7.0
+    instantir_creative_start: float = 1.0
+    instantir_preview_start: float = 0.0
+    instantir_seed: Optional[int] = 42
+    instantir_devices: Optional[List[Union[int, str]]] = None
+    instantir_batch_size: int = 4
+    instantir_parallel_chunk_length: Optional[int] = None
+    analysis_sample_frames: Optional[List[int]] = None
+    generate_opencv_benchmarks: bool = True
+    metric_stride: int = 1
+    fvmd_stride: int = 1
+    fvmd_max_frames: Optional[int] = None
+    fvmd_processes: Optional[int] = None
+    fvmd_early_stop_delta: float = 0.002
+    fvmd_early_stop_window: int = 50
+    vmaf_stride: int = 1
+
+
+def _list_or_none(value: Optional[Sequence[Any]]) -> Optional[List[Any]]:
+    if value is None:
+        return None
+    return list(value)
 
 
 @contextlib.contextmanager
@@ -579,11 +665,45 @@ def _encode_frames_to_video(
 
     height, width = frames[0].shape[:2]
 
+    # Some pixel formats (e.g., YUV 4:2:0) require even dimensions. When we
+    # generate cropped ROI clips it's easy to end up with odd sizes, so we pad a
+    # single row/column on the fly to keep the encoder happy without changing
+    # the visible content.
+    pix_fmt_lower = (pix_fmt or '').lower()
+    requires_even_dims = False
+    if pix_fmt_lower:
+        chroma_tokens = ('420', 'nv12', 'nv21', 'p010', 'p016')
+        if any(token in pix_fmt_lower for token in chroma_tokens):
+            requires_even_dims = True
+    else:
+        # FFmpeg defaults to yuv420p when no pixel format is provided.
+        requires_even_dims = True
+
+    pad_right = 1 if requires_even_dims and (width % 2 != 0) else 0
+    pad_bottom = 1 if requires_even_dims and (height % 2 != 0) else 0
+
+    even_pad_filter: Optional[str] = None
+    if requires_even_dims:
+        even_pad_filter = 'pad=ceil(iw/2)*2:ceil(ih/2)*2:x=0:y=0:color=black'
+        if filter_chain:
+            filter_chain = f"{filter_chain},{even_pad_filter}"
+        else:
+            filter_chain = even_pad_filter
+
+    adjusted_width = width + pad_right
+    adjusted_height = height + pad_bottom
+
+    if pad_right or pad_bottom:
+        print(
+            f"  - Adjusting frame dimensions from {width}x{height} to {adjusted_width}x{adjusted_height} "
+            f"for {pix_fmt or 'default'} encoding"
+        )
+
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
         '-f', 'rawvideo',
         '-pix_fmt', 'bgr24',
-        '-s', f'{width}x{height}',
+        '-s', f'{adjusted_width}x{adjusted_height}',
         '-r', f'{framerate}',
         '-i', '-'
     ]
@@ -609,7 +729,17 @@ def _encode_frames_to_video(
         for frame in frames:
             if frame is None:
                 continue
-            frame_bytes = np.ascontiguousarray(frame.astype(np.uint8)).tobytes()
+            frame_to_write = frame
+            if pad_right or pad_bottom:
+                frame_to_write = cv2.copyMakeBorder(
+                    frame_to_write,
+                    0,
+                    pad_bottom,
+                    0,
+                    pad_right,
+                    borderType=cv2.BORDER_REPLICATE,
+                )
+            frame_bytes = np.ascontiguousarray(frame_to_write.astype(np.uint8)).tobytes()
             process.stdin.write(frame_bytes)
     finally:
         if process.stdin:
@@ -2892,7 +3022,15 @@ def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, 
     
     # Use a multiprocessing pool to parallelize the metric calculation
     # By default, this uses all available CPU cores.
-    with multiprocessing.Pool() as pool:
+    spawn_context = None
+    if hasattr(multiprocessing, "get_context"):
+        try:
+            spawn_context = multiprocessing.get_context("spawn")
+        except ValueError:
+            spawn_context = None
+    pool_cls = spawn_context.Pool if spawn_context is not None else multiprocessing.Pool
+
+    with pool_cls() as pool:
         scores_flat = pool.starmap(metric_func, block_pairs)
         
     # Reshape the flat list of scores back into a 2D map
@@ -3312,7 +3450,17 @@ def analyze_encoding_performance(
         cpu_count = multiprocessing.cpu_count() if hasattr(multiprocessing, "cpu_count") else 1
         max_workers = fvmd_processes if fvmd_processes is not None else max(1, min(4, cpu_count))
         if max_workers > 0:
-            fvmd_executor = ProcessPoolExecutor(max_workers=max_workers)
+            spawn_context = None
+            if hasattr(multiprocessing, "get_context"):
+                try:
+                    spawn_context = multiprocessing.get_context("spawn")
+                except ValueError:
+                    spawn_context = None
+            if spawn_context is not None:
+                fvmd_executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_context)
+            else:
+                fvmd_executor = ProcessPoolExecutor(max_workers=max_workers)
+            print(f"  Using spawn-based FVMD worker pool with {max_workers} process(es)")
 
     # --- Generate OpenCV Restoration Benchmarks ---
     opencv_benchmarks: Dict[str, str] = {}
@@ -3847,49 +3995,157 @@ def _print_summary_report(results: Dict) -> None:
         print(f"{'-'*180}")
 
 
+def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
+    """Execute the full Elvis pipeline with the supplied configuration."""
 
-if __name__ == "__main__":
-    # Suppress warnings for cleaner output
-    import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
-    # Move to script directory
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    script_dir = Path(__file__).resolve().parent
+    os.chdir(str(script_dir))
 
-    # Example usage parameters
-    reference_video = "davis_test/bmx-trees.mp4"
-    width, height = 640, 360  # Target resolution
-    block_size = 8
-    shrink_amount = 0.25      # Number of blocks to remove per row in ELVIS v1
+    reference_video = config.reference_video
+    width, height = config.width, config.height
+    block_size = config.block_size
+    shrink_amount = config.shrink_amount
 
-    # Dictionary to store execution times
-    execution_times = {}
-
-    # Calculate appropriate target bitrate based on video characteristics
-    cap = cv2.VideoCapture(reference_video)
-    framerate = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=1.2)
-
-
-
-    #########################################################################################################
-    ############################################## SERVER SIDE ##############################################
-    #########################################################################################################
-
-
-
-    # --- Video Preprocessing ---
-    start = time.time()
-
-    # Create experiment directory for all experiment-related files
-    experiment_dir = "experiment"
+    experiment_dir = os.path.abspath(config.experiment_dir)
     os.makedirs(experiment_dir, exist_ok=True)
+
+    execution_times: Dict[str, float] = {}
+
+    if config.force_framerate is not None:
+        framerate = float(config.force_framerate)
+    else:
+        cap = cv2.VideoCapture(reference_video)
+        framerate = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if not framerate or framerate <= 0:
+            framerate = 30.0
+
+    target_bitrate = config.target_bitrate_override
+    if target_bitrate is None:
+        target_bitrate = calculate_target_bitrate(width, height, framerate, quality_factor=config.quality_factor)
+
+    config_dict = asdict(config)
+    pipeline_params: Dict[str, Any] = {
+        "config": config_dict,
+        "derived": {
+            "framerate": framerate,
+            "target_bitrate": target_bitrate,
+            "experiment_dir": experiment_dir,
+            "quality_factor": config.quality_factor,
+        },
+        "functions": {
+            "calculate_removability_scores": {
+                "alpha": config.removability_alpha,
+                "smoothing_beta": config.removability_smoothing_beta,
+                "block_size": block_size,
+                "working_dir": config.removability_working_dir or experiment_dir,
+            },
+            "apply_selective_removal": {
+                "shrink_amount": shrink_amount,
+            },
+            "decode_video": {
+                "quality": config.decode_quality,
+                "start_number": config.decode_start_number,
+            },
+            "inpaint_with_propainter": {
+                "propainter_dir": config.propainter_dir,
+                "resize_ratio": config.propainter_resize_ratio,
+                "ref_stride": config.propainter_ref_stride,
+                "neighbor_length": config.propainter_neighbor_length,
+                "subvideo_length": config.propainter_subvideo_length,
+                "mask_dilation": config.propainter_mask_dilation,
+                "raft_iter": config.propainter_raft_iter,
+                "fp16": config.propainter_fp16,
+                "devices": _list_or_none(config.propainter_devices),
+                "parallel_chunk_length": config.propainter_parallel_chunk_length,
+                "chunk_overlap": config.propainter_chunk_overlap,
+            },
+            "inpaint_with_e2fgvi": {
+                "e2fgvi_dir": config.e2fgvi_dir,
+                "model": config.e2fgvi_model,
+                "ckpt": config.e2fgvi_ckpt,
+                "ref_stride": config.e2fgvi_ref_stride,
+                "neighbor_stride": config.e2fgvi_neighbor_stride,
+                "num_ref": config.e2fgvi_num_ref,
+                "mask_dilation": config.e2fgvi_mask_dilation,
+            },
+            "restore_downsampled_with_realesrgan": {
+                "realesrgan_dir": config.realesrgan_dir,
+                "model_name": config.realesrgan_model_name,
+                "denoise_strength": config.realesrgan_denoise_strength,
+                "tile": config.realesrgan_tile,
+                "tile_pad": config.realesrgan_tile_pad,
+                "pre_pad": config.realesrgan_pre_pad,
+                "fp32": config.realesrgan_fp32,
+                "devices": _list_or_none(config.realesrgan_devices),
+                "parallel_chunk_length": config.realesrgan_parallel_chunk_length,
+                "per_device_workers": config.realesrgan_per_device_workers,
+                "model_path": config.realesrgan_model_path,
+            },
+            "restore_with_instantir_adaptive": {
+                "instantir_weights_dir": config.instantir_weights_dir,
+                "cfg": config.instantir_cfg,
+                "creative_start": config.instantir_creative_start,
+                "preview_start": config.instantir_preview_start,
+                "seed": config.instantir_seed,
+                "devices": _list_or_none(config.instantir_devices),
+                "batch_size": config.instantir_batch_size,
+                "parallel_chunk_length": config.instantir_parallel_chunk_length,
+            },
+            "analyze_encoding_performance": {
+                "generate_opencv_benchmarks": config.generate_opencv_benchmarks,
+                "metric_stride": config.metric_stride,
+                "fvmd_stride": config.fvmd_stride,
+                "fvmd_max_frames": config.fvmd_max_frames,
+                "fvmd_processes": config.fvmd_processes,
+                "fvmd_early_stop_delta": config.fvmd_early_stop_delta,
+                "fvmd_early_stop_window": config.fvmd_early_stop_window,
+                "vmaf_stride": config.vmaf_stride,
+            },
+        },
+    }
+
+    encode_function_params = {
+        "baseline": {
+            "preset": config.baseline_encode_preset,
+            "pix_fmt": config.baseline_encode_pix_fmt,
+            "target_bitrate": target_bitrate,
+        },
+        "adaptive": {
+            "preset": config.adaptive_encode_preset,
+            "pix_fmt": config.adaptive_encode_pix_fmt,
+            "target_bitrate": target_bitrate,
+        },
+        "elvis_v1_shrunk": {
+            "preset": config.shrunk_encode_preset,
+            "pix_fmt": config.shrunk_encode_pix_fmt,
+            "target_bitrate": target_bitrate,
+        },
+        "downsample": {
+            "preset": config.downsample_encode_preset,
+            "pix_fmt": config.downsample_encode_pix_fmt,
+            "target_bitrate": target_bitrate,
+        },
+        "gaussian": {
+            "preset": config.gaussian_encode_preset,
+            "pix_fmt": config.gaussian_encode_pix_fmt,
+            "target_bitrate": target_bitrate,
+        },
+    }
+    pipeline_params["functions"]["encode_video"] = encode_function_params
 
     print(f"Processing video: {reference_video}")
     print(f"Target resolution: {width}x{height}")
-    print(f"Calculated target bitrate: {target_bitrate} bps ({target_bitrate/1000000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps")
+    print(
+        f"Calculated target bitrate: {target_bitrate} bps "
+        f"({target_bitrate/1_000_000:.1f} Mbps) for {width}x{height}@{framerate:.1f}fps"
+    )
+
+    # Preprocessing
+    start = time.time()
 
     frames_dir = os.path.join(experiment_dir, "frames")
     reference_frames_dir = os.path.join(frames_dir, "reference")
@@ -3898,12 +4154,21 @@ if __name__ == "__main__":
 
     print("Converting video to raw YUV format...")
     raw_video_path = os.path.join(experiment_dir, "reference_raw.yuv")
-    subprocess.run(f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} -vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}", shell=True, check=False)
+    subprocess.run(
+        f"ffmpeg -hide_banner -loglevel error -y -i {reference_video} "
+        f"-vf scale={width}:{height} -c:v rawvideo -pix_fmt yuv420p {raw_video_path}",
+        shell=True,
+        check=False,
+    )
 
     print("Extracting reference frames...")
-    subprocess.run(f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} -r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png", shell=True, check=False)
-    
-    # Cache sorted frame list to avoid multiple listdir calls
+    subprocess.run(
+        f"ffmpeg -hide_banner -loglevel error -y -video_size {width}x{height} "
+        f"-r {framerate} -pixel_format yuv420p -i {raw_video_path} -q:v 2 {reference_frames_dir}/%05d.png",
+        shell=True,
+        check=False,
+    )
+
     frame_files = sorted([f for f in os.listdir(reference_frames_dir) if f.endswith('.png')])
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in frame_files]
 
@@ -3911,11 +4176,8 @@ if __name__ == "__main__":
     execution_times["preprocessing"] = end - start
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- Removability Score Calculation ---
+    # Removability scores
     start = time.time()
-
     print(f"Calculating removability scores with block size: {block_size}x{block_size}")
     removability_scores = calculate_removability_scores(
         raw_video_file=raw_video_path,
@@ -3923,85 +4185,88 @@ if __name__ == "__main__":
         width=width,
         height=height,
         block_size=block_size,
-        alpha=0.5,
-        working_dir=experiment_dir,
-        smoothing_beta=0.5
+        alpha=config.removability_alpha,
+        working_dir=config.removability_working_dir or experiment_dir,
+        smoothing_beta=config.removability_smoothing_beta,
     )
-    
     end = time.time()
     execution_times["removability_score_calculation"] = end - start
     print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- Baseline Encoding ---
+    # Baseline encoding
     start = time.time()
-    
-    print(f"Encoding reference frames with two-pass for baseline comparison...")
+    print("Encoding reference frames with two-pass for baseline comparison...")
     baseline_video = os.path.join(experiment_dir, "baseline.mp4")
-    # Encode the baseline video
     encode_video(
         input_frames_dir=reference_frames_dir,
         output_video=baseline_video,
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=target_bitrate
+        target_bitrate=target_bitrate,
+        preset=config.baseline_encode_preset,
+        pix_fmt=config.baseline_encode_pix_fmt,
     )
     end = time.time()
     execution_times["baseline_encoding"] = end - start
     print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- ELVIS v1 (shrinking and extracting metadata) ---
+    # ELVIS v1 shrinking
     start = time.time()
-    print(f"Shrinking and encoding frames with ELVIS v1...")
-    # Shrink frames based on removability scores - use list comprehension for speed
+    print("Shrinking and encoding frames with ELVIS v1...")
     shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
-    
-    # Process frames in parallel for significant speedup
-    shrunk_frames, removal_masks, block_coords_to_remove = zip(*(apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) for img, scores in zip(reference_frames, removability_scores)))
-    
-    # Serial version (kept for compatibility, comment out parallel version above to use this)
-    shrunk_frames, removal_masks, block_coords_to_remove = zip(*[
-        apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount) 
-        for img, scores in zip(reference_frames, removability_scores)
-    ])
+
+    shrunk_frames, removal_masks, block_coords_to_remove = zip(
+        *[
+            apply_selective_removal(img, scores, block_size, shrink_amount=shrink_amount)
+            for img, scores in zip(reference_frames, removability_scores)
+        ]
+    )
+
     for i, frame in enumerate(shrunk_frames):
         cv2.imwrite(os.path.join(shrunk_frames_dir, f"{i+1:05d}.png"), frame)
-    # Encode the shrunk frames (use actual shrunk frame dimensions, not original)
+
     shrunk_video = os.path.join(experiment_dir, "shrunk.mp4")
-    shrunk_width = shrunk_frames[0].shape[1]  # Width is reduced due to removed blocks
+    shrunk_width = shrunk_frames[0].shape[1]
     encode_video(
         input_frames_dir=shrunk_frames_dir,
         output_video=shrunk_video,
         framerate=framerate,
         width=shrunk_width,
         height=height,
-        target_bitrate=target_bitrate
+        target_bitrate=target_bitrate,
+        preset=config.shrunk_encode_preset,
+        pix_fmt=config.shrunk_encode_pix_fmt,
     )
-    # Save compressed metadata about removed blocks
-    removal_masks = np.array(removal_masks, dtype=np.uint8)
-    masks_packed = np.packbits(removal_masks)
+
+    removal_masks_np = np.array(removal_masks, dtype=np.uint8)
+    masks_packed = np.packbits(removal_masks_np)
     np.savez(
-        os.path.join(experiment_dir, 
-        f"shrink_masks_{block_size}.npz"), 
-        packed=masks_packed, shape=removal_masks.shape
+        os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"),
+        packed=masks_packed,
+        shape=removal_masks_np.shape,
     )
     end = time.time()
     execution_times["elvis_v1_shrinking"] = end - start
     print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- Adaptive ROI Encoding ---
+    # Adaptive ROI encoding
     start = time.time()
-    print(f"Encoding frames with ROI-based adaptive quantization...")
+    print("Encoding frames with ROI-based adaptive quantization...")
     adaptive_video = os.path.join(experiment_dir, "adaptive.mp4")
     maps_dir = os.path.join(experiment_dir, "maps")
     qp_maps_dir = os.path.join(maps_dir, "qp_maps")
+    os.makedirs(maps_dir, exist_ok=True)
+
+    valid_ctu_sizes = [16, 32, 64]
+    roi_ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
+    pipeline_params["functions"]["encode_with_roi"] = {
+        "save_qp_maps": config.roi_save_qp_maps,
+        "target_bitrate": target_bitrate,
+        "ctu_size": roi_ctu_size,
+    }
+
     encode_with_roi(
         input_frames_dir=reference_frames_dir,
         output_video=adaptive_video,
@@ -4011,27 +4276,29 @@ if __name__ == "__main__":
         width=width,
         height=height,
         target_bitrate=target_bitrate,
-        save_qp_maps=True,
-        qp_maps_dir=qp_maps_dir
+        save_qp_maps=config.roi_save_qp_maps,
+        qp_maps_dir=qp_maps_dir,
     )
     end = time.time()
     execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- Downsampling-based ELVIS v2 (adaptive filtering and encoding) ---
+    # Downsampling-based ELVIS v2
     start = time.time()
-    print(f"Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
+    print("Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
     downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
-    # Downsample frames based on removability scores - optimized list comprehension
-    downsampled_frames, downsample_maps = zip(*[
-        filter_frame_downsample(img, scores, block_size) 
-        for img, scores in zip(reference_frames, removability_scores)
-    ])
+
+    downsampled_frames, downsample_maps = zip(
+        *[
+            filter_frame_downsample(img, scores, block_size)
+            for img, scores in zip(reference_frames, removability_scores)
+        ]
+    )
+
     for i, frame in enumerate(downsampled_frames):
         cv2.imwrite(os.path.join(downsampled_frames_dir, f"{i+1:05d}.png"), frame)
+
     downsampled_video = os.path.join(experiment_dir, "downsampled_encoded.mp4")
     encode_video(
         input_frames_dir=downsampled_frames_dir,
@@ -4039,33 +4306,38 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=target_bitrate
+        target_bitrate=target_bitrate,
+        preset=config.downsample_encode_preset,
+        pix_fmt=config.downsample_encode_pix_fmt,
     )
-    # Encode downsampling maps as video for client-side adaptive restoration
+
     downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
     encode_strength_maps(
         strength_maps=list(downsample_maps),
         output_video=downsample_maps_video,
-        framerate=framerate
+        framerate=framerate,
+        target_bitrate=config.downsample_strength_target_bitrate,
     )
     end = time.time()
     execution_times["elvis_v2_downsampling"] = end - start
     print(f"Downsampling-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
-
-
-    # --- Gaussian blur Filtering-based ELVIS v2 (adaptive filtering and encoding) ---
+    # Gaussian blur-based ELVIS v2
     start = time.time()
-    print(f"Applying Gaussian blur Filtering-based ELVIS v2 adaptive filtering and encoding...")
+    print("Applying Gaussian blur Filtering-based ELVIS v2 adaptive filtering and encoding...")
     gaussian_frames_dir = os.path.join(experiment_dir, "frames", "gaussian")
     os.makedirs(gaussian_frames_dir, exist_ok=True)
-    # Apply Gaussian blur filtering to frames based on removability scores - optimized list comprehension
-    gaussian_frames, gaussian_maps = zip(*[
-        filter_frame_gaussian(img, scores, block_size) 
-        for img, scores in zip(reference_frames, removability_scores)
-    ])
+
+    gaussian_frames, gaussian_maps = zip(
+        *[
+            filter_frame_gaussian(img, scores, block_size)
+            for img, scores in zip(reference_frames, removability_scores)
+        ]
+    )
+
     for i, frame in enumerate(gaussian_frames):
         cv2.imwrite(os.path.join(gaussian_frames_dir, f"{i+1:05d}.png"), frame)
+
     gaussian_video = os.path.join(experiment_dir, "gaussian_encoded.mp4")
     encode_video(
         input_frames_dir=gaussian_frames_dir,
@@ -4073,45 +4345,52 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=target_bitrate
+        target_bitrate=target_bitrate,
+        preset=config.gaussian_encode_preset,
+        pix_fmt=config.gaussian_encode_pix_fmt,
     )
-    # Encode gaussian strength maps as video for client-side adaptive restoration
+
     gaussian_maps_video = os.path.join(maps_dir, "gaussian_encoded.mp4")
     encode_strength_maps(
         strength_maps=list(gaussian_maps),
         output_video=gaussian_maps_video,
-        framerate=framerate
+        framerate=framerate,
+        target_bitrate=config.gaussian_strength_target_bitrate,
     )
     end = time.time()
     execution_times["elvis_v2_gaussian"] = end - start
     print(f"Gaussian blur filtering-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
 
-
-
-    #########################################################################################################
-    ############################################## CLIENT SIDE ##############################################
-    #########################################################################################################
-
-
-
-    # --- ELVIS v1 (stretching and inpainting) ---
+    # Client-side stretching
     start = time.time()
-    print(f"Decoding and stretching ELVIS v1 video...")
-    # Decode the shrunk video to frames
-    removal_masks = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
-    removal_masks = np.unpackbits(removal_masks['packed'])[:np.prod(removal_masks['shape'])].reshape(removal_masks['shape'])
+    print("Decoding and stretching ELVIS v1 video...")
+    removal_masks_file = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
+    removal_masks_loaded = np.unpackbits(removal_masks_file['packed'])
+    removal_masks = removal_masks_loaded[:np.prod(removal_masks_file['shape'])].reshape(removal_masks_file['shape'])
+
     stretched_frames_dir = os.path.join(experiment_dir, "frames", "stretched")
-    if not decode_video(shrunk_video, stretched_frames_dir, framerate=framerate, start_number=1, quality=1):
+    if not decode_video(
+        shrunk_video,
+        stretched_frames_dir,
+        framerate=framerate,
+        start_number=config.decode_start_number,
+        quality=config.decode_quality,
+    ):
         raise RuntimeError(f"Failed to decode shrunk video: {shrunk_video}")
-    # Stretch each frame using the removal masks - read and process in single pass
+
     num_masks = len(removal_masks)
     stretched_frames = [
-        stretch_frame(cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")), removal_masks[i], block_size)
+        stretch_frame(
+            cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png")),
+            removal_masks[i],
+            block_size,
+        )
         for i in range(num_masks)
     ]
+
     for i, frame in enumerate(stretched_frames):
         cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
-    # Convert removal_masks to mask images for inpainting (considering block size)
+
     removal_masks_dir = os.path.join(maps_dir, "removal_masks")
     os.makedirs(removal_masks_dir, exist_ok=True)
     for i, mask in enumerate(removal_masks):
@@ -4121,7 +4400,7 @@ if __name__ == "__main__":
     end = time.time()
     execution_times["elvis_v1_stretching"] = end - start
     print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
-    # Encode the stretched frames losslessly TODO: this is not needed in production
+
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
     encode_video(
         input_frames_dir=stretched_frames_dir,
@@ -4129,13 +4408,11 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-    # --- Inpainting with CV2 ---
     start = time.time()
-    print(f"Inpainting stretched frames with CV2...")
-    # Inpaint the stretched frames to fill in removed blocks using CV2
+    print("Inpainting stretched frames with CV2...")
     inpainted_cv2_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_cv2")
     os.makedirs(inpainted_cv2_frames_dir, exist_ok=True)
     for i in range(len(removal_masks)):
@@ -4146,7 +4423,7 @@ if __name__ == "__main__":
     end = time.time()
     execution_times["elvis_v1_inpainting_cv2"] = end - start
     print(f"ELVIS v1 CV2 inpainting completed in {end - start:.2f} seconds.\n")
-    # Encode the CV2 inpainted frames losslessly TODO: this is not needed in production
+
     inpainted_cv2_video = os.path.join(experiment_dir, "inpainted_cv2.mp4")
     encode_video(
         input_frames_dir=inpainted_cv2_frames_dir,
@@ -4154,13 +4431,11 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-    # --- Inpainting with ProPainter ---
     start = time.time()
-    print(f"Inpainting stretched frames with ProPainter...")
-    # Inpaint the stretched frames to fill in removed blocks using ProPainter
+    print("Inpainting stretched frames with ProPainter...")
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
     inpaint_with_propainter(
         stretched_frames_dir=stretched_frames_dir,
@@ -4168,12 +4443,23 @@ if __name__ == "__main__":
         output_frames_dir=inpainted_frames_dir,
         width=width,
         height=height,
-        framerate=framerate
+        framerate=framerate,
+        propainter_dir=config.propainter_dir,
+        resize_ratio=config.propainter_resize_ratio,
+        ref_stride=config.propainter_ref_stride,
+        neighbor_length=config.propainter_neighbor_length,
+        subvideo_length=config.propainter_subvideo_length,
+        mask_dilation=config.propainter_mask_dilation,
+        raft_iter=config.propainter_raft_iter,
+        fp16=config.propainter_fp16,
+        devices=_list_or_none(config.propainter_devices),
+        parallel_chunk_length=config.propainter_parallel_chunk_length,
+        chunk_overlap=config.propainter_chunk_overlap,
     )
     end = time.time()
     execution_times["elvis_v1_inpainting_propainter"] = end - start
     print(f"ELVIS v1 ProPainter inpainting completed in {end - start:.2f} seconds.\n")
-    # Encode the ProPainter inpainted frames losslessly TODO: this is not needed in production
+
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
     encode_video(
         input_frames_dir=inpainted_frames_dir,
@@ -4181,13 +4467,11 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-    # --- Inpainting with E2FGVI ---
     start = time.time()
-    print(f"Inpainting stretched frames with E2FGVI...")
-    # Inpaint the stretched frames to fill in removed blocks using E2FGVI
+    print("Inpainting stretched frames with E2FGVI...")
     inpainted_e2fgvi_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_e2fgvi")
     inpaint_with_e2fgvi(
         stretched_frames_dir=stretched_frames_dir,
@@ -4195,12 +4479,19 @@ if __name__ == "__main__":
         output_frames_dir=inpainted_e2fgvi_frames_dir,
         width=width,
         height=height,
-        framerate=framerate
+        framerate=framerate,
+        e2fgvi_dir=config.e2fgvi_dir,
+        model=config.e2fgvi_model,
+        ckpt=config.e2fgvi_ckpt,
+        ref_stride=config.e2fgvi_ref_stride,
+        neighbor_stride=config.e2fgvi_neighbor_stride,
+        num_ref=config.e2fgvi_num_ref,
+        mask_dilation=config.e2fgvi_mask_dilation,
     )
     end = time.time()
     execution_times["elvis_v1_inpainting_e2fgvi"] = end - start
     print(f"ELVIS v1 E2FGVI inpainting completed in {end - start:.2f} seconds.\n")
-    # Encode the E2FGVI inpainted frames losslessly TODO: this is not needed in production
+
     inpainted_e2fgvi_video = os.path.join(experiment_dir, "inpainted_e2fgvi.mp4")
     encode_video(
         input_frames_dir=inpainted_e2fgvi_frames_dir,
@@ -4208,27 +4499,30 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-
-
-    # --- Downsampling-based ELVIS v2: Decode video and apply adaptive restoration ---
+    # Downsampling restoration
     start = time.time()
-    print(f"Decoding downsampled ELVIS v2 video and strength maps...")
-    # Decode the downsampled video to frames
+    print("Decoding downsampled ELVIS v2 video and strength maps...")
     downsampled_frames_decoded_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
-    if not decode_video(downsampled_video, downsampled_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
+    if not decode_video(
+        downsampled_video,
+        downsampled_frames_decoded_dir,
+        framerate=framerate,
+        start_number=config.decode_start_number,
+        quality=config.decode_quality,
+    ):
         raise RuntimeError(f"Failed to decode downsampled video: {downsampled_video}")
-    # Decode the downsampling strength maps video to frames
+
     downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
     strength_maps = decode_strength_maps(downsample_maps_video, block_size, downsampled_maps_decoded_dir)
     end = time.time()
     execution_times["elvis_v2_downsampling_decoding"] = end - start
     print(f"Decoding completed in {end - start:.2f} seconds.\n")
+
     start = time.time()
-    print(f"Applying adaptive upsampling restoration for downsampling-based ELVIS v2...")
-    # Apply adaptive upsampling restoration via Real-ESRGAN
+    print("Applying adaptive upsampling restoration for downsampling-based ELVIS v2...")
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
     restore_downsampled_with_realesrgan(
@@ -4236,11 +4530,21 @@ if __name__ == "__main__":
         output_frames_dir=downsampled_restored_frames_dir,
         downscale_maps=strength_maps,
         block_size=block_size,
+        model_name=config.realesrgan_model_name,
+        denoise_strength=config.realesrgan_denoise_strength,
+        tile=config.realesrgan_tile,
+        tile_pad=config.realesrgan_tile_pad,
+        pre_pad=config.realesrgan_pre_pad,
+        fp32=config.realesrgan_fp32,
+        devices=_list_or_none(config.realesrgan_devices),
+        parallel_chunk_length=config.realesrgan_parallel_chunk_length,
+        per_device_workers=config.realesrgan_per_device_workers,
+        model_path=config.realesrgan_model_path,
     )
     end = time.time()
     execution_times["elvis_v2_downsampling_restoration"] = end - start
     print(f"Adaptive upsampling restoration completed in {end - start:.2f} seconds.\n")
-    # Encode the restored frames losslessly TODO: this is not needed in production
+
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
     encode_video(
         input_frames_dir=downsampled_restored_frames_dir,
@@ -4248,69 +4552,78 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-
-
-    # --- Gaussian blur Filtering-based ELVIS v2: Decode video and apply adaptive restoration ---
+    # Gaussian restoration
     start = time.time()
-    print(f"Decoding Gaussian blur filtered ELVIS v2 video and strength maps...")
-    # Decode the Gaussian video to frames
+    print("Decoding Gaussian blur filtered ELVIS v2 video and strength maps...")
     gaussian_frames_decoded_dir = os.path.join(experiment_dir, "frames", "gaussian_decoded")
-    if not decode_video(gaussian_video, gaussian_frames_decoded_dir, framerate=framerate, start_number=1, quality=1):
+    if not decode_video(
+        gaussian_video,
+        gaussian_frames_decoded_dir,
+        framerate=framerate,
+        start_number=config.decode_start_number,
+        quality=config.decode_quality,
+    ):
         raise RuntimeError(f"Failed to decode Gaussian video: {gaussian_video}")
-    # Decode the Gaussian strength maps video to frames
+
     gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
     strength_maps_gaussian = decode_strength_maps(gaussian_maps_video, block_size, gaussian_maps_decoded_dir)
     end = time.time()
     execution_times["elvis_v2_gaussian_decoding"] = end - start
     print(f"Decoding completed in {end - start:.2f} seconds.\n")
+
     start = time.time()
-    print(f"Applying adaptive deblurring restoration for Gaussian blur filtering-based ELVIS v2...")
-    
-    # Copy decoded frames to a subfolder structure for InstantIR
-    # InstantIR expects: parent_dir/subfolder/images.png
+    print("Applying adaptive deblurring restoration for Gaussian blur filtering-based ELVIS v2...")
     instantir_work_dir = os.path.join(experiment_dir, "instantir_work")
     gaussian_instantir_input_dir = os.path.join(instantir_work_dir, "gaussian_decoded")
     os.makedirs(gaussian_instantir_input_dir, exist_ok=True)
-    
-    # Copy all decoded frames to the InstantIR input subfolder
-    print(f"  Copying {len(reference_frames)} frames to InstantIR input directory...")
-    for frame_file in os.listdir(gaussian_frames_decoded_dir):
-        if frame_file.endswith(('.png', '.jpg', '.jpeg')):
-            shutil.copy2(
-                os.path.join(gaussian_frames_decoded_dir, frame_file),
-                os.path.join(gaussian_instantir_input_dir, frame_file)
-            )
-    
-    # Apply adaptive restoration on the entire folder
-    # This will modify frames in-place in gaussian_instantir_input_dir
+
+    decoded_gaussian_frames = [
+        f for f in os.listdir(gaussian_frames_decoded_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+    ]
+    print(f"  Copying {len(decoded_gaussian_frames)} frames to InstantIR input directory...")
+    for frame_file in decoded_gaussian_frames:
+        shutil.copy2(
+            os.path.join(gaussian_frames_decoded_dir, frame_file),
+            os.path.join(gaussian_instantir_input_dir, frame_file),
+        )
+
+    instantir_weights_dir = (
+        config.instantir_weights_dir
+        if config.instantir_weights_dir is not None
+        else str(script_dir / "InstantIR" / "models")
+    )
+
     restore_with_instantir_adaptive(
         input_frames_dir=gaussian_instantir_input_dir,
         blur_maps=strength_maps_gaussian,
         block_size=block_size,
-        instantir_weights_dir=str(Path(__file__).resolve().parent / "InstantIR" / "models"),
-        cfg=7.0,
-        creative_start=1.0,  # No creative restoration, preserve fidelity
-        preview_start=0.0,
+        instantir_weights_dir=instantir_weights_dir,
+        cfg=config.instantir_cfg,
+        creative_start=config.instantir_creative_start,
+        preview_start=config.instantir_preview_start,
+        seed=config.instantir_seed,
+        devices=_list_or_none(config.instantir_devices),
+        batch_size=config.instantir_batch_size,
+        parallel_chunk_length=config.instantir_parallel_chunk_length,
     )
-    
-    # Copy restored frames to final output directory
+
     gaussian_restored_frames_dir = os.path.join(experiment_dir, "frames", "gaussian_restored")
     os.makedirs(gaussian_restored_frames_dir, exist_ok=True)
-    print(f"  Copying restored frames to output directory...")
+    print("  Copying restored frames to output directory...")
     for frame_file in os.listdir(gaussian_instantir_input_dir):
-        if frame_file.endswith(('.png', '.jpg', '.jpeg')):
+        if frame_file.lower().endswith(('.png', '.jpg', '.jpeg')):
             shutil.copy2(
                 os.path.join(gaussian_instantir_input_dir, frame_file),
-                os.path.join(gaussian_restored_frames_dir, frame_file)
+                os.path.join(gaussian_restored_frames_dir, frame_file),
             )
-    
+
     end = time.time()
     execution_times["elvis_v2_gaussian_restoration"] = end - start
     print(f"Adaptive deblurring restoration completed in {end - start:.2f} seconds.\n")
-    # Encode the restored frames losslessly TODO: this is not needed in production
+
     gaussian_restored_video = os.path.join(experiment_dir, "gaussian_restored.mp4")
     encode_video(
         input_frames_dir=gaussian_restored_frames_dir,
@@ -4318,35 +4631,30 @@ if __name__ == "__main__":
         framerate=framerate,
         width=width,
         height=height,
-        target_bitrate=None
+        target_bitrate=None,
     )
 
-
-
-    #########################################################################################################
-    ######################################### PERFORMANCE EVALUATION ########################################
-    #########################################################################################################
-
+    # Performance evaluation
     print("Evaluating and comparing encoding performance...")
     start = time.time()
 
-    # Compare file sizes and quality metrics (include metadata)
     video_sizes = {
         "Baseline": os.path.getsize(baseline_video),
         "ELVIS v1": os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
         "Adaptive": os.path.getsize(adaptive_video),
         "ELVIS v2 Downsample": os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
-        "ELVIS v2 Gaussian": os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video)
+        "ELVIS v2 Gaussian": os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video),
     }
 
-    # Use cached frame_files instead of re-listing directory
     frame_count = len(frame_files)
-    duration = frame_count / framerate
+    duration = frame_count / framerate if framerate else frame_count
     bitrates = {key: (size * 8) / duration for key, size in video_sizes.items()}
 
-    print(f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1000000:.1f} Mbps):")
+    print(
+        f"\nEncoding Results (Target Bitrate: {target_bitrate} bps / {target_bitrate/1_000_000:.1f} Mbps):"
+    )
     for key, bitrate in bitrates.items():
-        print(f"{key} bitrate: {bitrate / 1000000:.2f} Mbps")
+        print(f"{key} bitrate: {bitrate / 1_000_000:.2f} Mbps")
 
     encoded_videos = {
         "Baseline": baseline_video,
@@ -4355,17 +4663,20 @@ if __name__ == "__main__":
         "ELVIS v1 ProPainter": inpainted_video,
         "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
         "ELVIS v2 Downsample": downsampled_restored_video,
-        "ELVIS v2 Gaussian": gaussian_restored_video
+        "ELVIS v2 Gaussian": gaussian_restored_video,
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "maps", "ufo_masks")
-    sample_frames = [frame_count // 2] # [0, frame_count // 4, frame_count // 2, 3 * frame_count // 4, frame_count - 1]
-    sample_frames = [f for f in sample_frames if f < frame_count]
+    if config.analysis_sample_frames is not None:
+        sample_frames = sorted({int(idx) for idx in config.analysis_sample_frames if idx >= 0})
+    else:
+        sample_frames = [frame_count // 2]
+    sample_frames = [idx for idx in sample_frames if idx < frame_count]
+    pipeline_params["derived"]["analysis_sample_frames"] = sample_frames
 
-    # Prepare strength maps for OpenCV benchmarks
     strength_maps_dict = {
         "ELVIS v2 Downsample": strength_maps,
-        "ELVIS v2 Gaussian": strength_maps_gaussian
+        "ELVIS v2 Gaussian": strength_maps_gaussian,
     }
 
     analysis_results = analyze_encoding_performance(
@@ -4381,22 +4692,139 @@ if __name__ == "__main__":
         reference_video_path=reference_video,
         framerate=framerate,
         strength_maps=strength_maps_dict,
-        generate_opencv_benchmarks=True
+        generate_opencv_benchmarks=config.generate_opencv_benchmarks,
+        metric_stride=config.metric_stride,
+        fvmd_stride=config.fvmd_stride,
+        fvmd_max_frames=config.fvmd_max_frames,
+        fvmd_processes=config.fvmd_processes,
+        fvmd_early_stop_delta=config.fvmd_early_stop_delta,
+        fvmd_early_stop_window=config.fvmd_early_stop_window,
+        vmaf_stride=config.vmaf_stride,
     )
-    
-    # Add collected times to the results dictionary
-    analysis_results["execution_times_seconds"] = execution_times
 
-    # Add video parameters to the results dictionary
+    end = time.time()
+    execution_times["performance_evaluation"] = end - start
+
+    analysis_results["execution_times_seconds"] = execution_times
     analysis_results["video_name"] = reference_video
-    analysis_results["video_length_seconds"] = frame_count / framerate
+    analysis_results["video_length_seconds"] = duration
     analysis_results["video_framerate"] = framerate
     analysis_results["video_resolution"] = f"{width}x{height}"
     analysis_results["block_size"] = block_size
     analysis_results["target_bitrate_bps"] = target_bitrate
-    
-    # Save analysis results to a JSON file
+
     results_json_path = os.path.join(experiment_dir, "analysis_results.json")
-    with open(results_json_path, 'w') as f:
+    pipeline_params["derived"]["analysis_results_path"] = results_json_path
+    analysis_results["parameters"] = pipeline_params
+    analysis_results["experiment_dir"] = experiment_dir
+    analysis_results["analysis_results_path"] = results_json_path
+
+    with open(results_json_path, "w") as f:
         json.dump(analysis_results, f, indent=4)
+
     print(f"Analysis results saved to: {results_json_path}")
+
+    return analysis_results
+
+
+def _parse_analysis_frames_arg(value: Optional[str]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    frames: List[int] = []
+    for part in value.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            frames.append(int(part))
+        except ValueError:
+            raise ValueError(f"Invalid frame index '{part}' in --analysis-sample-frames") from None
+    return frames
+
+
+def _load_config_from_cli() -> ElvisConfig:
+    parser = argparse.ArgumentParser(description="Run the ELVIS pipeline with configurable parameters.")
+    parser.add_argument("--config", type=str, help="Path to a JSON file containing ElvisConfig fields.")
+    parser.add_argument("--reference-video", type=str, help="Path to the input reference video.")
+    parser.add_argument("--experiment-dir", type=str, help="Directory to store experiment artefacts.")
+    parser.add_argument("--width", type=int, help="Target frame width.")
+    parser.add_argument("--height", type=int, help="Target frame height.")
+    parser.add_argument("--block-size", type=int, help="Processing block size.")
+    parser.add_argument("--shrink-amount", type=float, help="Shrink amount for ELVIS v1.")
+    parser.add_argument("--quality-factor", type=float, help="Quality factor for target bitrate calculation.")
+    parser.add_argument("--target-bitrate", type=int, help="Override target bitrate in bits per second")
+    parser.add_argument("--framerate", type=float, help="Override source framerate.")
+    parser.add_argument("--removability-alpha", type=float, help="Alpha parameter for removability scoring.")
+    parser.add_argument("--removability-smoothing-beta", type=float, help="Smoothing beta for removability scoring.")
+    parser.add_argument("--analysis-sample-frames", type=str, help="Comma-separated frame indices for analysis.")
+    parser.add_argument("--roi-save-qp-maps", dest="roi_save_qp_maps", action="store_true", help="Enable saving QP maps.")
+    parser.add_argument("--no-roi-save-qp-maps", dest="roi_save_qp_maps", action="store_false", help="Disable saving QP maps.")
+    parser.set_defaults(roi_save_qp_maps=None)
+    parser.add_argument("--generate-opencv-benchmarks", dest="generate_opencv_benchmarks", action="store_true", help="Enable OpenCV baseline generation.")
+    parser.add_argument("--disable-opencv-benchmarks", dest="generate_opencv_benchmarks", action="store_false", help="Disable OpenCV baseline generation.")
+    parser.set_defaults(generate_opencv_benchmarks=None)
+    parser.add_argument("--metric-stride", type=int, help="Stride for PSNR/SSIM/LPIPS metrics.")
+    parser.add_argument("--fvmd-stride", type=int, help="Stride for FVMD computation.")
+    parser.add_argument("--fvmd-max-frames", type=int, help="Maximum frames for FVMD computation.")
+    parser.add_argument("--fvmd-processes", type=int, help="Number of FVMD worker processes.")
+    parser.add_argument("--fvmd-early-stop-delta", type=float, help="Early stop delta for FVMD.")
+    parser.add_argument("--fvmd-early-stop-window", type=int, help="Early stop window for FVMD.")
+    parser.add_argument("--vmaf-stride", type=int, help="Stride for VMAF computation.")
+
+    args = parser.parse_args()
+
+    config_data: Dict[str, Any] = asdict(ElvisConfig())
+
+    if args.config:
+        with open(args.config, "r") as f:
+            file_config = json.load(f)
+        config_data.update(file_config)
+
+    overrides = {
+        "reference_video": args.reference_video,
+        "experiment_dir": args.experiment_dir,
+        "width": args.width,
+        "height": args.height,
+        "block_size": args.block_size,
+        "shrink_amount": args.shrink_amount,
+        "quality_factor": args.quality_factor,
+        "target_bitrate_override": args.target_bitrate,
+        "force_framerate": args.framerate,
+        "removability_alpha": args.removability_alpha,
+        "removability_smoothing_beta": args.removability_smoothing_beta,
+        "metric_stride": args.metric_stride,
+        "fvmd_stride": args.fvmd_stride,
+        "fvmd_max_frames": args.fvmd_max_frames,
+        "fvmd_processes": args.fvmd_processes,
+        "fvmd_early_stop_delta": args.fvmd_early_stop_delta,
+        "fvmd_early_stop_window": args.fvmd_early_stop_window,
+        "vmaf_stride": args.vmaf_stride,
+    }
+
+    for key, value in overrides.items():
+        if value is not None:
+            config_data[key] = value
+
+    if args.roi_save_qp_maps is not None:
+        config_data["roi_save_qp_maps"] = args.roi_save_qp_maps
+
+    if args.generate_opencv_benchmarks is not None:
+        config_data["generate_opencv_benchmarks"] = args.generate_opencv_benchmarks
+
+    analysis_frames = _parse_analysis_frames_arg(args.analysis_sample_frames)
+    if analysis_frames is not None:
+        config_data["analysis_sample_frames"] = analysis_frames
+
+    return ElvisConfig(**config_data)
+
+
+def main() -> None:
+    config = _load_config_from_cli()
+    results = run_elvis(config)
+    path = results.get("analysis_results_path")
+    if path:
+        print(f"\nFinal analysis JSON: {path}")
+
+
+if __name__ == "__main__":
+    main()
