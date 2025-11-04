@@ -9,7 +9,7 @@ import contextlib
 import warnings
 from dataclasses import dataclass, asdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from itertools import islice
+from itertools import islice, cycle
 from pathlib import Path
 import cv2
 import numpy as np
@@ -28,7 +28,10 @@ import lpips
 import platform
 import tempfile
 import uuid
-from fvmd import fvmd
+from fvmd.datasets.video_datasets import VideoDataset
+from fvmd.keypoint_tracking import track_keypoints
+from fvmd.extract_motion_features import calc_hist
+from fvmd.frechet_distance import calculate_fd_given_vectors
 import sys
 from instantir import InstantIRRuntime, load_runtime, restore_images_batch
 
@@ -440,10 +443,10 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
     fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
 
     metrics = [
-        ('psnr_mean', 'PSNR (dB)', [20, 50]),
         ('ssim_mean', 'SSIM', [0, 1]),
-        ('lpips_mean', 'LPIPS (lower is better)', [0, 0.5]),
         ('vmaf_mean', 'VMAF', [0, 100]),
+        ('lpips_mean', 'LPIPS (lower is better)', [0, 0.6]),
+        ('fvmd', 'FVMD (lower is better)', None),
     ]
 
     for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
@@ -458,8 +461,10 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
         bars1 = ax.bar(x - width / 2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
         bars2 = ax.bar(x + width / 2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
 
-        if metric_key in ['psnr_mean', 'vmaf_mean']:
+        if metric_key == 'vmaf_mean':
             ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
+        elif metric_key == 'fvmd':
+            ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.0f'))
         else:
             ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
 
@@ -469,15 +474,27 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
         ax.set_xticklabels(video_names, rotation=45, ha='right')
         ax.legend()
         ax.grid(axis='y', alpha=0.3, linestyle='--')
-        ax.set_ylim(ylim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
+        else:
+            all_values = fg_values + bg_values
+            max_value = max(all_values) if all_values else 0.0
+            upper_bound = max(max_value * 1.1, 0.1)
+            ax.set_ylim([0, upper_bound])
 
         for bars in [bars1, bars2]:
             for bar in bars:
                 height = bar.get_height()
+                if metric_key == 'vmaf_mean':
+                    value_label = f'{height:.1f}'
+                elif metric_key == 'fvmd':
+                    value_label = f'{height:.0f}'
+                else:
+                    value_label = f'{height:.3f}'
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
                     height,
-                    f'{height:.2f}',
+                    value_label,
                     ha='center',
                     va='bottom',
                     fontsize=8,
@@ -1806,8 +1823,8 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
         # --- Part 1: Generate the detailed per-block qpfile ---
         print("Generating detailed qpfile for per-block quality control...")
 
-        # Map normalized scores [0, 1] to QP values [1, 50]
-        qp_maps = np.round(removability_scores * 49 + 1).astype(int)
+        # Map normalized scores [0, 1] to QP offsets [-1, 1]
+        qp_maps = np.clip((removability_scores * 2.0) - 1.0, -1.0, 1.0)
 
         # Generate qpfile with optimized string building
         with open(qpfile_path, 'w') as f:
@@ -2756,65 +2773,6 @@ def restore_blur_opencv_unsharp_mask(blurred_image: np.ndarray, blur_maps: np.nd
     
     return combine_blocks_into_image(restored_blocks)
 
-def restore_blur_opencv_wiener_approximation(blurred_image: np.ndarray, blur_maps: np.ndarray, block_size: int) -> np.ndarray:
-    """
-    Restores a blurred image using a Wiener filter approximation with OpenCV.
-    This uses a combination of deconvolution and denoising to restore sharpness.
-    
-    Since OpenCV doesn't have a direct Wiener filter, we approximate it using:
-    1. High-pass filtering to enhance edges
-    2. Adaptive histogram equalization to improve contrast
-    3. Bilateral filtering to reduce noise while preserving edges
-    
-    Args:
-        blurred_image: The blurred image in BGR format
-        blur_maps: 2D array (num_blocks_y, num_blocks_x) indicating blur rounds applied to each block
-        block_size: The side length of each block
-    
-    Returns:
-        The restored image with Wiener-like deconvolution applied
-    """
-    # Split image into blocks
-    num_blocks_y, num_blocks_x = blur_maps.shape
-    blocks = split_image_into_blocks(blurred_image, block_size)
-    
-    # Apply restoration to each block based on its blur strength
-    restored_blocks = np.zeros_like(blocks)
-    for i in range(num_blocks_y):
-        for j in range(num_blocks_x):
-            block = blocks[i, j]
-            blur_strength = int(blur_maps[i, j])
-            
-            if blur_strength > 0:
-                # Apply adaptive sharpening
-                # 1. Convert to LAB color space for better results
-                lab = cv2.cvtColor(block, cv2.COLOR_BGR2LAB)
-                l, a, b = cv2.split(lab)
-                
-                # 2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
-                clahe = cv2.createCLAHE(clipLimit=2.0 * blur_strength, tileGridSize=(8, 8))
-                l = clahe.apply(l)
-                
-                # 3. Merge channels and convert back to BGR
-                enhanced = cv2.merge([l, a, b])
-                enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
-                
-                # 4. Apply bilateral filter to reduce noise while preserving edges
-                sigma = max(5, blur_strength * 5)
-                denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=sigma, sigmaSpace=sigma)
-                
-                # 5. Sharpen using unsharp mask
-                amount = blur_strength * 0.3
-                blurred_temp = cv2.GaussianBlur(denoised, (0, 0), max(1, blur_strength * 0.5))
-                sharpened = cv2.addWeighted(denoised, 1.0 + amount, blurred_temp, -amount, 0)
-                
-                restored_blocks[i, j] = np.clip(sharpened, 0, 255).astype(np.uint8)
-            else:
-                # No blurring was applied
-                restored_blocks[i, j] = block
-    
-    return combine_blocks_into_image(restored_blocks)
-
 def restore_with_instantir_adaptive(
     input_frames_dir: str,
     blur_maps: np.ndarray,
@@ -3258,25 +3216,68 @@ def calculate_fvmd(
     max_frames: Optional[int] = None,
     early_stop_delta: float = 0.002,
     early_stop_window: int = 50,
-) -> float:
-    """Calculate FVMD (Fréchet Video Mask Distance) with optional subsampling and early exit."""
+    device: Optional[int] = None,
+) -> Tuple[float, float]:
+    """Calculate FVMD (Fréchet Video Mask Distance) statistics.
+
+    Returns a tuple containing the aggregated FVMD value (matching previous
+    behaviour) and the standard deviation computed over the sampled frames
+    respecting the provided stride.
+    """
 
     if not reference_frames or not decoded_frames:
         raise ValueError("Both reference_frames and decoded_frames must contain at least one frame.")
 
     total_frames = min(len(reference_frames), len(decoded_frames))
-    indices = list(range(0, total_frames, max(1, stride)))
+    if total_frames < 2:
+        raise ValueError("FVMD requires at least two frames in both reference and decoded sequences.")
 
-    if max_frames is not None and max_frames > 0:
-        indices = indices[:max_frames]
+    base_stride = max(1, stride)
 
-    if not indices:
-        raise ValueError("FVMD sampling produced no frames to evaluate.")
+    def _build_indices(stride_value: int) -> List[int]:
+        idxs = list(range(0, total_frames, stride_value))
+        if len(idxs) < 2 and total_frames >= 2:
+            idxs = [0, total_frames - 1]
+        if max_frames is not None and max_frames > 0:
+            idxs = idxs[:max_frames]
+        unique: List[int] = []
+        seen: set[int] = set()
+        for idx in idxs:
+            if idx not in seen:
+                unique.append(idx)
+                seen.add(idx)
+        return unique
 
-    # Ensure early_stop_window is sensible
-    window = max(1, early_stop_window)
+    class _FvmdNoTrajectories(RuntimeError):
+        pass
 
-    def _compute_once(frame_indices: Sequence[int]) -> float:
+    def _render_frames(frame_indices: Sequence[int], gt_clip: Path, gen_clip: Path) -> None:
+        for idx, frame_idx in enumerate(frame_indices, start=1):
+            ref_frame = reference_frames[frame_idx]
+            dec_frame = decoded_frames[frame_idx]
+
+            if ref_frame is None or dec_frame is None:
+                raise ValueError("Frames must not be None when computing FVMD.")
+
+            ref_frame_contig = np.ascontiguousarray(ref_frame)
+            dec_frame_contig = np.ascontiguousarray(dec_frame)
+
+            if ref_frame_contig.dtype != np.uint8:
+                ref_frame_contig = np.clip(ref_frame_contig, 0, 255).astype(np.uint8)
+            if dec_frame_contig.dtype != np.uint8:
+                dec_frame_contig = np.clip(dec_frame_contig, 0, 255).astype(np.uint8)
+
+            ref_path = gt_clip / f"{idx:05d}.png"
+            dec_path = gen_clip / f"{idx:05d}.png"
+
+            if not cv2.imwrite(str(ref_path), ref_frame_contig):
+                raise RuntimeError(f"Failed to write reference frame for FVMD: {ref_path}")
+            if not cv2.imwrite(str(dec_path), dec_frame_contig):
+                raise RuntimeError(f"Failed to write decoded frame for FVMD: {dec_path}")
+
+    min_required_frames = 10
+
+    def _run_fvmd_once(frame_indices: Sequence[int]) -> float:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             gt_root = tmp_path / "gt"
@@ -3287,28 +3288,7 @@ def calculate_fvmd(
             gt_clip.mkdir(parents=True, exist_ok=True)
             gen_clip.mkdir(parents=True, exist_ok=True)
 
-            for idx, frame_idx in enumerate(frame_indices, start=1):
-                ref_frame = reference_frames[frame_idx]
-                dec_frame = decoded_frames[frame_idx]
-
-                if ref_frame is None or dec_frame is None:
-                    raise ValueError("Frames must not be None when computing FVMD.")
-
-                ref_frame_contig = np.ascontiguousarray(ref_frame)
-                dec_frame_contig = np.ascontiguousarray(dec_frame)
-
-                if ref_frame_contig.dtype != np.uint8:
-                    ref_frame_contig = np.clip(ref_frame_contig, 0, 255).astype(np.uint8)
-                if dec_frame_contig.dtype != np.uint8:
-                    dec_frame_contig = np.clip(dec_frame_contig, 0, 255).astype(np.uint8)
-
-                ref_path = gt_clip / f"{idx:05d}.png"
-                dec_path = gen_clip / f"{idx:05d}.png"
-
-                if not cv2.imwrite(str(ref_path), ref_frame_contig):
-                    raise RuntimeError(f"Failed to write reference frame for FVMD: {ref_path}")
-                if not cv2.imwrite(str(dec_path), dec_frame_contig):
-                    raise RuntimeError(f"Failed to write decoded frame for FVMD: {dec_path}")
+            _render_frames(frame_indices, gt_clip, gen_clip)
 
             if log_root is None:
                 logs_root_path = tmp_path / "fvmd_logs"
@@ -3319,33 +3299,156 @@ def calculate_fvmd(
             run_log_dir = logs_root_path / f"run_{uuid.uuid4().hex}"
             run_log_dir.mkdir(parents=True, exist_ok=True)
 
-            score = fvmd(
-                log_dir=str(run_log_dir),
-                gen_path=str(gen_root),
-                gt_path=str(gt_root),
+            if len(frame_indices) < min_required_frames:
+                raise _FvmdNoTrajectories(
+                    f"Only {len(frame_indices)} frame(s) sampled; FVMD requires at least {min_required_frames}."
+                )
+
+            clip_seq_len = max(min_required_frames, min(16, len(frame_indices)))
+
+            gen_dataset = VideoDataset(str(gen_root), seq_len=clip_seq_len, stride=1)
+            gt_dataset = VideoDataset(str(gt_root), seq_len=clip_seq_len, stride=1)
+            if len(gen_dataset) == 0 or len(gt_dataset) == 0:
+                raise _FvmdNoTrajectories("Insufficient frames after sampling for FVMD evaluation.")
+
+            if not torch.cuda.is_available():
+                raise RuntimeError("FVMD evaluation requires a CUDA-capable GPU, but none were detected.")
+
+            available_gpus = torch.cuda.device_count()
+            if device is not None:
+                if device < 0 or device >= available_gpus:
+                    raise ValueError(f"Requested FVMD device index {device} is out of range (found {available_gpus}).")
+                device_ids = [int(device)]
+            else:
+                device_ids = [0]
+
+            torch.cuda.set_device(device_ids[0])
+            device_label = f"cuda:{device_ids[0]}"
+            print(f"    FVMD evaluating {len(frame_indices)} frame(s) on {device_label}")
+
+            try:
+                velo_gen, velo_gt, acc_gen, acc_gt = track_keypoints(
+                    log_dir=str(run_log_dir),
+                    gen_dataset=gen_dataset,
+                    gt_dataset=gt_dataset,
+                    v_stride=1,
+                    S=clip_seq_len,
+                    device_ids=device_ids,
+                )
+            except RuntimeError as exc:
+                raise _FvmdNoTrajectories(str(exc)) from exc
+
+            if any(arr.size == 0 for arr in (velo_gen, velo_gt, acc_gen, acc_gt)):
+                raise _FvmdNoTrajectories("FVMD keypoint tracking returned empty trajectories.")
+
+            B = velo_gen.shape[0]
+            if B == 0:
+                raise _FvmdNoTrajectories("FVMD keypoint tracking produced zero batches.")
+
+            try:
+                gt_v_hist = calc_hist(velo_gt).reshape(B, -1)
+                gen_v_hist = calc_hist(velo_gen).reshape(B, -1)
+                gt_a_hist = calc_hist(acc_gt).reshape(B, -1)
+                gen_a_hist = calc_hist(acc_gen).reshape(B, -1)
+            except ValueError as exc:
+                raise _FvmdNoTrajectories(f"Histogram computation failed: {exc}") from exc
+
+            gt_hist = np.concatenate((gt_v_hist, gt_a_hist), axis=1)
+            gen_hist = np.concatenate((gen_v_hist, gen_a_hist), axis=1)
+
+            fvmd_value = calculate_fd_given_vectors(gt_hist, gen_hist)
+            if not np.isfinite(fvmd_value):
+                raise RuntimeError("FVMD produced a non-finite score.")
+
+        return float(fvmd_value)
+
+    def _compute_std(selected_indices: Sequence[int]) -> float:
+        if len(selected_indices) < 2:
+            return 0.0
+
+        scores: List[float] = []
+        warned = False
+        window_span = min(len(selected_indices), max(min_required_frames, 8))
+        for start in range(0, len(selected_indices) - window_span + 1):
+            window_indices = selected_indices[start : start + window_span]
+            try:
+                scores.append(_run_fvmd_once(window_indices))
+            except _FvmdNoTrajectories as exc:
+                if not warned:
+                    print(
+                        "  Warning: FVMD could not compute variability for one or more windows; "
+                        f"first failure involving frames {window_indices}: {exc}"
+                    )
+                    warned = True
+
+        if len(scores) <= 1:
+            return 0.0
+
+        return float(np.std(scores, ddof=1))
+
+    window = max(1, early_stop_window)
+    attempt_stride = base_stride
+
+    while True:
+        indices = _build_indices(attempt_stride)
+        if len(indices) < min_required_frames:
+            if attempt_stride == 1:
+                raise ValueError(
+                    f"FVMD requires at least {min_required_frames} sampled frames; provide more frames or disable stride."
+                )
+            next_stride = max(1, attempt_stride // 2)
+            if next_stride == attempt_stride:
+                next_stride = attempt_stride - 1
+            print(
+                f"  Warning: FVMD sampling with stride {attempt_stride} yielded only {len(indices)} frame(s); retrying with stride {next_stride}."
             )
+            attempt_stride = next_stride
+            continue
 
-        return float(score)
+        processed = 0
+        last_score: Optional[float] = None
+        used_indices: Sequence[int] = []
 
-    processed = 0
-    last_score: Optional[float] = None
+        try:
+            while processed < len(indices):
+                next_count = min(len(indices), processed + window)
+                current_indices = indices[:next_count]
+                current_score = _run_fvmd_once(current_indices)
+                used_indices = list(current_indices)
 
-    while processed < len(indices):
-        next_count = min(len(indices), processed + window)
-        current_indices = indices[:next_count]
-        current_score = _compute_once(current_indices)
+                if last_score is not None:
+                    baseline = max(abs(last_score), 1e-6)
+                    delta = abs(current_score - last_score) / baseline
+                    if delta < early_stop_delta:
+                        std_value = _compute_std(used_indices)
+                        if attempt_stride != base_stride:
+                            print(
+                                f"  Info: FVMD used effective stride {attempt_stride} instead of requested {base_stride}."
+                            )
+                        return current_score, std_value
 
-        if last_score is not None:
-            baseline = max(abs(last_score), 1e-6)
-            delta = abs(current_score - last_score) / baseline
-            if delta < early_stop_delta:
-                return current_score
+                last_score = current_score
+                processed = next_count
 
-        last_score = current_score
-        processed = next_count
+            assert last_score is not None
+            std_value = _compute_std(used_indices if used_indices else indices)
+            if attempt_stride != base_stride:
+                print(f"  Info: FVMD used effective stride {attempt_stride} instead of requested {base_stride}.")
+            return last_score, std_value
 
-    assert last_score is not None
-    return last_score
+        except _FvmdNoTrajectories as exc:
+            if attempt_stride == 1:
+                raise RuntimeError(
+                    "FVMD failed to track keypoints even with stride=1. Consider reviewing the input frames or masks."
+                ) from exc
+
+            next_stride = max(1, attempt_stride // 2)
+            if next_stride == attempt_stride:
+                next_stride = attempt_stride - 1
+            print(
+                f"  Warning: FVMD tracking failed with stride {attempt_stride}; retrying with stride {next_stride}."
+            )
+            attempt_stride = next_stride
 
 def analyze_encoding_performance(
     reference_frames: List[np.ndarray],
@@ -3462,6 +3565,12 @@ def analyze_encoding_performance(
                 fvmd_executor = ProcessPoolExecutor(max_workers=max_workers)
             print(f"  Using spawn-based FVMD worker pool with {max_workers} process(es)")
 
+    fvmd_device_cycle: Optional[Iterator[int]] = None
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if gpu_count > 0:
+            fvmd_device_cycle = cycle(range(gpu_count))
+
     # --- Generate OpenCV Restoration Benchmarks ---
     opencv_benchmarks: Dict[str, str] = {}
     if generate_opencv_benchmarks and strength_maps is not None:
@@ -3548,23 +3657,6 @@ def analyze_encoding_performance(
                 opencv_benchmarks[f"{method_name} (OpenCV Unsharp Mask)"] = unsharp_video
                 video_bitrates[f"{method_name} (OpenCV Unsharp Mask)"] = video_bitrates.get(method_name, 0)
 
-                print("  - Generating Wiener approximation restoration benchmark...")
-                benchmark_frames_wiener = []
-                for frame_idx, frame in enumerate(reference_frames):
-                    blurred_frame, _ = filter_frame_gaussian(frame, maps[frame_idx] / np.max(maps[frame_idx]) if np.max(maps[frame_idx]) > 0 else maps[frame_idx], block_size)
-                    restored_frame = restore_blur_opencv_wiener_approximation(blurred_frame, maps[frame_idx], block_size)
-                    benchmark_frames_wiener.append(restored_frame)
-
-                wiener_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_wiener_frames")
-                os.makedirs(wiener_frames_dir, exist_ok=True)
-                for i, frame in enumerate(benchmark_frames_wiener):
-                    cv2.imwrite(os.path.join(wiener_frames_dir, f"{i+1:05d}.png"), frame)
-
-                wiener_video = os.path.join(benchmarks_dir, f"{method_name}_wiener.mp4")
-                encode_video(wiener_frames_dir, wiener_video, framerate, width, height, target_bitrate=video_bitrates.get(method_name, 1000000))
-                opencv_benchmarks[f"{method_name} (OpenCV Wiener Approx)"] = wiener_video
-                video_bitrates[f"{method_name} (OpenCV Wiener Approx)"] = video_bitrates.get(method_name, 0)
-
         encoded_videos.update(opencv_benchmarks)
 
         print(f"\nGenerated {len(opencv_benchmarks)} OpenCV restoration benchmarks.")
@@ -3596,8 +3688,8 @@ def analyze_encoding_performance(
         slug = _slugify_name(video_name)
 
         analysis_results[video_name] = {
-            'foreground': {'fvmd': 0.0},
-            'background': {'fvmd': 0.0},
+            'foreground': {'fvmd': 0.0, 'fvmd_std': 0.0},
+            'background': {'fvmd': 0.0, 'fvmd_std': 0.0},
             'bitrate_mbps': video_bitrates.get(video_name, 0) / 1_000_000,
         }
 
@@ -3721,6 +3813,7 @@ def analyze_encoding_performance(
         dec_bg_fvmd_frames = [masked_decoded_bg_frames[i] for i in fvmd_indices]
 
         if fvmd_executor is not None:
+            fg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
             fvmd_tasks.append((video_name, 'foreground', fvmd_executor.submit(
                 calculate_fvmd,
                 ref_fg_fvmd_frames,
@@ -3730,7 +3823,9 @@ def analyze_encoding_performance(
                 max_frames=None,
                 early_stop_delta=fvmd_early_stop_delta,
                 early_stop_window=fvmd_early_stop_window,
+                device=fg_device,
             )))
+            bg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
             fvmd_tasks.append((video_name, 'background', fvmd_executor.submit(
                 calculate_fvmd,
                 ref_bg_fvmd_frames,
@@ -3740,9 +3835,11 @@ def analyze_encoding_performance(
                 max_frames=None,
                 early_stop_delta=fvmd_early_stop_delta,
                 early_stop_window=fvmd_early_stop_window,
+                device=bg_device,
             )))
         else:
-            analysis_results[video_name]['foreground']['fvmd'] = calculate_fvmd(
+            fg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
+            fg_fvmd_mean, fg_fvmd_std = calculate_fvmd(
                 ref_fg_fvmd_frames,
                 dec_fg_fvmd_frames,
                 log_root=fvmd_log_root,
@@ -3750,8 +3847,10 @@ def analyze_encoding_performance(
                 max_frames=None,
                 early_stop_delta=fvmd_early_stop_delta,
                 early_stop_window=fvmd_early_stop_window,
+                device=fg_device,
             )
-            analysis_results[video_name]['background']['fvmd'] = calculate_fvmd(
+            bg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
+            bg_fvmd_mean, bg_fvmd_std = calculate_fvmd(
                 ref_bg_fvmd_frames,
                 dec_bg_fvmd_frames,
                 log_root=fvmd_log_root,
@@ -3759,7 +3858,13 @@ def analyze_encoding_performance(
                 max_frames=None,
                 early_stop_delta=fvmd_early_stop_delta,
                 early_stop_window=fvmd_early_stop_window,
+                device=bg_device,
             )
+
+            analysis_results[video_name]['foreground']['fvmd'] = fg_fvmd_mean
+            analysis_results[video_name]['foreground']['fvmd_std'] = fg_fvmd_std
+            analysis_results[video_name]['background']['fvmd'] = bg_fvmd_mean
+            analysis_results[video_name]['background']['fvmd_std'] = bg_fvmd_std
 
         for frame_idx in sample_frames_unique:
             if frame_idx >= frame_count:
@@ -3793,11 +3898,16 @@ def analyze_encoding_performance(
     if fvmd_executor is not None:
         for video_name, region, future in fvmd_tasks:
             try:
-                score = future.result()
+                mean_val, std_val = future.result()
             except Exception as exc:
-                print(f"  Warning: FVMD failed for '{video_name}' ({region}): {exc}")
-                score = 0.0
-            analysis_results.setdefault(video_name, {}).setdefault(region, {})['fvmd'] = score
+                if fvmd_executor is not None:
+                    fvmd_executor.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(
+                    f"FVMD failed for '{video_name}' ({region})"
+                ) from exc
+            region_metrics = analysis_results.setdefault(video_name, {}).setdefault(region, {})
+            region_metrics['fvmd'] = mean_val
+            region_metrics['fvmd_std'] = std_val
         fvmd_executor.shutdown(wait=True)
 
     if analysis_results:

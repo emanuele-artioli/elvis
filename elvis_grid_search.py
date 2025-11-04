@@ -19,8 +19,8 @@ GRID_RESULTS_DIR = Path("grid_search_results")
 # Single-value lists keep the search manageable by default while allowing easy edits.
 PARAMETER_GRID: Dict[str, List[Any]] = {
     "reference_video": [
-        "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4",
-        "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/camel.mp4",
+        # "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4",
+        # "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/camel.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/dance-jump.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/elephant.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/flamingo.mp4",
@@ -71,7 +71,7 @@ PARAMETER_GRID: Dict[str, List[Any]] = {
     "propainter_resize_ratio": [1.0],
     "propainter_ref_stride": [20],
     "propainter_neighbor_length": [4],
-    "propainter_subvideo_length": [40],
+    "propainter_subvideo_length": [30],
     "propainter_mask_dilation": [4],
     "propainter_raft_iter": [20],
     "propainter_fp16": [True],
@@ -103,14 +103,14 @@ PARAMETER_GRID: Dict[str, List[Any]] = {
     "instantir_seed": [42],
     "instantir_devices": [None],
     "instantir_batch_size": [4],
-    "instantir_parallel_chunk_length": [None],
+    "instantir_parallel_chunk_length": [30],
     "analysis_sample_frames": [None],
     "generate_opencv_benchmarks": [True],
     "metric_stride": [1],
-    "fvmd_stride": [1],
+    "fvmd_stride": [5],
     "fvmd_max_frames": [None],
-    "fvmd_processes": [None],
-    "fvmd_early_stop_delta": [0.002],
+    "fvmd_processes": [16],
+    "fvmd_early_stop_delta": [0.01],
     "fvmd_early_stop_window": [50],
     "vmaf_stride": [1],
 }
@@ -156,31 +156,30 @@ def main() -> None:
     for run_index, combo in enumerate(combinations, start=1):
         overrides = {key: combo[idx] for idx, key in enumerate(grid_keys)}
 
+        slug_source = {key: overrides[key] for key in varying_keys}
+        slug = _slugify(slug_source) or f"run_{run_index:03d}"
+        final_dir = GRID_RESULTS_DIR / slug
+
         config_data = asdict(ElvisConfig())
         config_data.update(overrides)
+        config_data["experiment_dir"] = str(final_dir)
         config = ElvisConfig(**config_data)
 
         experiment_path = Path(config.experiment_dir)
         _ensure_clean_dir(experiment_path)
+        experiment_path.mkdir(parents=True, exist_ok=True)
 
         print(f"\n[{run_index}/{len(combinations)}] Running configuration: {overrides}")
         results = run_elvis(config)
 
-        slug_source = {key: overrides[key] for key in varying_keys}
-        slug = _slugify(slug_source) or f"run_{run_index:03d}"
-        final_dir = GRID_RESULTS_DIR / slug
-        _ensure_clean_dir(final_dir)
-
-        shutil.move(str(experiment_path), final_dir)
-
-        analysis_path = final_dir / "analysis_results.json"
+        analysis_path = experiment_path / "analysis_results.json"
         analysis_data: Dict[str, Any] = results
         if analysis_path.exists():
             with analysis_path.open("r") as fp:
                 analysis_data = json.load(fp)
-            analysis_data.setdefault("parameters", {}).setdefault("derived", {})["experiment_dir"] = str(final_dir)
+            analysis_data.setdefault("parameters", {}).setdefault("derived", {})["experiment_dir"] = str(experiment_path)
             analysis_data["parameters"]["derived"]["analysis_results_path"] = str(analysis_path)
-            analysis_data["experiment_dir"] = str(final_dir)
+            analysis_data["experiment_dir"] = str(experiment_path)
             analysis_data["analysis_results_path"] = str(analysis_path)
             analysis_data["grid_search_label"] = slug
             with analysis_path.open("w") as fp:
