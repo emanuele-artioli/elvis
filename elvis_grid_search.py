@@ -19,8 +19,8 @@ GRID_RESULTS_DIR = Path("grid_search_results")
 # Single-value lists keep the search manageable by default while allowing easy edits.
 PARAMETER_GRID: Dict[str, List[Any]] = {
     "reference_video": [
-        # "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4",
-        # "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/camel.mp4",
+        "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4",
+        "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/camel.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/dance-jump.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/elephant.mp4",
         "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/flamingo.mp4",
@@ -46,6 +46,7 @@ PARAMETER_GRID: Dict[str, List[Any]] = {
     "height": [360],
     "block_size": [8],
     "shrink_amount": [0.25],
+    "enable_fvmd": [True],
     "quality_factor": [1.2],
     "target_bitrate_override": [None],
     "force_framerate": [None],
@@ -102,8 +103,9 @@ PARAMETER_GRID: Dict[str, List[Any]] = {
     "instantir_preview_start": [0.0],
     "instantir_seed": [42],
     "instantir_devices": [None],
-    "instantir_batch_size": [4],
-    "instantir_parallel_chunk_length": [30],
+    "instantir_batch_size": [3],
+    # InstantIR workers now ignore chunk length overrides; keep for compatibility.
+    "instantir_parallel_chunk_length": [None],
     "analysis_sample_frames": [None],
     "generate_opencv_benchmarks": [True],
     "metric_stride": [1],

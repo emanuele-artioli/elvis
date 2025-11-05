@@ -7,6 +7,7 @@ import math
 import threading
 import contextlib
 import warnings
+import gc
 from dataclasses import dataclass, asdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from itertools import islice, cycle
@@ -28,10 +29,19 @@ import lpips
 import platform
 import tempfile
 import uuid
+import builtins
+
+os.environ.setdefault("LOGURU_LEVEL", "WARNING")
+
 from fvmd.datasets.video_datasets import VideoDataset
 from fvmd.keypoint_tracking import track_keypoints
 from fvmd.extract_motion_features import calc_hist
 from fvmd.frechet_distance import calculate_fd_given_vectors
+
+try:
+    from loguru import logger as _loguru_logger
+except ImportError:  # pragma: no cover - optional dependency
+    _loguru_logger = None
 import sys
 from instantir import InstantIRRuntime, load_runtime, restore_images_batch
 
@@ -56,6 +66,7 @@ class ElvisConfig:
     height: int = 360
     block_size: int = 8
     shrink_amount: float = 0.25
+    enable_fvmd: bool = True
     quality_factor: float = 1.2
     target_bitrate_override: Optional[int] = None
     force_framerate: Optional[float] = None
@@ -123,6 +134,35 @@ class ElvisConfig:
     fvmd_early_stop_delta: float = 0.002
     fvmd_early_stop_window: int = 50
     vmaf_stride: int = 1
+    
+@dataclass
+class _EvaluationContext:
+    reference_frames: Sequence[np.ndarray]
+    masked_reference_fg_frames: Sequence[np.ndarray]
+    masked_reference_bg_frames: Sequence[np.ndarray]
+    fg_masks: Sequence[np.ndarray]
+    bg_masks: Sequence[np.ndarray]
+    roi_slice: Tuple[slice, slice]
+    crop_width: int
+    crop_height: int
+    crop_filter: str
+    framerate: float
+    block_size: int
+    masked_videos_dir: str
+    heatmaps_dir: str
+    fvmd_log_root: str
+    sample_frames: List[int]
+    enable_fvmd: bool
+
+
+_EVALUATION_CONTEXT: Optional[_EvaluationContext] = None
+
+
+def _initialise_evaluation_worker(context: _EvaluationContext) -> None:
+    """Initializer that seeds worker processes with shared evaluation context."""
+
+    global _EVALUATION_CONTEXT
+    _EVALUATION_CONTEXT = context
 
 
 def _list_or_none(value: Optional[Sequence[Any]]) -> Optional[List[Any]]:
@@ -131,18 +171,83 @@ def _list_or_none(value: Optional[Sequence[Any]]) -> Optional[List[Any]]:
     return list(value)
 
 
+class _NullStream:
+    """Lightweight write-only stream that safely discards all data."""
+
+    def write(self, text: str) -> int:  # type: ignore[override]
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def writelines(self, lines: Sequence[str]) -> None:  # pragma: no cover - trivial
+        for line in lines:
+            self.write(line)
+
+    def close(self) -> None:  # pragma: no cover - noop
+        pass
+
+    @property
+    def closed(self) -> bool:  # pragma: no cover - constant property
+        return False
+
+    def isatty(self) -> bool:  # pragma: no cover - interface compatibility
+        return False
+
+
 @contextlib.contextmanager
 def _silence_console_output() -> Iterator[None]:
-    """Redirect stdout/stderr to null device for noisy third-party calls."""
+    """Redirect stdout/stderr to a resilient null stream for noisy calls."""
+
+    null_stream = _NullStream()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
 
     try:
-        with open(NULL_DEVICE, "w") as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            yield
-    except OSError:
-        # If the null device cannot be opened, fall back to regular execution
+        sys.stdout = null_stream  # type: ignore[assignment]
+        sys.stderr = null_stream  # type: ignore[assignment]
         yield
+    finally:
+        sys.stdout = original_stdout  # type: ignore[assignment]
+        sys.stderr = original_stderr  # type: ignore[assignment]
+
+
+def _safe_print(*args: Any, **kwargs: Any) -> None:
+    """Print helper resilient to closed stdout/stderr streams."""
+
+    target_stream = kwargs.get("file", sys.stdout)
+    try:
+        builtins.print(*args, **kwargs)
+    except (ValueError, OSError):
+        fallback = getattr(sys, "__stdout__", None)
+        if fallback is None or fallback is target_stream:
+            return
+        kwargs["file"] = fallback
+        try:
+            builtins.print(*args, **kwargs)
+        except (ValueError, OSError):
+            pass
 
 _LPIPS_MODEL_CACHE: Dict[str, lpips.LPIPS] = {}
+
+
+def _configure_fvmd_logging() -> None:
+    """Restrict FVMD's internal logger to warnings/errors to reduce noise."""
+
+    if _loguru_logger is None:
+        return
+
+    try:
+        _loguru_logger.disable("fvmd")
+    except Exception:
+        try:
+            _loguru_logger.remove()
+            _loguru_logger.add(sys.stderr, level="WARNING")
+        except Exception:
+            pass
+
+
+_configure_fvmd_logging()
 
 
 def _get_lpips_model(device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> lpips.LPIPS:
@@ -449,6 +554,20 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
         ('fvmd', 'FVMD (lower is better)', None),
     ]
 
+    def _metric_available(metric_key: str) -> bool:
+        for video_name in video_names:
+            for region in ('foreground', 'background'):
+                value = results[video_name][region].get(metric_key)
+                if value is None or (isinstance(value, float) and not math.isfinite(value)):
+                    return False
+        return True
+
+    metrics = [entry for entry in metrics if _metric_available(entry[0])]
+
+    if not metrics:
+        print("  - Skipping quality visualization; no finite metrics available.")
+        return
+
     for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
         ax = axes[idx // 2, idx % 2]
 
@@ -572,6 +691,10 @@ def _generate_patch_comparison(
     ref_bg2_patch, _ = extract_patch(ref_frame, bg2_center_x, bg2_center_y, patch_size)
 
     video_names = list(decoded_frames_cache.keys())
+    if not video_names:
+        print("  - Patch comparison skipped; no decoded frames available at the requested index.")
+        return
+
     num_methods = len(video_names)
 
     fig, axes = plt.subplots(3, num_methods + 1, figsize=(4 * (num_methods + 1), 12))
@@ -813,6 +936,102 @@ def normalize_array(arr: np.ndarray) -> np.ndarray:
     if max_val - min_val > 0:
         return (arr - min_val) / (max_val - min_val)
     return arr
+
+
+def generate_opencv_benchmarks(
+    reference_frames: Sequence[np.ndarray],
+    strength_maps: Optional[Dict[str, np.ndarray]],
+    block_size: int,
+    framerate: float,
+    width: int,
+    height: int,
+    temp_dir: str,
+    video_bitrates: Dict[str, float],
+) -> Tuple[Dict[str, str], Dict[str, float]]:
+    """Generate OpenCV restoration benchmark videos for downstream evaluation."""
+
+    if not strength_maps:
+        return {}, {}
+
+    print("\n" + "=" * 80)
+    print("GENERATING OPENCV RESTORATION BENCHMARKS")
+    print("=" * 80)
+
+    benchmarks_dir = os.path.join(temp_dir, "opencv_benchmarks")
+    os.makedirs(benchmarks_dir, exist_ok=True)
+
+    opencv_benchmarks: Dict[str, str] = {}
+    updated_bitrates = dict(video_bitrates)
+
+    for method_name, maps in strength_maps.items():
+        if maps is None:
+            continue
+
+        print(f"\nProcessing benchmarks for: {method_name}")
+        target_bitrate = video_bitrates.get(method_name, 1_000_000)
+
+        if "downsample" in method_name.lower():
+            print("  - Generating Lanczos restoration benchmark...")
+            benchmark_frames_lanczos: List[np.ndarray] = []
+            for frame_idx, frame in enumerate(reference_frames):
+                map_frame = maps[frame_idx]
+                normalizer = np.max(map_frame)
+                normalized_map = map_frame / normalizer if normalizer > 0 else map_frame
+                downsampled_frame, _ = filter_frame_downsample(frame, normalized_map, block_size)
+                restored_frame = restore_downsample_opencv_lanczos(downsampled_frame, map_frame, block_size)
+                benchmark_frames_lanczos.append(restored_frame)
+
+            lanczos_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_lanczos_frames")
+            os.makedirs(lanczos_frames_dir, exist_ok=True)
+            for i, frame in enumerate(benchmark_frames_lanczos):
+                cv2.imwrite(os.path.join(lanczos_frames_dir, f"{i+1:05d}.png"), frame)
+
+            lanczos_video = os.path.join(benchmarks_dir, f"{method_name}_lanczos.mp4")
+            encode_video(
+                lanczos_frames_dir,
+                lanczos_video,
+                framerate,
+                width,
+                height,
+                target_bitrate=target_bitrate,
+            )
+            key = f"{method_name} (OpenCV Lanczos)"
+            opencv_benchmarks[key] = lanczos_video
+            updated_bitrates[key] = video_bitrates.get(method_name, 0.0)
+
+        elif "gaussian" in method_name.lower() or "blur" in method_name.lower():
+            print("  - Generating unsharp mask restoration benchmark...")
+            benchmark_frames_unsharp: List[np.ndarray] = []
+            for frame_idx, frame in enumerate(reference_frames):
+                map_frame = maps[frame_idx]
+                normalizer = np.max(map_frame)
+                normalized_map = map_frame / normalizer if normalizer > 0 else map_frame
+                blurred_frame, _ = filter_frame_gaussian(frame, normalized_map, block_size)
+                restored_frame = restore_blur_opencv_unsharp_mask(blurred_frame, map_frame, block_size)
+                benchmark_frames_unsharp.append(restored_frame)
+
+            unsharp_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_unsharp_frames")
+            os.makedirs(unsharp_frames_dir, exist_ok=True)
+            for i, frame in enumerate(benchmark_frames_unsharp):
+                cv2.imwrite(os.path.join(unsharp_frames_dir, f"{i+1:05d}.png"), frame)
+
+            unsharp_video = os.path.join(benchmarks_dir, f"{method_name}_unsharp.mp4")
+            encode_video(
+                unsharp_frames_dir,
+                unsharp_video,
+                framerate,
+                width,
+                height,
+                target_bitrate=target_bitrate,
+            )
+            key = f"{method_name} (OpenCV Unsharp Mask)"
+            opencv_benchmarks[key] = unsharp_video
+            updated_bitrates[key] = video_bitrates.get(method_name, 0.0)
+
+    print(f"\nGenerated {len(opencv_benchmarks)} OpenCV restoration benchmarks.")
+    print("=" * 80 + "\n")
+
+    return opencv_benchmarks, updated_bitrates
 
 def calculate_removability_scores(raw_video_file: str, reference_frames_folder: str, width: int, height: int, block_size: int, alpha: float = 0.5, working_dir: str = ".", smoothing_beta: float = 1) -> np.ndarray:
     """
@@ -2581,102 +2800,6 @@ def restore_downsampled_with_realesrgan(
 
 # OpenCV-based restoration benchmarks for Elvis v2
 
-def restore_downsample_opencv_bilinear(downsampled_image: np.ndarray, downscale_maps: np.ndarray, block_size: int) -> np.ndarray:
-    """
-    Restores a downsampled image using OpenCV's bilinear interpolation.
-    This is a simple client-side restoration benchmark that doesn't require any ML models.
-    
-    Args:
-        downsampled_image: The downsampled image (non-uniform block sizes) in BGR format
-        downscale_maps: 2D array (num_blocks_y, num_blocks_x) indicating the downscale factor applied to each block
-        block_size: The side length of each block in the original resolution
-    
-    Returns:
-        The restored image at original resolution using bilinear upscaling
-    """
-    # Convert downscale maps to actual downscale factors (powers of 2)
-    downscale_factors = np.power(2, downscale_maps).astype(np.int32)
-    
-    # Find max downscaling factor
-    max_factor = int(downscale_factors.max())
-    
-    if max_factor == 1:
-        # No downsampling was applied
-        return downsampled_image
-    
-    # Split image into blocks at current resolution
-    height, width, _ = downsampled_image.shape
-    num_blocks_y, num_blocks_x = downscale_maps.shape
-    blocks = split_image_into_blocks(downsampled_image, block_size)
-    
-    # Upscale each block individually using bilinear interpolation
-    restored_blocks = np.zeros_like(blocks)
-    for i in range(num_blocks_y):
-        for j in range(num_blocks_x):
-            factor = downscale_factors[i, j]
-            if factor > 1:
-                # Block was downsampled, upscale it
-                block = blocks[i, j]
-                # Downscale to simulate the degraded version
-                small_size = max(1, block_size // factor)
-                small_block = cv2.resize(block, (small_size, small_size), interpolation=cv2.INTER_AREA)
-                # Upscale back using bilinear interpolation
-                restored_block = cv2.resize(small_block, (block_size, block_size), interpolation=cv2.INTER_LINEAR)
-                restored_blocks[i, j] = restored_block
-            else:
-                # Block was not downsampled
-                restored_blocks[i, j] = blocks[i, j]
-    
-    return combine_blocks_into_image(restored_blocks)
-
-def restore_downsample_opencv_bicubic(downsampled_image: np.ndarray, downscale_maps: np.ndarray, block_size: int) -> np.ndarray:
-    """
-    Restores a downsampled image using OpenCV's bicubic interpolation.
-    This is a simple client-side restoration benchmark that doesn't require any ML models.
-    
-    Args:
-        downsampled_image: The downsampled image (non-uniform block sizes) in BGR format
-        downscale_maps: 2D array (num_blocks_y, num_blocks_x) indicating the downscale factor applied to each block
-        block_size: The side length of each block in the original resolution
-    
-    Returns:
-        The restored image at original resolution using bicubic upscaling
-    """
-    # Convert downscale maps to actual downscale factors (powers of 2)
-    downscale_factors = np.power(2, downscale_maps).astype(np.int32)
-    
-    # Find max downscaling factor
-    max_factor = int(downscale_factors.max())
-    
-    if max_factor == 1:
-        # No downsampling was applied
-        return downsampled_image
-    
-    # Split image into blocks at current resolution
-    height, width, _ = downsampled_image.shape
-    num_blocks_y, num_blocks_x = downscale_maps.shape
-    blocks = split_image_into_blocks(downsampled_image, block_size)
-    
-    # Upscale each block individually using bicubic interpolation
-    restored_blocks = np.zeros_like(blocks)
-    for i in range(num_blocks_y):
-        for j in range(num_blocks_x):
-            factor = downscale_factors[i, j]
-            if factor > 1:
-                # Block was downsampled, upscale it
-                block = blocks[i, j]
-                # Downscale to simulate the degraded version
-                small_size = max(1, block_size // factor)
-                small_block = cv2.resize(block, (small_size, small_size), interpolation=cv2.INTER_AREA)
-                # Upscale back using bicubic interpolation
-                restored_block = cv2.resize(small_block, (block_size, block_size), interpolation=cv2.INTER_CUBIC)
-                restored_blocks[i, j] = restored_block
-            else:
-                # Block was not downsampled
-                restored_blocks[i, j] = blocks[i, j]
-    
-    return combine_blocks_into_image(restored_blocks)
-
 def restore_downsample_opencv_lanczos(downsampled_image: np.ndarray, downscale_maps: np.ndarray, block_size: int) -> np.ndarray:
     """
     Restores a downsampled image using OpenCV's Lanczos interpolation.
@@ -2773,6 +2896,137 @@ def restore_blur_opencv_unsharp_mask(blurred_image: np.ndarray, blur_maps: np.nd
     
     return combine_blocks_into_image(restored_blocks)
 
+def _instantir_chunk_worker(
+    frames_dir: str,
+    frame_names: Sequence[str],
+    blur_maps: np.ndarray,
+    block_size: int,
+    weights_dir: str,
+    cfg: float,
+    creative_start: float,
+    preview_start: float,
+    batch_size: int,
+    device_str: str,
+    seed: Optional[int],
+    chunk_index: int,
+    total_chunks: int,
+    global_start: int,
+    global_end: int,
+) -> None:
+    """Worker entry point that restores a contiguous frame chunk on a single device."""
+
+    device = torch.device(device_str)
+
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+
+    weights_path = Path(weights_dir).expanduser()
+    frame_paths = [os.path.join(frames_dir, name) for name in frame_names]
+
+    chunk_frames: List[np.ndarray] = []
+    original_blocks: List[np.ndarray] = []
+    for path in frame_paths:
+        frame = cv2.imread(path, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError(f"Failed to load frame for InstantIR restoration: {path}")
+        chunk_frames.append(frame)
+        original_blocks.append(split_image_into_blocks(frame, block_size))
+
+    if not chunk_frames:
+        return
+
+    chunk_original_blocks = np.stack(original_blocks, axis=0)
+    chunk_blur_maps = np.asarray(blur_maps, dtype=np.int32).copy()
+    local_length = len(chunk_frames)
+    max_rounds = int(chunk_blur_maps.max()) if chunk_blur_maps.size else 0
+
+    device_label = device_str
+    _safe_print(
+        f"    -> InstantIR chunk {chunk_index + 1}/{total_chunks} "
+        f"frames {global_start + 1}-{global_end} on {device_label} (max rounds: {max_rounds})"
+    )
+
+    runtime: Optional[InstantIRRuntime] = None
+    try:
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        with _silence_console_output():
+            runtime = load_runtime(
+                instantir_path=weights_path,
+                device=device,
+                torch_dtype=dtype,
+                map_location="cpu",
+            )
+        if hasattr(runtime, "pipe") and hasattr(runtime.pipe, "set_progress_bar_config"):
+            runtime.pipe.set_progress_bar_config(disable=True)
+
+        if max_rounds <= 0:
+            _safe_print(
+                f"       No blur detected for chunk {chunk_index + 1}; skipping restoration."
+            )
+        else:
+            def _iter_batches(indices: Sequence[int], batch_len: int) -> Iterator[List[int]]:
+                step = max(1, batch_len)
+                for offset in range(0, len(indices), step):
+                    yield list(indices[offset:offset + step])
+
+            for round_idx in range(max_rounds):
+                active_indices = [idx for idx in range(local_length) if np.any(chunk_blur_maps[idx] > 0)]
+                if not active_indices:
+                    break
+
+                _safe_print(
+                    f"       Round {round_idx + 1}/{max_rounds}: processing {len(active_indices)} frame(s)"
+                )
+
+                for batch_indices in _iter_batches(active_indices, batch_size):
+                    pil_batch = []
+                    for local_idx in batch_indices:
+                        frame_rgb = cv2.cvtColor(chunk_frames[local_idx], cv2.COLOR_BGR2RGB)
+                        pil_batch.append(Image.fromarray(frame_rgb))
+
+                    with _silence_console_output():
+                        restored_pils = restore_images_batch(
+                            runtime,
+                            pil_batch,
+                            num_inference_steps=1,
+                            cfg=cfg,
+                            preview_start=preview_start,
+                            creative_start=creative_start,
+                        )
+
+                    for local_idx, restored_pil in zip(batch_indices, restored_pils):
+                        restored_bgr = cv2.cvtColor(np.array(restored_pil), cv2.COLOR_RGB2BGR)
+                        restored_blocks = split_image_into_blocks(restored_bgr, block_size)
+                        completed_mask = chunk_blur_maps[local_idx] <= 0
+                        if np.any(completed_mask):
+                            restored_blocks[completed_mask] = chunk_original_blocks[local_idx][completed_mask]
+                        chunk_frames[local_idx] = combine_blocks_into_image(restored_blocks)
+
+                positive_mask = chunk_blur_maps > 0
+                chunk_blur_maps[positive_mask] -= 1
+
+        for path, frame in zip(frame_paths, chunk_frames):
+            if not cv2.imwrite(path, frame):
+                raise RuntimeError(f"Failed to write restored frame: {path}")
+
+    finally:
+        if runtime is not None:
+            del runtime
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        gc.collect()
+
+
 def restore_with_instantir_adaptive(
     input_frames_dir: str,
     blur_maps: np.ndarray,
@@ -2786,12 +3040,14 @@ def restore_with_instantir_adaptive(
     batch_size: int = 4,
     parallel_chunk_length: Optional[int] = None,
 ) -> None:
-    """Apply adaptive InstantIR blind restoration with multi-device chunked execution."""
+    """Apply adaptive InstantIR blind restoration with simple per-device chunking."""
+
+    _ = parallel_chunk_length  # Retained for backwards compatibility; no longer used.
 
     if batch_size < 1:
         raise ValueError("`batch_size` must be at least 1.")
 
-    print("  Loading InstantIR runtime(s)...")
+    _safe_print("  Preparing InstantIR workers...")
 
     weights_dir = Path(instantir_weights_dir or "./InstantIR/models").expanduser()
     weights_dir.mkdir(parents=True, exist_ok=True)
@@ -2802,41 +3058,10 @@ def restore_with_instantir_adaptive(
             torch.cuda.manual_seed_all(seed)
 
     resolved_devices = _resolve_device_list(devices, prefer_cuda=True, allow_cpu_fallback=True)
+    cuda_devices = [dev for dev in resolved_devices if dev.type == "cuda"]
+    worker_devices = cuda_devices if cuda_devices else [resolved_devices[0]]
 
-    runtime_cache: Dict[str, InstantIRRuntime] = {}
-    runtime_lock = threading.Lock()
-
-    def _device_key(device_obj: torch.device) -> str:
-        if device_obj.type == "cuda":
-            idx = device_obj.index if device_obj.index is not None else 0
-            return f"cuda:{idx}"
-        return str(device_obj)
-
-    def _get_runtime(device_obj: torch.device) -> InstantIRRuntime:
-        key = _device_key(device_obj)
-        with runtime_lock:
-            runtime = runtime_cache.get(key)
-            if runtime is None:
-                print(f"    -> Warming InstantIR runtime on {key}...")
-                dtype = torch.float16 if device_obj.type == "cuda" else torch.float32
-                with _silence_console_output():
-                    runtime = load_runtime(
-                        instantir_path=weights_dir,
-                        device=device_obj,
-                        torch_dtype=dtype,
-                        map_location="cpu",
-                    )
-                if hasattr(runtime, "pipe") and hasattr(runtime.pipe, "set_progress_bar_config"):
-                    runtime.pipe.set_progress_bar_config(disable=True)
-                runtime_cache[key] = runtime
-        return runtime
-
-    devices_summary = ", ".join(str(dev) for dev in resolved_devices)
-    print(
-        f"  Using InstantIR on devices: {devices_summary} | batch size per device: {batch_size}"
-    )
-
-    frames_files = sorted([f for f in os.listdir(input_frames_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    frames_files = sorted([f for f in os.listdir(input_frames_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
     num_frames = len(frames_files)
     if num_frames == 0:
         raise ValueError(f"No frames found in {input_frames_dir}")
@@ -2845,124 +3070,125 @@ def restore_with_instantir_adaptive(
             f"Number of frames ({num_frames}) doesn't match blur_maps shape ({blur_maps.shape[0]})"
         )
 
-    frames_images = [cv2.imread(os.path.join(input_frames_dir, f)) for f in frames_files]
-    frames_blocks = np.stack([split_image_into_blocks(frame, block_size) for frame in frames_images], axis=0)
-
     if np.max(blur_maps) == 0:
-        print("  No blurring detected, skipping restoration.")
+        _safe_print("  No blurring detected, skipping restoration.")
         return
 
-    effective_chunk_length = parallel_chunk_length or num_frames
-    effective_chunk_length = max(1, min(effective_chunk_length, num_frames))
-    effective_batch = max(1, batch_size)
+    def _split_ranges(total: int, parts: int) -> List[Tuple[int, int]]:
+        if parts <= 0:
+            return [(0, total)]
+        base = total // parts
+        remainder = total % parts
+        ranges: List[Tuple[int, int]] = []
+        start = 0
+        for idx in range(parts):
+            length = base + (1 if idx < remainder else 0)
+            end = start + length
+            ranges.append((start, end))
+            start = end
+        return ranges
 
-    class _InstantIRChunk(NamedTuple):
-        job_id: int
-        start: int
-        end: int
+    initial_ranges = _split_ranges(num_frames, len(worker_devices))
 
-    chunks: List[_InstantIRChunk] = []
-    cursor = 0
-    job_id = 0
-    while cursor < num_frames:
-        end = min(num_frames, cursor + effective_chunk_length)
-        chunks.append(_InstantIRChunk(job_id=job_id, start=cursor, end=end))
-        job_id += 1
-        cursor = end
-
-    print(
-        f"  Chunk length: {effective_chunk_length} | total frames: {num_frames} | total chunks: {len(chunks)}"
-    )
-
-    def _iter_batches(indices: Sequence[int], batch_len: int):
-        iterator = iter(indices)
-        while True:
-            batch = list(islice(iterator, batch_len))
-            if not batch:
-                break
-            yield batch
-
-    def _process_chunk(chunk: _InstantIRChunk, device_obj: torch.device) -> List[Tuple[int, np.ndarray]]:
-        runtime = _get_runtime(device_obj)
-        local_length = chunk.end - chunk.start
-        chunk_frames = [frames_images[idx].copy() for idx in range(chunk.start, chunk.end)]
-        chunk_blur_maps = blur_maps[chunk.start:chunk.end].astype(np.int32).copy()
-        chunk_original_blocks = frames_blocks[chunk.start:chunk.end]
-        max_rounds = int(chunk_blur_maps.max())
-
-        print(
-            f"    -> InstantIR chunk {chunk.job_id + 1}/{len(chunks)} "
-            f"frames {chunk.start + 1}-{chunk.end} on {device_obj} (rounds: {max_rounds})"
+    jobs: List[Dict[str, Any]] = []
+    for device, (start, end) in zip(worker_devices, initial_ranges):
+        if start >= end:
+            continue
+        frames_subset = frames_files[start:end]
+        jobs.append(
+            {
+                "device": device,
+                "start": start,
+                "end": end,
+                "frames": frames_subset,
+                "blur": np.array(blur_maps[start:end], copy=True),
+            }
         )
 
-        if max_rounds <= 0:
-            return [(chunk.start + idx, chunk_frames[idx]) for idx in range(local_length)]
+    if not jobs:
+        _safe_print("  No frame chunks were assigned; skipping InstantIR restoration.")
+        return
 
-        for round_idx in range(max_rounds):
-            active_indices = [idx for idx in range(local_length) if np.any(chunk_blur_maps[idx] > 0)]
-            if not active_indices:
-                break
+    for idx, job in enumerate(jobs):
+        device = job["device"]
+        if device.type == "cuda":
+            dev_idx = device.index if device.index is not None else 0
+            job["device_str"] = f"cuda:{dev_idx}"
+        else:
+            job["device_str"] = str(device)
+        job["chunk_index"] = idx
 
-            print(
-                f"       Round {round_idx + 1}/{max_rounds}: processing {len(active_indices)} frame(s)"
+    device_summary = ", ".join(job["device_str"] for job in jobs)
+    _safe_print(
+        f"  Using InstantIR on devices: {device_summary} | batch size per device: {batch_size}"
+    )
+
+    total_chunks = len(jobs)
+    chunk_shapes = ", ".join(
+        f"{job['start'] + 1}-{job['end']} ({job['end'] - job['start']} frames)" for job in jobs
+    )
+    _safe_print(
+        f"  Assigned frame spans per worker: {chunk_shapes}"
+    )
+
+    if total_chunks == 1:
+        job = jobs[0]
+        worker_seed = seed
+        _instantir_chunk_worker(
+            input_frames_dir,
+            job["frames"],
+            job["blur"],
+            block_size,
+            str(weights_dir),
+            cfg,
+            creative_start,
+            preview_start,
+            batch_size,
+            job["device_str"],
+            worker_seed,
+            job["chunk_index"],
+            total_chunks,
+            job["start"],
+            job["end"],
+        )
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        processes: List[multiprocessing.Process] = []
+        for job in jobs:
+            worker_seed = (seed + job["chunk_index"]) if (seed is not None) else None
+            proc = ctx.Process(
+                target=_instantir_chunk_worker,
+                args=(
+                    input_frames_dir,
+                    job["frames"],
+                    job["blur"],
+                    block_size,
+                    str(weights_dir),
+                    cfg,
+                    creative_start,
+                    preview_start,
+                    batch_size,
+                    job["device_str"],
+                    worker_seed,
+                    job["chunk_index"],
+                    total_chunks,
+                    job["start"],
+                    job["end"],
+                ),
             )
+            proc.start()
+            processes.append(proc)
 
-            for batch_indices in _iter_batches(active_indices, effective_batch):
-                pil_batch = []
-                for local_idx in batch_indices:
-                    frame_rgb = cv2.cvtColor(chunk_frames[local_idx], cv2.COLOR_BGR2RGB)
-                    pil_batch.append(Image.fromarray(frame_rgb))
+        errors: List[int] = []
+        for proc in processes:
+            proc.join()
+            if proc.exitcode not in (0, None):
+                errors.append(proc.exitcode)
 
-                with _silence_console_output():
-                    restored_pils = restore_images_batch(
-                        runtime,
-                        pil_batch,
-                        num_inference_steps=1,
-                        cfg=cfg,
-                        preview_start=preview_start,
-                        creative_start=creative_start,
-                    )
+        if errors:
+            raise RuntimeError(f"InstantIR worker(s) exited with non-zero code(s): {errors}")
 
-                for local_idx, restored_pil in zip(batch_indices, restored_pils):
-                    restored_bgr = cv2.cvtColor(np.array(restored_pil), cv2.COLOR_RGB2BGR)
-                    restored_blocks = split_image_into_blocks(restored_bgr, block_size)
-                    completed_mask = chunk_blur_maps[local_idx] <= 0
-                    if np.any(completed_mask):
-                        restored_blocks[completed_mask] = chunk_original_blocks[local_idx][completed_mask]
-                    chunk_frames[local_idx] = combine_blocks_into_image(restored_blocks)
-
-            positive_mask = chunk_blur_maps > 0
-            chunk_blur_maps[positive_mask] -= 1
-
-        return [(chunk.start + idx, chunk_frames[idx]) for idx in range(local_length)]
-
-    updated_frames: Dict[int, np.ndarray] = {}
-
-    max_workers = min(len(resolved_devices), len(chunks))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        chunk_iter = iter(chunks)
-        while True:
-            tasks = []
-            for device_obj in resolved_devices:
-                chunk = next(chunk_iter, None)
-                if chunk is None:
-                    break
-                tasks.append(executor.submit(_process_chunk, chunk, device_obj))
-
-            if not tasks:
-                break
-
-            for future in tasks:
-                for frame_idx, updated_frame in future.result():
-                    updated_frames[frame_idx] = updated_frame
-
-    for idx in range(num_frames):
-        frames_images[idx] = updated_frames.get(idx, frames_images[idx])
-
-    for i, frame in enumerate(frames_images):
-        cv2.imwrite(os.path.join(input_frames_dir, frames_files[i]), frame)
-
-    print(f"  Adaptive InstantIR restoration complete. Frames saved to {input_frames_dir}")
+    _safe_print(f"  Adaptive InstantIR restoration complete. Frames saved to {input_frames_dir}")
         
 # TODO: not used anymore, but we should bring back the blockwise figures at some point
 def calculate_blockwise_metric(ref_blocks: np.ndarray, test_blocks: np.ndarray, metric_func: Callable[..., float]) -> np.ndarray:
@@ -3217,13 +3443,27 @@ def calculate_fvmd(
     early_stop_delta: float = 0.002,
     early_stop_window: int = 50,
     device: Optional[int] = None,
+    verbose: bool = True,
 ) -> Tuple[float, float]:
     """Calculate FVMD (Fréchet Video Mask Distance) statistics.
 
     Returns a tuple containing the aggregated FVMD value (matching previous
     behaviour) and the standard deviation computed over the sampled frames
     respecting the provided stride.
+
+    Args:
+        reference_frames: Ground-truth frames aligned with decoded frames.
+        decoded_frames: Generated frames to be evaluated.
+        log_root: Optional directory used to persist intermediate FVMD artefacts.
+        stride: Base sampling stride used when selecting frames.
+        max_frames: Optional clamp on the total number of sampled frames.
+        early_stop_delta: Relative delta controlling FVMD early stopping.
+        early_stop_window: Window size for convergence checks.
+        device: Optional CUDA device index used by FVMD.
+        verbose: If False, suppresses informational logging during FVMD evaluation.
     """
+
+    printer = _safe_print if verbose else (lambda *args, **kwargs: None)
 
     if not reference_frames or not decoded_frames:
         raise ValueError("Both reference_frames and decoded_frames must contain at least one frame.")
@@ -3324,17 +3564,18 @@ def calculate_fvmd(
 
             torch.cuda.set_device(device_ids[0])
             device_label = f"cuda:{device_ids[0]}"
-            print(f"    FVMD evaluating {len(frame_indices)} frame(s) on {device_label}")
+            printer(f"    FVMD evaluating {len(frame_indices)} frame(s) on {device_label}")
 
             try:
-                velo_gen, velo_gt, acc_gen, acc_gt = track_keypoints(
-                    log_dir=str(run_log_dir),
-                    gen_dataset=gen_dataset,
-                    gt_dataset=gt_dataset,
-                    v_stride=1,
-                    S=clip_seq_len,
-                    device_ids=device_ids,
-                )
+                with _silence_console_output():
+                    velo_gen, velo_gt, acc_gen, acc_gt = track_keypoints(
+                        log_dir=str(run_log_dir),
+                        gen_dataset=gen_dataset,
+                        gt_dataset=gt_dataset,
+                        v_stride=1,
+                        S=clip_seq_len,
+                        device_ids=device_ids,
+                    )
             except RuntimeError as exc:
                 raise _FvmdNoTrajectories(str(exc)) from exc
 
@@ -3375,7 +3616,7 @@ def calculate_fvmd(
                 scores.append(_run_fvmd_once(window_indices))
             except _FvmdNoTrajectories as exc:
                 if not warned:
-                    print(
+                    printer(
                         "  Warning: FVMD could not compute variability for one or more windows; "
                         f"first failure involving frames {window_indices}: {exc}"
                     )
@@ -3399,7 +3640,7 @@ def calculate_fvmd(
             next_stride = max(1, attempt_stride // 2)
             if next_stride == attempt_stride:
                 next_stride = attempt_stride - 1
-            print(
+            printer(
                 f"  Warning: FVMD sampling with stride {attempt_stride} yielded only {len(indices)} frame(s); retrying with stride {next_stride}."
             )
             attempt_stride = next_stride
@@ -3422,7 +3663,7 @@ def calculate_fvmd(
                     if delta < early_stop_delta:
                         std_value = _compute_std(used_indices)
                         if attempt_stride != base_stride:
-                            print(
+                            printer(
                                 f"  Info: FVMD used effective stride {attempt_stride} instead of requested {base_stride}."
                             )
                         return current_score, std_value
@@ -3433,7 +3674,7 @@ def calculate_fvmd(
             assert last_score is not None
             std_value = _compute_std(used_indices if used_indices else indices)
             if attempt_stride != base_stride:
-                print(f"  Info: FVMD used effective stride {attempt_stride} instead of requested {base_stride}.")
+                printer(f"  Info: FVMD used effective stride {attempt_stride} instead of requested {base_stride}.")
             return last_score, std_value
 
         except _FvmdNoTrajectories as exc:
@@ -3445,7 +3686,7 @@ def calculate_fvmd(
             next_stride = max(1, attempt_stride // 2)
             if next_stride == attempt_stride:
                 next_stride = attempt_stride - 1
-            print(
+            printer(
                 f"  Warning: FVMD tracking failed with stride {attempt_stride}; retrying with stride {next_stride}."
             )
             attempt_stride = next_stride
@@ -3471,34 +3712,14 @@ def analyze_encoding_performance(
     fvmd_early_stop_delta: float = 0.002,
     fvmd_early_stop_window: int = 50,
     vmaf_stride: int = 1,
+    enable_fvmd: bool = True,
 ) -> Dict:
-    """Analyze encoded videos with mask-aware metrics and sampling controls.
+    """Analyze encoded videos with mask-aware metrics leveraging per-approach processes."""
 
-    Args:
-        reference_frames: Source frames used for quality comparisons.
-        encoded_videos: Mapping from method name to encoded video path.
-        block_size: Block size used for spatial visualizations.
-        width: Frame width in pixels.
-        height: Frame height in pixels.
-        temp_dir: Working directory for intermediate artifacts.
-        masks_dir: Directory containing per-frame UFO masks.
-        sample_frames: Frame indices for heatmap export.
-        video_bitrates: Optional bitrate lookup (bps) per method name.
-        reference_video_path: Unused placeholder retained for compatibility.
-        framerate: Video framerate.
-        strength_maps: Optional strength maps for OpenCV baselines.
-        generate_opencv_benchmarks: Toggle for generating OpenCV reference clips.
-        metric_stride: Sampling stride for PSNR/SSIM/LPIPS computation.
-        fvmd_stride: Sampling stride for FVMD computation.
-        fvmd_max_frames: Maximum sampled frames passed to FVMD after stride.
-        fvmd_processes: Number of parallel FVMD workers (0 disables parallelism).
-        fvmd_early_stop_delta: Relative delta threshold for FVMD early termination.
-        fvmd_early_stop_window: Batch size of sampled frames added before FVMD convergence check.
-        vmaf_stride: Sampling stride injected into the VMAF evaluation pipeline.
-
-    Returns:
-        Aggregated analysis results keyed by encoded video name.
-    """
+    del strength_maps  # retained for backwards compatibility; handled upstream
+    del generate_opencv_benchmarks  # benchmark generation occurs prior to evaluation
+    del reference_video_path  # retained for backwards compatibility
+    del fvmd_processes  # per-approach processes supersede nested FVMD pools
 
     metric_stride = max(1, metric_stride)
     fvmd_stride = max(1, fvmd_stride)
@@ -3543,375 +3764,109 @@ def analyze_encoding_performance(
         for idx in range(total_reference_frames)
     ]
 
-    reference_vmaf_cache: Dict[Tuple[str, int], str] = {}
+    sample_frames_unique = sorted({idx for idx in sample_frames if 0 <= idx < total_reference_frames})
+
+    global _EVALUATION_CONTEXT
+    evaluation_context = _EvaluationContext(
+        reference_frames=reference_frames,
+        masked_reference_fg_frames=masked_reference_fg_frames,
+        masked_reference_bg_frames=masked_reference_bg_frames,
+        fg_masks=fg_masks,
+        bg_masks=bg_masks,
+        roi_slice=roi_slice,
+        crop_width=crop_width,
+        crop_height=crop_height,
+        crop_filter=crop_filter,
+        framerate=framerate,
+        block_size=block_size,
+        masked_videos_dir=masked_videos_dir,
+        heatmaps_dir=heatmaps_dir,
+        fvmd_log_root=fvmd_log_root,
+        sample_frames=sample_frames_unique,
+        enable_fvmd=enable_fvmd,
+    )
+    _EVALUATION_CONTEXT = evaluation_context
+
     analysis_results: Dict[str, Dict[str, Dict[str, float]]] = {}
-    decoded_frames_cache: Dict[str, List[np.ndarray]] = {}
 
-    fvmd_tasks: List[Tuple[str, str, "Future"]] = []
-    fvmd_executor: Optional[ProcessPoolExecutor] = None
-    if fvmd_processes != 0:
-        cpu_count = multiprocessing.cpu_count() if hasattr(multiprocessing, "cpu_count") else 1
-        max_workers = fvmd_processes if fvmd_processes is not None else max(1, min(4, cpu_count))
-        if max_workers > 0:
-            spawn_context = None
-            if hasattr(multiprocessing, "get_context"):
-                try:
-                    spawn_context = multiprocessing.get_context("spawn")
-                except ValueError:
-                    spawn_context = None
-            if spawn_context is not None:
-                fvmd_executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_context)
-            else:
-                fvmd_executor = ProcessPoolExecutor(max_workers=max_workers)
-            print(f"  Using spawn-based FVMD worker pool with {max_workers} process(es)")
+    videos_to_process: List[Tuple[str, str]] = []
+    for video_name, video_path in encoded_videos.items():
+        if not os.path.exists(video_path):
+            print(f"\nProcessing '{video_name}'...")
+            print("  - Video not found, skipping.")
+            continue
+        videos_to_process.append((video_name, video_path))
 
-    fvmd_device_cycle: Optional[Iterator[int]] = None
+    if not videos_to_process:
+        print("No encoded videos available for analysis.")
+        _EVALUATION_CONTEXT = None
+        return analysis_results
+
+    gpu_device_ids: List[Optional[int]] = []
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         if gpu_count > 0:
-            fvmd_device_cycle = cycle(range(gpu_count))
+            gpu_device_ids = list(range(gpu_count))
+    if not enable_fvmd or not gpu_device_ids:
+        gpu_device_ids = [None]
 
-    # --- Generate OpenCV Restoration Benchmarks ---
-    opencv_benchmarks: Dict[str, str] = {}
-    if generate_opencv_benchmarks and strength_maps is not None:
-        print("\n" + "=" * 80)
-        print("GENERATING OPENCV RESTORATION BENCHMARKS")
-        print("=" * 80)
+    cpu_count = multiprocessing.cpu_count() if hasattr(multiprocessing, "cpu_count") else os.cpu_count()
+    max_workers = min(len(videos_to_process), cpu_count or len(videos_to_process) or 1)
 
-        benchmarks_dir = os.path.join(temp_dir, "opencv_benchmarks")
-        os.makedirs(benchmarks_dir, exist_ok=True)
+    effective_gpu_workers = len([device for device in gpu_device_ids if device is not None])
+    if enable_fvmd and effective_gpu_workers > 0:
+        max_workers = min(max_workers, effective_gpu_workers)
 
-        for method_name, maps in strength_maps.items():
-            if maps is None:
-                continue
+    max_workers = max(1, max_workers)
 
-            print(f"\nProcessing benchmarks for: {method_name}")
+    try:
+        mp_ctx = multiprocessing.get_context("spawn")
+    except ValueError:
+        mp_ctx = multiprocessing.get_context()
 
-            if "downsample" in method_name.lower():
-                print("  - Generating bilinear restoration benchmark...")
-                benchmark_frames_bilinear = []
-                for frame_idx, frame in enumerate(reference_frames):
-                    downsampled_frame, _ = filter_frame_downsample(frame, maps[frame_idx] / np.max(maps[frame_idx]) if np.max(maps[frame_idx]) > 0 else maps[frame_idx], block_size)
-                    restored_frame = restore_downsample_opencv_bilinear(downsampled_frame, maps[frame_idx], block_size)
-                    benchmark_frames_bilinear.append(restored_frame)
-
-                bilinear_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_bilinear_frames")
-                os.makedirs(bilinear_frames_dir, exist_ok=True)
-                for i, frame in enumerate(benchmark_frames_bilinear):
-                    cv2.imwrite(os.path.join(bilinear_frames_dir, f"{i+1:05d}.png"), frame)
-
-                bilinear_video = os.path.join(benchmarks_dir, f"{method_name}_bilinear.mp4")
-                encode_video(bilinear_frames_dir, bilinear_video, framerate, width, height, target_bitrate=video_bitrates.get(method_name, 1000000))
-                opencv_benchmarks[f"{method_name} (OpenCV Bilinear)"] = bilinear_video
-                video_bitrates[f"{method_name} (OpenCV Bilinear)"] = video_bitrates.get(method_name, 0)
-
-                print("  - Generating bicubic restoration benchmark...")
-                benchmark_frames_bicubic = []
-                for frame_idx, frame in enumerate(reference_frames):
-                    downsampled_frame, _ = filter_frame_downsample(frame, maps[frame_idx] / np.max(maps[frame_idx]) if np.max(maps[frame_idx]) > 0 else maps[frame_idx], block_size)
-                    restored_frame = restore_downsample_opencv_bicubic(downsampled_frame, maps[frame_idx], block_size)
-                    benchmark_frames_bicubic.append(restored_frame)
-
-                bicubic_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_bicubic_frames")
-                os.makedirs(bicubic_frames_dir, exist_ok=True)
-                for i, frame in enumerate(benchmark_frames_bicubic):
-                    cv2.imwrite(os.path.join(bicubic_frames_dir, f"{i+1:05d}.png"), frame)
-
-                bicubic_video = os.path.join(benchmarks_dir, f"{method_name}_bicubic.mp4")
-                encode_video(bicubic_frames_dir, bicubic_video, framerate, width, height, target_bitrate=video_bitrates.get(method_name, 1000000))
-                opencv_benchmarks[f"{method_name} (OpenCV Bicubic)"] = bicubic_video
-                video_bitrates[f"{method_name} (OpenCV Bicubic)"] = video_bitrates.get(method_name, 0)
-
-                print("  - Generating Lanczos restoration benchmark...")
-                benchmark_frames_lanczos = []
-                for frame_idx, frame in enumerate(reference_frames):
-                    downsampled_frame, _ = filter_frame_downsample(frame, maps[frame_idx] / np.max(maps[frame_idx]) if np.max(maps[frame_idx]) > 0 else maps[frame_idx], block_size)
-                    restored_frame = restore_downsample_opencv_lanczos(downsampled_frame, maps[frame_idx], block_size)
-                    benchmark_frames_lanczos.append(restored_frame)
-
-                lanczos_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_lanczos_frames")
-                os.makedirs(lanczos_frames_dir, exist_ok=True)
-                for i, frame in enumerate(benchmark_frames_lanczos):
-                    cv2.imwrite(os.path.join(lanczos_frames_dir, f"{i+1:05d}.png"), frame)
-
-                lanczos_video = os.path.join(benchmarks_dir, f"{method_name}_lanczos.mp4")
-                encode_video(lanczos_frames_dir, lanczos_video, framerate, width, height, target_bitrate=video_bitrates.get(method_name, 1000000))
-                opencv_benchmarks[f"{method_name} (OpenCV Lanczos)"] = lanczos_video
-                video_bitrates[f"{method_name} (OpenCV Lanczos)"] = video_bitrates.get(method_name, 0)
-
-            elif "gaussian" in method_name.lower() or "blur" in method_name.lower():
-                print("  - Generating unsharp mask restoration benchmark...")
-                benchmark_frames_unsharp = []
-                for frame_idx, frame in enumerate(reference_frames):
-                    blurred_frame, _ = filter_frame_gaussian(frame, maps[frame_idx] / np.max(maps[frame_idx]) if np.max(maps[frame_idx]) > 0 else maps[frame_idx], block_size)
-                    restored_frame = restore_blur_opencv_unsharp_mask(blurred_frame, maps[frame_idx], block_size)
-                    benchmark_frames_unsharp.append(restored_frame)
-
-                unsharp_frames_dir = os.path.join(benchmarks_dir, f"{method_name}_unsharp_frames")
-                os.makedirs(unsharp_frames_dir, exist_ok=True)
-                for i, frame in enumerate(benchmark_frames_unsharp):
-                    cv2.imwrite(os.path.join(unsharp_frames_dir, f"{i+1:05d}.png"), frame)
-
-                unsharp_video = os.path.join(benchmarks_dir, f"{method_name}_unsharp.mp4")
-                encode_video(unsharp_frames_dir, unsharp_video, framerate, width, height, target_bitrate=video_bitrates.get(method_name, 1000000))
-                opencv_benchmarks[f"{method_name} (OpenCV Unsharp Mask)"] = unsharp_video
-                video_bitrates[f"{method_name} (OpenCV Unsharp Mask)"] = video_bitrates.get(method_name, 0)
-
-        encoded_videos.update(opencv_benchmarks)
-
-        print(f"\nGenerated {len(opencv_benchmarks)} OpenCV restoration benchmarks.")
-        print("=" * 80 + "\n")
-
-    sample_frames_unique = sorted({idx for idx in sample_frames if 0 <= idx < total_reference_frames})
-
-    for video_name, video_path in encoded_videos.items():
-        print(f"\nProcessing '{video_name}'...")
-        if not os.path.exists(video_path):
-            print("  - Video not found, skipping.")
-            continue
-
-        decoded_frames = _decode_video_to_frames(video_path)
-        decoded_frames_cache[video_name] = decoded_frames
-
-        frame_count = min(total_reference_frames, len(decoded_frames))
-        if frame_count == 0:
-            print("  - No decoded frames available, skipping.")
-            continue
-
-        frame_indices = list(range(0, frame_count, metric_stride))
-        if not frame_indices:
-            frame_indices = [0]
-        if frame_indices[-1] != frame_count - 1:
-            frame_indices.append(frame_count - 1)
-        frame_indices = sorted(set(frame_indices))
-
-        slug = _slugify_name(video_name)
-
-        analysis_results[video_name] = {
-            'foreground': {'fvmd': 0.0, 'fvmd_std': 0.0},
-            'background': {'fvmd': 0.0, 'fvmd_std': 0.0},
-            'bitrate_mbps': video_bitrates.get(video_name, 0) / 1_000_000,
-        }
-
-        masked_decoded_fg_frames = [
-            _apply_binary_mask(decoded_frames[idx], fg_masks[idx])
-            for idx in range(frame_count)
-        ]
-        masked_decoded_bg_frames = [
-            _apply_binary_mask(decoded_frames[idx], bg_masks[idx])
-            for idx in range(frame_count)
-        ]
-
-        fg_psnr_vals: List[float] = []
-        fg_ssim_vals: List[float] = []
-        fg_ref_lpips_frames: List[np.ndarray] = []
-        fg_dec_lpips_frames: List[np.ndarray] = []
-        bg_psnr_vals: List[float] = []
-        bg_ssim_vals: List[float] = []
-        bg_ref_lpips_frames: List[np.ndarray] = []
-        bg_dec_lpips_frames: List[np.ndarray] = []
-
-        for idx in frame_indices:
-            ref_frame = reference_frames[idx]
-            dec_frame = decoded_frames[idx]
-            fg_mask = fg_masks[idx]
-            bg_mask = bg_masks[idx]
-
-            ref_roi = ref_frame[roi_slice]
-            dec_roi = dec_frame[roi_slice]
-            fg_mask_roi = fg_mask[roi_slice]
-
-            fg_psnr_vals.append(_masked_psnr(ref_roi, dec_roi, fg_mask_roi))
-            fg_ssim_vals.append(_masked_ssim(ref_roi, dec_roi, fg_mask_roi))
-            fg_ref_lpips_frames.append(masked_reference_fg_frames[idx][roi_slice])
-            fg_dec_lpips_frames.append(masked_decoded_fg_frames[idx][roi_slice])
-
-            bg_psnr_vals.append(_masked_psnr(ref_frame, dec_frame, bg_mask))
-            bg_ssim_vals.append(_masked_ssim(ref_frame, dec_frame, bg_mask))
-            bg_ref_lpips_frames.append(masked_reference_bg_frames[idx])
-            bg_dec_lpips_frames.append(masked_decoded_bg_frames[idx])
-
-        analysis_results[video_name]['foreground']['psnr_mean'] = float(np.mean(fg_psnr_vals)) if fg_psnr_vals else 0.0
-        analysis_results[video_name]['foreground']['psnr_std'] = float(np.std(fg_psnr_vals)) if fg_psnr_vals else 0.0
-        analysis_results[video_name]['foreground']['ssim_mean'] = float(np.mean(fg_ssim_vals)) if fg_ssim_vals else 0.0
-        analysis_results[video_name]['foreground']['ssim_std'] = float(np.std(fg_ssim_vals)) if fg_ssim_vals else 0.0
-
-        analysis_results[video_name]['background']['psnr_mean'] = float(np.mean(bg_psnr_vals)) if bg_psnr_vals else 0.0
-        analysis_results[video_name]['background']['psnr_std'] = float(np.std(bg_psnr_vals)) if bg_psnr_vals else 0.0
-        analysis_results[video_name]['background']['ssim_mean'] = float(np.mean(bg_ssim_vals)) if bg_ssim_vals else 0.0
-        analysis_results[video_name]['background']['ssim_std'] = float(np.std(bg_ssim_vals)) if bg_ssim_vals else 0.0
-
-        fg_lpips_scores = calculate_lpips_per_frame(fg_ref_lpips_frames, fg_dec_lpips_frames)
-        bg_lpips_scores = calculate_lpips_per_frame(bg_ref_lpips_frames, bg_dec_lpips_frames)
-
-        analysis_results[video_name]['foreground']['lpips_mean'] = float(np.mean(fg_lpips_scores)) if fg_lpips_scores else 0.0
-        analysis_results[video_name]['foreground']['lpips_std'] = float(np.std(fg_lpips_scores)) if fg_lpips_scores else 0.0
-        analysis_results[video_name]['background']['lpips_mean'] = float(np.mean(bg_lpips_scores)) if bg_lpips_scores else 0.0
-        analysis_results[video_name]['background']['lpips_std'] = float(np.std(bg_lpips_scores)) if bg_lpips_scores else 0.0
-
-        ref_fg_key = ("fg", frame_count)
-        if ref_fg_key in reference_vmaf_cache:
-            ref_fg_video_path = reference_vmaf_cache[ref_fg_key]
-        else:
-            ref_fg_video_path = os.path.join(masked_videos_dir, f"reference_fg_{frame_count:05d}.mp4")
-            _encode_frames_to_video(
-                masked_reference_fg_frames[:frame_count],
-                ref_fg_video_path,
-                framerate,
-                filter_chain=crop_filter,
-                extra_codec_args=['-g', '1'],
-            )
-            reference_vmaf_cache[ref_fg_key] = ref_fg_video_path
-
-        ref_bg_key = ("bg", frame_count)
-        if ref_bg_key in reference_vmaf_cache:
-            ref_bg_video_path = reference_vmaf_cache[ref_bg_key]
-        else:
-            ref_bg_video_path = os.path.join(masked_videos_dir, f"reference_bg_{frame_count:05d}.mp4")
-            _encode_frames_to_video(
-                masked_reference_bg_frames[:frame_count],
-                ref_bg_video_path,
-                framerate,
-                extra_codec_args=['-g', '1'],
-            )
-            reference_vmaf_cache[ref_bg_key] = ref_bg_video_path
-
-        enc_fg_video_path = os.path.join(masked_videos_dir, f"{slug}_fg.mp4")
-        _encode_frames_to_video(
-            masked_decoded_fg_frames,
-            enc_fg_video_path,
-            framerate,
-            filter_chain=crop_filter,
-            extra_codec_args=['-g', '1'],
-        )
-
-        enc_bg_video_path = os.path.join(masked_videos_dir, f"{slug}_bg.mp4")
-        _encode_frames_to_video(
-            masked_decoded_bg_frames,
-            enc_bg_video_path,
-            framerate,
-            extra_codec_args=['-g', '1'],
-        )
-
-        vmaf_fg = calculate_vmaf(ref_fg_video_path, enc_fg_video_path, crop_width, crop_height, framerate, frame_stride=vmaf_stride)
-        vmaf_bg = calculate_vmaf(ref_bg_video_path, enc_bg_video_path, width, height, framerate, frame_stride=vmaf_stride)
-
-        analysis_results[video_name]['foreground']['vmaf_mean'] = float(vmaf_fg.get('mean', 0))
-        analysis_results[video_name]['foreground']['vmaf_std'] = float(vmaf_fg.get('std', 0))
-        analysis_results[video_name]['background']['vmaf_mean'] = float(vmaf_bg.get('mean', 0))
-        analysis_results[video_name]['background']['vmaf_std'] = float(vmaf_bg.get('std', 0))
-
-        fvmd_indices = list(range(0, frame_count, fvmd_stride))
-        if not fvmd_indices:
-            fvmd_indices = [0]
-        if fvmd_max_frames is not None and fvmd_max_frames > 0:
-            fvmd_indices = fvmd_indices[:fvmd_max_frames]
-
-        ref_fg_fvmd_frames = [masked_reference_fg_frames[i] for i in fvmd_indices]
-        dec_fg_fvmd_frames = [masked_decoded_fg_frames[i] for i in fvmd_indices]
-        ref_bg_fvmd_frames = [masked_reference_bg_frames[i] for i in fvmd_indices]
-        dec_bg_fvmd_frames = [masked_decoded_bg_frames[i] for i in fvmd_indices]
-
-        if fvmd_executor is not None:
-            fg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
-            fvmd_tasks.append((video_name, 'foreground', fvmd_executor.submit(
-                calculate_fvmd,
-                ref_fg_fvmd_frames,
-                dec_fg_fvmd_frames,
-                log_root=fvmd_log_root,
-                stride=1,
-                max_frames=None,
-                early_stop_delta=fvmd_early_stop_delta,
-                early_stop_window=fvmd_early_stop_window,
-                device=fg_device,
-            )))
-            bg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
-            fvmd_tasks.append((video_name, 'background', fvmd_executor.submit(
-                calculate_fvmd,
-                ref_bg_fvmd_frames,
-                dec_bg_fvmd_frames,
-                log_root=fvmd_log_root,
-                stride=1,
-                max_frames=None,
-                early_stop_delta=fvmd_early_stop_delta,
-                early_stop_window=fvmd_early_stop_window,
-                device=bg_device,
-            )))
-        else:
-            fg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
-            fg_fvmd_mean, fg_fvmd_std = calculate_fvmd(
-                ref_fg_fvmd_frames,
-                dec_fg_fvmd_frames,
-                log_root=fvmd_log_root,
-                stride=1,
-                max_frames=None,
-                early_stop_delta=fvmd_early_stop_delta,
-                early_stop_window=fvmd_early_stop_window,
-                device=fg_device,
-            )
-            bg_device = next(fvmd_device_cycle) if fvmd_device_cycle is not None else None
-            bg_fvmd_mean, bg_fvmd_std = calculate_fvmd(
-                ref_bg_fvmd_frames,
-                dec_bg_fvmd_frames,
-                log_root=fvmd_log_root,
-                stride=1,
-                max_frames=None,
-                early_stop_delta=fvmd_early_stop_delta,
-                early_stop_window=fvmd_early_stop_window,
-                device=bg_device,
-            )
-
-            analysis_results[video_name]['foreground']['fvmd'] = fg_fvmd_mean
-            analysis_results[video_name]['foreground']['fvmd_std'] = fg_fvmd_std
-            analysis_results[video_name]['background']['fvmd'] = bg_fvmd_mean
-            analysis_results[video_name]['background']['fvmd_std'] = bg_fvmd_std
-
-        for frame_idx in sample_frames_unique:
-            if frame_idx >= frame_count:
-                continue
-            ref_frame = reference_frames[frame_idx]
-            dec_frame = decoded_frames[frame_idx]
-            try:
-                ref_blocks = split_image_into_blocks(ref_frame, block_size)
-                dec_blocks = split_image_into_blocks(dec_frame, block_size)
-            except ValueError:
-                continue
-
-            psnr_map = calculate_blockwise_metric(ref_blocks, dec_blocks, psnr)
-            ssim_map = calculate_blockwise_metric(ref_blocks, dec_blocks, _block_ssim)
-            mask_img = fg_masks[frame_idx].astype(np.uint8) * 255
-            heatmap_path = os.path.join(
-                heatmaps_dir,
-                f"{slug}_frame_{frame_idx + 1:05d}.png",
-            )
-            _generate_and_save_heatmap(
-                ref_frame,
-                dec_frame,
-                mask_img,
-                {'PSNR': psnr_map, 'SSIM': ssim_map},
+    futures = {}
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=mp_ctx,
+        initializer=_initialise_evaluation_worker,
+        initargs=(evaluation_context,),
+    ) as executor:
+        for idx, (video_name, video_path) in enumerate(videos_to_process):
+            fvmd_device = gpu_device_ids[idx % len(gpu_device_ids)] if gpu_device_ids else None
+            bitrate = video_bitrates.get(video_name, 0.0)
+            future = executor.submit(
+                _evaluate_single_video_metrics,
                 video_name,
-                frame_idx,
-                heatmap_path,
-                block_size,
+                video_path,
+                metric_stride,
+                fvmd_stride,
+                fvmd_max_frames,
+                fvmd_early_stop_delta,
+                fvmd_early_stop_window,
+                vmaf_stride,
+                bitrate,
+                fvmd_device,
             )
+            futures[future] = video_name
 
-    if fvmd_executor is not None:
-        for video_name, region, future in fvmd_tasks:
+        for future in as_completed(futures):
+            video_name = futures[future]
             try:
-                mean_val, std_val = future.result()
+                result = future.result()
             except Exception as exc:
-                if fvmd_executor is not None:
-                    fvmd_executor.shutdown(wait=False, cancel_futures=True)
-                raise RuntimeError(
-                    f"FVMD failed for '{video_name}' ({region})"
-                ) from exc
-            region_metrics = analysis_results.setdefault(video_name, {}).setdefault(region, {})
-            region_metrics['fvmd'] = mean_val
-            region_metrics['fvmd_std'] = std_val
-        fvmd_executor.shutdown(wait=True)
+                raise RuntimeError(f"Error during analysis of '{video_name}'") from exc
+            if result is not None:
+                analysis_results[video_name] = result
+
+    _EVALUATION_CONTEXT = None
 
     if analysis_results:
         _generate_quality_visualizations(analysis_results, heatmaps_dir)
+        decoded_frames_cache = {
+            name: _decode_video_to_frames(encoded_videos[name])
+            for name in analysis_results.keys()
+            if os.path.exists(encoded_videos.get(name, ""))
+        }
         _generate_patch_comparison(
             reference_frames=reference_frames,
             decoded_frames_cache=decoded_frames_cache,
@@ -3929,6 +3884,254 @@ def analyze_encoding_performance(
     print(f"Quality visualizations saved to: {heatmaps_dir}")
 
     return analysis_results
+
+def _evaluate_single_video_metrics(
+    video_name: str,
+    video_path: str,
+    metric_stride: int,
+    fvmd_stride: int,
+    fvmd_max_frames: Optional[int],
+    fvmd_early_stop_delta: float,
+    fvmd_early_stop_window: int,
+    vmaf_stride: int,
+    bitrate_bps: float,
+    fvmd_device: Optional[int],
+) -> Optional[Dict[str, Dict[str, float]]]:
+    """Evaluate quality metrics for a single encoded approach in an isolated process."""
+
+    if _EVALUATION_CONTEXT is None:
+        raise RuntimeError("Evaluation context was not initialised before spawning workers.")
+
+    ctx = _EVALUATION_CONTEXT
+
+    print(f"\nProcessing '{video_name}'...")
+    if not os.path.exists(video_path):
+        print("  - Video not found, skipping.")
+        return None
+
+    decoded_frames = _decode_video_to_frames(video_path)
+    reference_frames = ctx.reference_frames
+    total_reference_frames = len(reference_frames)
+    frame_count = min(total_reference_frames, len(decoded_frames))
+    if frame_count == 0:
+        print("  - No decoded frames available, skipping.")
+        return None
+
+    frame_indices = list(range(0, frame_count, metric_stride))
+    if not frame_indices:
+        frame_indices = [0]
+    if frame_indices[-1] != frame_count - 1:
+        frame_indices.append(frame_count - 1)
+    frame_indices = sorted(set(frame_indices))
+
+    slug = _slugify_name(video_name)
+    block_size = ctx.block_size
+    fg_masks = ctx.fg_masks
+    bg_masks = ctx.bg_masks
+    roi_slice = ctx.roi_slice
+
+    masked_reference_fg_frames = ctx.masked_reference_fg_frames[:frame_count]
+    masked_reference_bg_frames = ctx.masked_reference_bg_frames[:frame_count]
+
+    masked_decoded_fg_frames = [
+        _apply_binary_mask(decoded_frames[idx], fg_masks[idx])
+        for idx in range(frame_count)
+    ]
+    masked_decoded_bg_frames = [
+        _apply_binary_mask(decoded_frames[idx], bg_masks[idx])
+        for idx in range(frame_count)
+    ]
+
+    fg_psnr_vals: List[float] = []
+    fg_ssim_vals: List[float] = []
+    fg_ref_lpips_frames: List[np.ndarray] = []
+    fg_dec_lpips_frames: List[np.ndarray] = []
+    bg_psnr_vals: List[float] = []
+    bg_ssim_vals: List[float] = []
+    bg_ref_lpips_frames: List[np.ndarray] = []
+    bg_dec_lpips_frames: List[np.ndarray] = []
+
+    for idx in frame_indices:
+        ref_frame = reference_frames[idx]
+        dec_frame = decoded_frames[idx]
+        fg_mask = fg_masks[idx]
+        bg_mask = bg_masks[idx]
+
+        ref_roi = ref_frame[roi_slice]
+        dec_roi = dec_frame[roi_slice]
+        fg_mask_roi = fg_mask[roi_slice]
+
+        fg_psnr_vals.append(_masked_psnr(ref_roi, dec_roi, fg_mask_roi))
+        fg_ssim_vals.append(_masked_ssim(ref_roi, dec_roi, fg_mask_roi))
+        fg_ref_lpips_frames.append(masked_reference_fg_frames[idx][roi_slice])
+        fg_dec_lpips_frames.append(masked_decoded_fg_frames[idx][roi_slice])
+
+        bg_psnr_vals.append(_masked_psnr(ref_frame, dec_frame, bg_mask))
+        bg_ssim_vals.append(_masked_ssim(ref_frame, dec_frame, bg_mask))
+        bg_ref_lpips_frames.append(masked_reference_bg_frames[idx])
+        bg_dec_lpips_frames.append(masked_decoded_bg_frames[idx])
+
+    result: Dict[str, Dict[str, float]] = {
+        'foreground': {
+            'psnr_mean': float(np.mean(fg_psnr_vals)) if fg_psnr_vals else 0.0,
+            'psnr_std': float(np.std(fg_psnr_vals)) if fg_psnr_vals else 0.0,
+            'ssim_mean': float(np.mean(fg_ssim_vals)) if fg_ssim_vals else 0.0,
+            'ssim_std': float(np.std(fg_ssim_vals)) if fg_ssim_vals else 0.0,
+        },
+        'background': {
+            'psnr_mean': float(np.mean(bg_psnr_vals)) if bg_psnr_vals else 0.0,
+            'psnr_std': float(np.std(bg_psnr_vals)) if bg_psnr_vals else 0.0,
+            'ssim_mean': float(np.mean(bg_ssim_vals)) if bg_ssim_vals else 0.0,
+            'ssim_std': float(np.std(bg_ssim_vals)) if bg_ssim_vals else 0.0,
+        },
+        'bitrate_mbps': bitrate_bps / 1_000_000,
+    }
+
+    result['foreground']['fvmd'] = float('nan')
+    result['foreground']['fvmd_std'] = float('nan')
+    result['background']['fvmd'] = float('nan')
+    result['background']['fvmd_std'] = float('nan')
+
+    fg_lpips_scores = calculate_lpips_per_frame(fg_ref_lpips_frames, fg_dec_lpips_frames)
+    bg_lpips_scores = calculate_lpips_per_frame(bg_ref_lpips_frames, bg_dec_lpips_frames)
+
+    result['foreground']['lpips_mean'] = float(np.mean(fg_lpips_scores)) if fg_lpips_scores else 0.0
+    result['foreground']['lpips_std'] = float(np.std(fg_lpips_scores)) if fg_lpips_scores else 0.0
+    result['background']['lpips_mean'] = float(np.mean(bg_lpips_scores)) if bg_lpips_scores else 0.0
+    result['background']['lpips_std'] = float(np.std(bg_lpips_scores)) if bg_lpips_scores else 0.0
+
+    ref_fg_video_path = os.path.join(ctx.masked_videos_dir, f"{slug}_reference_fg_{frame_count:05d}.mp4")
+    if not os.path.exists(ref_fg_video_path):
+        _encode_frames_to_video(
+            masked_reference_fg_frames,
+            ref_fg_video_path,
+            ctx.framerate,
+            filter_chain=ctx.crop_filter,
+            extra_codec_args=['-g', '1'],
+        )
+
+    ref_bg_video_path = os.path.join(ctx.masked_videos_dir, f"{slug}_reference_bg_{frame_count:05d}.mp4")
+    if not os.path.exists(ref_bg_video_path):
+        _encode_frames_to_video(
+            masked_reference_bg_frames,
+            ref_bg_video_path,
+            ctx.framerate,
+            extra_codec_args=['-g', '1'],
+        )
+
+    enc_fg_video_path = os.path.join(ctx.masked_videos_dir, f"{slug}_fg_{frame_count:05d}.mp4")
+    _encode_frames_to_video(
+        masked_decoded_fg_frames,
+        enc_fg_video_path,
+        ctx.framerate,
+        filter_chain=ctx.crop_filter,
+        extra_codec_args=['-g', '1'],
+    )
+
+    enc_bg_video_path = os.path.join(ctx.masked_videos_dir, f"{slug}_bg_{frame_count:05d}.mp4")
+    _encode_frames_to_video(
+        masked_decoded_bg_frames,
+        enc_bg_video_path,
+        ctx.framerate,
+        extra_codec_args=['-g', '1'],
+    )
+
+    frame_height, frame_width = reference_frames[0].shape[:2]
+    vmaf_fg = calculate_vmaf(
+        ref_fg_video_path,
+        enc_fg_video_path,
+        ctx.crop_width,
+        ctx.crop_height,
+        ctx.framerate,
+        frame_stride=vmaf_stride,
+    )
+    vmaf_bg = calculate_vmaf(
+        ref_bg_video_path,
+        enc_bg_video_path,
+        frame_width,
+        frame_height,
+        ctx.framerate,
+        frame_stride=vmaf_stride,
+    )
+
+    result['foreground']['vmaf_mean'] = float(vmaf_fg.get('mean', 0))
+    result['foreground']['vmaf_std'] = float(vmaf_fg.get('std', 0))
+    result['background']['vmaf_mean'] = float(vmaf_bg.get('mean', 0))
+    result['background']['vmaf_std'] = float(vmaf_bg.get('std', 0))
+
+    if ctx.enable_fvmd:
+        fvmd_indices = list(range(0, frame_count, fvmd_stride))
+        if not fvmd_indices:
+            fvmd_indices = [0]
+        if fvmd_max_frames is not None and fvmd_max_frames > 0:
+            fvmd_indices = fvmd_indices[:fvmd_max_frames]
+
+        ref_fg_fvmd_frames = [masked_reference_fg_frames[i] for i in fvmd_indices]
+        dec_fg_fvmd_frames = [masked_decoded_fg_frames[i] for i in fvmd_indices]
+        ref_bg_fvmd_frames = [masked_reference_bg_frames[i] for i in fvmd_indices]
+        dec_bg_fvmd_frames = [masked_decoded_bg_frames[i] for i in fvmd_indices]
+
+        fvmd_log_dir = os.path.join(ctx.fvmd_log_root, slug)
+        os.makedirs(fvmd_log_dir, exist_ok=True)
+
+        fg_fvmd_mean, fg_fvmd_std = calculate_fvmd(
+            ref_fg_fvmd_frames,
+            dec_fg_fvmd_frames,
+            log_root=fvmd_log_dir,
+            stride=1,
+            max_frames=None,
+            early_stop_delta=fvmd_early_stop_delta,
+            early_stop_window=fvmd_early_stop_window,
+            device=fvmd_device,
+            verbose=False,
+        )
+        bg_fvmd_mean, bg_fvmd_std = calculate_fvmd(
+            ref_bg_fvmd_frames,
+            dec_bg_fvmd_frames,
+            log_root=fvmd_log_dir,
+            stride=1,
+            max_frames=None,
+            early_stop_delta=fvmd_early_stop_delta,
+            early_stop_window=fvmd_early_stop_window,
+            device=fvmd_device,
+            verbose=False,
+        )
+
+        result['foreground']['fvmd'] = fg_fvmd_mean
+        result['foreground']['fvmd_std'] = fg_fvmd_std
+        result['background']['fvmd'] = bg_fvmd_mean
+        result['background']['fvmd_std'] = bg_fvmd_std
+
+    sample_frames = [idx for idx in ctx.sample_frames if idx < frame_count]
+    for frame_idx in sample_frames:
+        ref_frame = reference_frames[frame_idx]
+        dec_frame = decoded_frames[frame_idx]
+        try:
+            ref_blocks = split_image_into_blocks(ref_frame, block_size)
+            dec_blocks = split_image_into_blocks(dec_frame, block_size)
+        except ValueError:
+            continue
+
+        psnr_map = calculate_blockwise_metric(ref_blocks, dec_blocks, psnr)
+        ssim_map = calculate_blockwise_metric(ref_blocks, dec_blocks, _block_ssim)
+        mask_img = fg_masks[frame_idx].astype(np.uint8) * 255
+        heatmap_path = os.path.join(
+            ctx.heatmaps_dir,
+            f"{slug}_frame_{frame_idx + 1:05d}.png",
+        )
+        _generate_and_save_heatmap(
+            ref_frame,
+            dec_frame,
+            mask_img,
+            {'PSNR': psnr_map, 'SSIM': ssim_map},
+            video_name,
+            frame_idx,
+            heatmap_path,
+            block_size,
+        )
+
+    print(f"  ✓ Completed evaluation for '{video_name}'.")
+    return result
 
 
 def _generate_and_save_heatmap(
@@ -4012,6 +4215,31 @@ def _print_summary_report(results: Dict) -> None:
         print("No results to display.")
         return
 
+    def _format_pair(
+        fg_value: Optional[float],
+        bg_value: Optional[float],
+        precision_fg: int = 2,
+        precision_bg: Optional[int] = None,
+    ) -> str:
+        precision_bg = precision_bg if precision_bg is not None else precision_fg
+
+        def _fmt(value: Optional[float], precision: int) -> str:
+            if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return 'N/A'
+            return f"{value:.{precision}f}"
+
+        return f"{_fmt(fg_value, precision_fg)} / {_fmt(bg_value, precision_bg)}"
+
+    def _format_single(value: Optional[float], precision: int = 2) -> str:
+        if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return 'N/A'
+        return f"{value:.{precision}f}"
+
+    def _format_change(value: Optional[float]) -> str:
+        if value is None or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return 'N/A'
+        return f"{value:+.2f}%"
+
     # Unified metrics table
     print(f"\n{'QUALITY METRICS (Foreground / Background)':^180}")
     print(f"{'Method':<20} {'PSNR (dB)':<25} {'SSIM':<25} {'LPIPS':<25} {'FVMD':<25} {'VMAF':<25} {'Bitrate (Mbps)':<15}")
@@ -4022,12 +4250,12 @@ def _print_summary_report(results: Dict) -> None:
         bg_data = data['background']
 
         # Format metric strings (FG / BG)
-        psnr_str = f"{fg_data.get('psnr_mean', 0):.2f} / {bg_data.get('psnr_mean', 0):.2f}"
-        ssim_str = f"{fg_data.get('ssim_mean', 0):.4f} / {bg_data.get('ssim_mean', 0):.4f}"
-        lpips_str = f"{fg_data.get('lpips_mean', 0):.4f} / {bg_data.get('lpips_mean', 0):.4f}"
-        fvmd_str = f"{fg_data.get('fvmd', 0):.2f} / {bg_data.get('fvmd', 0):.2f}"
-        vmaf_str = f"{fg_data.get('vmaf_mean', 0):.2f} / {bg_data.get('vmaf_mean', 0):.2f}"
-        bitrate_str = f"{data['bitrate_mbps']:.2f}"
+        psnr_str = _format_pair(fg_data.get('psnr_mean'), bg_data.get('psnr_mean'), precision_fg=2)
+        ssim_str = _format_pair(fg_data.get('ssim_mean'), bg_data.get('ssim_mean'), precision_fg=4, precision_bg=4)
+        lpips_str = _format_pair(fg_data.get('lpips_mean'), bg_data.get('lpips_mean'), precision_fg=4, precision_bg=4)
+        fvmd_str = _format_pair(fg_data.get('fvmd'), bg_data.get('fvmd'), precision_fg=2)
+        vmaf_str = _format_pair(fg_data.get('vmaf_mean'), bg_data.get('vmaf_mean'), precision_fg=2)
+        bitrate_str = _format_single(data.get('bitrate_mbps'), precision=2)
 
         print(f"{video_name:<20} {psnr_str:<25} {ssim_str:<25} {lpips_str:<25} {fvmd_str:<25} {vmaf_str:<25} {bitrate_str:<15}")
 
@@ -4042,64 +4270,92 @@ def _print_summary_report(results: Dict) -> None:
 
         for video_name in list(results.keys())[1:]:
             # Calculate changes for all metrics
-            psnr_fg_change = 0.0
-            psnr_bg_change = 0.0
-            ssim_fg_change = 0.0
-            ssim_bg_change = 0.0
-            lpips_fg_change = 0.0
-            lpips_bg_change = 0.0
-            fvmd_fg_change = 0.0
-            fvmd_bg_change = 0.0
-            vmaf_fg_change = 0.0
-            vmaf_bg_change = 0.0
+            psnr_fg_change = math.nan
+            psnr_bg_change = math.nan
+            ssim_fg_change = math.nan
+            ssim_bg_change = math.nan
+            lpips_fg_change = math.nan
+            lpips_bg_change = math.nan
+            fvmd_fg_change = math.nan
+            fvmd_bg_change = math.nan
+            vmaf_fg_change = math.nan
+            vmaf_bg_change = math.nan
 
             for metric in ['psnr', 'ssim', 'lpips', 'vmaf']:
                 for region in ['foreground', 'background']:
-                    baseline_val = results[baseline_name][region].get(f'{metric}_mean', 0)
-                    current_val = results[video_name][region].get(f'{metric}_mean', 0)
+                    baseline_val = results[baseline_name][region].get(f'{metric}_mean')
+                    current_val = results[video_name][region].get(f'{metric}_mean')
 
-                    if baseline_val > 0:
-                        # For LPIPS, lower is better, so invert the change
+                    change = math.nan
+                    if (
+                        isinstance(baseline_val, (int, float))
+                        and isinstance(current_val, (int, float))
+                        and math.isfinite(baseline_val)
+                        and math.isfinite(current_val)
+                        and baseline_val != 0
+                    ):
                         if metric == 'lpips':
-                            change = ((baseline_val / current_val) - 1) * 100 if current_val > 0 else 0.0
+                            if current_val > 0:
+                                change = ((baseline_val / current_val) - 1) * 100
                         else:
                             change = ((current_val / baseline_val) - 1) * 100
 
-                        if metric == 'psnr' and region == 'foreground':
-                            psnr_fg_change = change
-                        elif metric == 'psnr' and region == 'background':
-                            psnr_bg_change = change
-                        elif metric == 'ssim' and region == 'foreground':
-                            ssim_fg_change = change
-                        elif metric == 'ssim' and region == 'background':
-                            ssim_bg_change = change
-                        elif metric == 'lpips' and region == 'foreground':
-                            lpips_fg_change = change
-                        elif metric == 'lpips' and region == 'background':
-                            lpips_bg_change = change
-                        elif metric == 'vmaf' and region == 'foreground':
-                            vmaf_fg_change = change
-                        elif metric == 'vmaf' and region == 'background':
-                            vmaf_bg_change = change
+                    if metric == 'psnr' and region == 'foreground':
+                        psnr_fg_change = change
+                    elif metric == 'psnr' and region == 'background':
+                        psnr_bg_change = change
+                    elif metric == 'ssim' and region == 'foreground':
+                        ssim_fg_change = change
+                    elif metric == 'ssim' and region == 'background':
+                        ssim_bg_change = change
+                    elif metric == 'lpips' and region == 'foreground':
+                        lpips_fg_change = change
+                    elif metric == 'lpips' and region == 'background':
+                        lpips_bg_change = change
+                    elif metric == 'vmaf' and region == 'foreground':
+                        vmaf_fg_change = change
+                    elif metric == 'vmaf' and region == 'background':
+                        vmaf_bg_change = change
 
             # Calculate FVMD changes (lower is better, so invert like LPIPS)
             for region in ['foreground', 'background']:
-                baseline_fvmd = results[baseline_name][region].get('fvmd', 0)
-                current_fvmd = results[video_name][region].get('fvmd', 0)
+                baseline_fvmd = results[baseline_name][region].get('fvmd')
+                current_fvmd = results[video_name][region].get('fvmd')
 
-                if baseline_fvmd > 0 and current_fvmd > 0:
+                change = math.nan
+                if (
+                    isinstance(baseline_fvmd, (int, float))
+                    and isinstance(current_fvmd, (int, float))
+                    and math.isfinite(baseline_fvmd)
+                    and math.isfinite(current_fvmd)
+                    and baseline_fvmd > 0
+                    and current_fvmd > 0
+                ):
                     change = ((baseline_fvmd / current_fvmd) - 1) * 100
-                    if region == 'foreground':
-                        fvmd_fg_change = change
-                    else:
-                        fvmd_bg_change = change
+
+                if region == 'foreground':
+                    fvmd_fg_change = change
+                else:
+                    fvmd_bg_change = change
+
+            psnr_fg_change_str = _format_change(psnr_fg_change)
+            psnr_bg_change_str = _format_change(psnr_bg_change)
+            ssim_fg_change_str = _format_change(ssim_fg_change)
+            ssim_bg_change_str = _format_change(ssim_bg_change)
+            lpips_fg_change_str = _format_change(lpips_fg_change)
+            lpips_bg_change_str = _format_change(lpips_bg_change)
+            fvmd_fg_change_str = _format_change(fvmd_fg_change)
+            fvmd_bg_change_str = _format_change(fvmd_bg_change)
+            vmaf_fg_change_str = _format_change(vmaf_fg_change)
+            vmaf_bg_change_str = _format_change(vmaf_bg_change)
 
             print(
-                f"{video_name:<20} {psnr_fg_change:+.2f}%{' '*8} {psnr_bg_change:+.2f}%{' '*8} "
-                f"{ssim_fg_change:+.2f}%{' '*8} {ssim_bg_change:+.2f}%{' '*8} "
-                f"{lpips_fg_change:+.2f}%{' '*8} {lpips_bg_change:+.2f}%{' '*8} "
-                f"{fvmd_fg_change:+.2f}%{' '*8} {fvmd_bg_change:+.2f}%{' '*8} "
-                f"{vmaf_fg_change:+.2f}%{' '*8} {vmaf_bg_change:+.2f}%{' '*8}"
+                f"{video_name:<20} "
+                f"{psnr_fg_change_str:<15} {psnr_bg_change_str:<15} "
+                f"{ssim_fg_change_str:<15} {ssim_bg_change_str:<15} "
+                f"{lpips_fg_change_str:<15} {lpips_bg_change_str:<15} "
+                f"{fvmd_fg_change_str:<15} {fvmd_bg_change_str:<15} "
+                f"{vmaf_fg_change_str:<15} {vmaf_bg_change_str:<15}"
             )
 
         print(f"{'-'*180}")
@@ -4214,6 +4470,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
                 "fvmd_early_stop_delta": config.fvmd_early_stop_delta,
                 "fvmd_early_stop_window": config.fvmd_early_stop_window,
                 "vmaf_stride": config.vmaf_stride,
+                "enable_fvmd": config.enable_fvmd,
             },
         },
     }
@@ -4393,9 +4650,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     execution_times["adaptive_encoding"] = end - start
     print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
 
-    # Downsampling-based ELVIS v2
+    # ELVIS v2 Downsample
     start = time.time()
-    print("Applying downsampling-based ELVIS v2 adaptive filtering and encoding...")
+    print("Applying ELVIS v2 Downsample adaptive filtering and encoding...")
     downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
 
@@ -4430,11 +4687,11 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     )
     end = time.time()
     execution_times["elvis_v2_downsampling"] = end - start
-    print(f"Downsampling-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+    print(f"ELVIS v2 Downsample filtering and encoding completed in {end - start:.2f} seconds.\n")
 
-    # Gaussian blur-based ELVIS v2
+    # ELVIS v2 Gaussian
     start = time.time()
-    print("Applying Gaussian blur Filtering-based ELVIS v2 adaptive filtering and encoding...")
+    print("Applying ELVIS v2 Gaussian adaptive filtering and encoding...")
     gaussian_frames_dir = os.path.join(experiment_dir, "frames", "gaussian")
     os.makedirs(gaussian_frames_dir, exist_ok=True)
 
@@ -4469,7 +4726,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     )
     end = time.time()
     execution_times["elvis_v2_gaussian"] = end - start
-    print(f"Gaussian blur filtering-based ELVIS v2 filtering and encoding completed in {end - start:.2f} seconds.\n")
+    print(f"ELVIS v2 Gaussian filtering and encoding completed in {end - start:.2f} seconds.\n")
 
     # Client-side stretching
     start = time.time()
@@ -4612,9 +4869,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         target_bitrate=None,
     )
 
-    # Downsampling restoration
+    # ELVIS v2 Downsample restoration
     start = time.time()
-    print("Decoding downsampled ELVIS v2 video and strength maps...")
+    print("Decoding ELVIS v2 Downsample video and strength maps...")
     downsampled_frames_decoded_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
     if not decode_video(
         downsampled_video,
@@ -4632,7 +4889,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     print(f"Decoding completed in {end - start:.2f} seconds.\n")
 
     start = time.time()
-    print("Applying adaptive upsampling restoration for downsampling-based ELVIS v2...")
+    print("Applying adaptive upsampling restoration for ELVIS v2 Downsample...")
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
     restore_downsampled_with_realesrgan(
@@ -4667,7 +4924,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
 
     # Gaussian restoration
     start = time.time()
-    print("Decoding Gaussian blur filtered ELVIS v2 video and strength maps...")
+    print("Decoding ELVIS v2 Gaussian video and strength maps...")
     gaussian_frames_decoded_dir = os.path.join(experiment_dir, "frames", "gaussian_decoded")
     if not decode_video(
         gaussian_video,
@@ -4685,7 +4942,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     print(f"Decoding completed in {end - start:.2f} seconds.\n")
 
     start = time.time()
-    print("Applying adaptive deblurring restoration for Gaussian blur filtering-based ELVIS v2...")
+    print("Applying adaptive deblurring restoration for ELVIS v2 Gaussian...")
     instantir_work_dir = os.path.join(experiment_dir, "instantir_work")
     gaussian_instantir_input_dir = os.path.join(instantir_work_dir, "gaussian_decoded")
     os.makedirs(gaussian_instantir_input_dir, exist_ok=True)
@@ -4789,6 +5046,20 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         "ELVIS v2 Gaussian": strength_maps_gaussian,
     }
 
+    if config.generate_opencv_benchmarks:
+        opencv_benchmarks, opencv_bitrates = generate_opencv_benchmarks(
+            reference_frames=reference_frames,
+            strength_maps=strength_maps_dict,
+            block_size=block_size,
+            framerate=framerate,
+            width=width,
+            height=height,
+            temp_dir=experiment_dir,
+            video_bitrates=bitrates,
+        )
+        encoded_videos.update(opencv_benchmarks)
+        bitrates.update(opencv_bitrates)
+
     analysis_results = analyze_encoding_performance(
         reference_frames=reference_frames,
         encoded_videos=encoded_videos,
@@ -4801,8 +5072,8 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         video_bitrates=bitrates,
         reference_video_path=reference_video,
         framerate=framerate,
-        strength_maps=strength_maps_dict,
-        generate_opencv_benchmarks=config.generate_opencv_benchmarks,
+    strength_maps=None,
+    generate_opencv_benchmarks=False,
         metric_stride=config.metric_stride,
         fvmd_stride=config.fvmd_stride,
         fvmd_max_frames=config.fvmd_max_frames,
@@ -4810,6 +5081,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         fvmd_early_stop_delta=config.fvmd_early_stop_delta,
         fvmd_early_stop_window=config.fvmd_early_stop_window,
         vmaf_stride=config.vmaf_stride,
+        enable_fvmd=config.enable_fvmd,
     )
 
     end = time.time()

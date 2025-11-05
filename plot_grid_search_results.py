@@ -19,14 +19,22 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Ellipse  # noqa: E402
 
 DEFAULT_METRICS: Sequence[str] = (
-    "fvmd",
     "psnr_mean",
     "ssim_mean",
-    "lpips_mean",
     "vmaf_mean",
+    "lpips_mean",
+    "fvmd",
 )
 
 EXCLUDED_METRIC_KEYWORDS: Sequence[str] = ("execution", "parameter")
+
+LOG_SCALE_METRICS: Sequence[str] = ("fvmd",)
+
+MIN_LOG_VALUE: float = 1e-6
+
+
+def _metric_root(metric: str) -> str:
+    return metric.split("_", 1)[0].lower()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -171,16 +179,29 @@ def _plot_metric_scatter(
     for idx, metric in enumerate(metrics_to_plot):
         ax = axes_iter[idx]
         points = metric_points[metric]
-        fg_values = [point["foreground"] for point in points]
-        bg_values = [point["background"] for point in points]
+        metric_root = _metric_root(metric)
+        use_log_scale = metric_root in LOG_SCALE_METRICS
+        fg_values: List[float] = []
+        bg_values: List[float] = []
         extent_values: List[float] = []
 
-        for point, fg_val, bg_val in zip(points, fg_values, bg_values):
+        for point in points:
+            fg_val = float(point["foreground"])
+            bg_val = float(point["background"])
+            fg_plot = fg_val
+            bg_plot = bg_val
+            if use_log_scale:
+                fg_plot = max(fg_plot, MIN_LOG_VALUE)
+                bg_plot = max(bg_plot, MIN_LOG_VALUE)
+
+            fg_values.append(fg_plot)
+            bg_values.append(bg_plot)
+
             approach = point["experiment"]
-            color = approach_color_map.get(approach)
+            color = approach_color_map.get(approach, "#999999")
             ax.scatter(
-                [bg_val],
-                [fg_val],
+                [bg_plot],
+                [fg_plot],
                 color=color,
                 alpha=0.85,
                 edgecolor="white",
@@ -192,7 +213,7 @@ def _plot_metric_scatter(
             bg_std = point.get("background_std")
             if fg_std is not None and bg_std is not None and (fg_std > 0 or bg_std > 0):
                 ellipse = Ellipse(
-                    xy=(bg_val, fg_val),
+                    xy=(bg_plot, fg_plot),
                     width=max(1e-6, 2 * bg_std),
                     height=max(1e-6, 2 * fg_std),
                     edgecolor=color,
@@ -201,31 +222,70 @@ def _plot_metric_scatter(
                     alpha=0.4,
                 )
                 ax.add_patch(ellipse)
-                extent_values.extend([
-                    fg_val + fg_std,
-                    fg_val - fg_std,
-                    bg_val + bg_std,
-                    bg_val - bg_std,
-                ])
+                candidate_values = [
+                    fg_plot + fg_std,
+                    fg_plot - fg_std,
+                    bg_plot + bg_std,
+                    bg_plot - bg_std,
+                ]
+                if use_log_scale:
+                    for candidate in candidate_values:
+                        if math.isfinite(candidate):
+                            extent_values.append(max(candidate, MIN_LOG_VALUE))
+                else:
+                    extent_values.extend([candidate for candidate in candidate_values if math.isfinite(candidate)])
 
         combined = fg_values + bg_values + extent_values
         finite_values = [val for val in combined if math.isfinite(val)]
+        if use_log_scale:
+            finite_values = [val for val in finite_values if val > 0]
+
+        line_lower = None
+        line_upper = None
         if finite_values:
             min_val = min(finite_values)
             max_val = max(finite_values)
-            span = max_val - min_val
-            padding = 1.0 if span < 1e-6 else span * 0.05
-            lower = min_val - padding
-            upper = max_val + padding
+            if use_log_scale:
+                log_min = math.log10(min_val)
+                log_max = math.log10(max_val)
+                if math.isclose(log_min, log_max):
+                    delta = 0.5
+                else:
+                    delta = (log_max - log_min) * 0.05
+                lower = 10 ** (log_min - delta)
+                upper = 10 ** (log_max + delta)
+                lower = max(lower, MIN_LOG_VALUE)
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+            else:
+                span = max_val - min_val
+                padding = 1.0 if span < 1e-6 else span * 0.05
+                lower = min_val - padding
+                upper = max_val + padding
+            if upper <= lower:
+                if use_log_scale:
+                    upper = lower * 1.1
+                else:
+                    upper = lower + 1.0
             ax.set_xlim(lower, upper)
             ax.set_ylim(lower, upper)
-            ax.plot([lower, upper], [lower, upper], linestyle="--", color="#666666", linewidth=1.0)
+            line_lower, line_upper = lower, upper
+        elif use_log_scale:
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+
+        if line_lower is not None and line_upper is not None:
+            ax.plot([line_lower, line_upper], [line_lower, line_upper], linestyle="--", color="#666666", linewidth=1.0)
 
         title = metric.replace("_mean", "").replace("_", " ").upper()
         ax.set_title(title)
         ax.set_xlabel("Background")
         ax.set_ylabel("Foreground")
-        ax.grid(True, linestyle="--", alpha=0.3)
+        grid_kwargs = {"linestyle": "--", "alpha": 0.3}
+        if use_log_scale:
+            ax.grid(True, which="both", **grid_kwargs)
+        else:
+            ax.grid(True, **grid_kwargs)
 
     for ax in axes_iter[num_metrics:]:
         ax.axis("off")

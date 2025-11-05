@@ -166,3 +166,5 @@ Real-ESRGAN/
 *.pt
 *.bin
 grid_search_results/
+grid_search_results_with_fvmd/
+grid_search_results_wo_fvmd/
