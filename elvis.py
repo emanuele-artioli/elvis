@@ -8,6 +8,7 @@ import threading
 import contextlib
 import warnings
 import gc
+from collections import defaultdict
 from dataclasses import dataclass, asdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from itertools import islice, cycle
@@ -48,6 +49,8 @@ from instantir import InstantIRRuntime, load_runtime, restore_images_batch
 # Cache platform-specific constants at module level for performance
 NULL_DEVICE = "NUL" if platform.system() == "Windows" else "/dev/null"
 IS_WINDOWS = platform.system() == "Windows"
+
+FVMD_MIN_FRAMES = 10
 
 try:
     from diffusers.utils import logging as _diffusers_logging  # type: ignore
@@ -135,6 +138,22 @@ class ElvisConfig:
     fvmd_early_stop_window: int = 50
     vmaf_stride: int = 1
     
+
+# ---------------------------------------------------------------------------
+# Pipeline and reporting label constants
+# ---------------------------------------------------------------------------
+APPROACH_BASELINE = "Baseline"
+APPROACH_PRESLEY_QP = "PRESLEY QP"
+APPROACH_ELVIS = "ELVIS"
+APPROACH_ELVIS_CV2 = f"{APPROACH_ELVIS} CV2"
+APPROACH_ELVIS_PROP = f"{APPROACH_ELVIS} ProPainter"
+APPROACH_ELVIS_E2FGVI = f"{APPROACH_ELVIS} E2FGVI"
+APPROACH_PRESLEY_REALESRGAN = "PRESLEY RealESRGAN"
+APPROACH_PRESLEY_INSTANTIR = "PRESLEY InstantIR"
+APPROACH_PRESLEY_LANCZOS = "PRESLEY Lanczos"
+APPROACH_PRESLEY_UNSHARP = "PRESLEY Unsharp"
+
+
 @dataclass
 class _EvaluationContext:
     reference_frames: Sequence[np.ndarray]
@@ -153,16 +172,20 @@ class _EvaluationContext:
     fvmd_log_root: str
     sample_frames: List[int]
     enable_fvmd: bool
+    fvmd_device_locks: Dict[Optional[int], Any]
 
 
 _EVALUATION_CONTEXT: Optional[_EvaluationContext] = None
+_FVMD_DEVICE_LOCKS: Dict[Optional[int], Any] = {}
 
 
 def _initialise_evaluation_worker(context: _EvaluationContext) -> None:
     """Initializer that seeds worker processes with shared evaluation context."""
 
-    global _EVALUATION_CONTEXT
+    global _EVALUATION_CONTEXT, _FVMD_DEVICE_LOCKS
+    global _FVMD_DEVICE_LOCKS
     _EVALUATION_CONTEXT = context
+    _FVMD_DEVICE_LOCKS = context.fvmd_device_locks
 
 
 def _list_or_none(value: Optional[Sequence[Any]]) -> Optional[List[Any]]:
@@ -970,7 +993,9 @@ def generate_opencv_benchmarks(
         print(f"\nProcessing benchmarks for: {method_name}")
         target_bitrate = video_bitrates.get(method_name, 1_000_000)
 
-        if "downsample" in method_name.lower():
+        normalized_name = method_name.lower()
+
+        if "downsample" in normalized_name or "realesrgan" in normalized_name:
             print("  - Generating Lanczos restoration benchmark...")
             benchmark_frames_lanczos: List[np.ndarray] = []
             for frame_idx, frame in enumerate(reference_frames):
@@ -995,11 +1020,11 @@ def generate_opencv_benchmarks(
                 height,
                 target_bitrate=target_bitrate,
             )
-            key = f"{method_name} (OpenCV Lanczos)"
+            key = APPROACH_PRESLEY_LANCZOS if method_name == APPROACH_PRESLEY_REALESRGAN else f"{method_name} Lanczos"
             opencv_benchmarks[key] = lanczos_video
             updated_bitrates[key] = video_bitrates.get(method_name, 0.0)
 
-        elif "gaussian" in method_name.lower() or "blur" in method_name.lower():
+        elif "gaussian" in normalized_name or "blur" in normalized_name or "instantir" in normalized_name:
             print("  - Generating unsharp mask restoration benchmark...")
             benchmark_frames_unsharp: List[np.ndarray] = []
             for frame_idx, frame in enumerate(reference_frames):
@@ -1024,7 +1049,7 @@ def generate_opencv_benchmarks(
                 height,
                 target_bitrate=target_bitrate,
             )
-            key = f"{method_name} (OpenCV Unsharp Mask)"
+            key = APPROACH_PRESLEY_UNSHARP if method_name == APPROACH_PRESLEY_INSTANTIR else f"{method_name} Unsharp"
             opencv_benchmarks[key] = unsharp_video
             updated_bitrates[key] = video_bitrates.get(method_name, 0.0)
 
@@ -3766,6 +3791,28 @@ def analyze_encoding_performance(
 
     sample_frames_unique = sorted({idx for idx in sample_frames if 0 <= idx < total_reference_frames})
 
+    try:
+        mp_ctx = multiprocessing.get_context("spawn")
+    except ValueError:
+        mp_ctx = multiprocessing.get_context()
+
+    gpu_device_ids: List[Optional[int]] = []
+    if enable_fvmd and torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if gpu_count > 0:
+            gpu_device_ids = list(range(gpu_count))
+    if not gpu_device_ids:
+        gpu_device_ids = [None]
+
+    unique_device_ids: List[Optional[int]] = []
+    for device_id in gpu_device_ids:
+        if device_id not in unique_device_ids:
+            unique_device_ids.append(device_id)
+
+    fvmd_device_locks: Dict[Optional[int], Any] = {}
+    for device_id in unique_device_ids:
+        fvmd_device_locks[device_id] = mp_ctx.Semaphore(1)
+
     global _EVALUATION_CONTEXT
     evaluation_context = _EvaluationContext(
         reference_frames=reference_frames,
@@ -3784,6 +3831,7 @@ def analyze_encoding_performance(
         fvmd_log_root=fvmd_log_root,
         sample_frames=sample_frames_unique,
         enable_fvmd=enable_fvmd,
+        fvmd_device_locks=fvmd_device_locks,
     )
     _EVALUATION_CONTEXT = evaluation_context
 
@@ -3800,15 +3848,8 @@ def analyze_encoding_performance(
     if not videos_to_process:
         print("No encoded videos available for analysis.")
         _EVALUATION_CONTEXT = None
+        _FVMD_DEVICE_LOCKS = {}
         return analysis_results
-
-    gpu_device_ids: List[Optional[int]] = []
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        if gpu_count > 0:
-            gpu_device_ids = list(range(gpu_count))
-    if not enable_fvmd or not gpu_device_ids:
-        gpu_device_ids = [None]
 
     cpu_count = multiprocessing.cpu_count() if hasattr(multiprocessing, "cpu_count") else os.cpu_count()
     max_workers = min(len(videos_to_process), cpu_count or len(videos_to_process) or 1)
@@ -3818,11 +3859,6 @@ def analyze_encoding_performance(
         max_workers = min(max_workers, effective_gpu_workers)
 
     max_workers = max(1, max_workers)
-
-    try:
-        mp_ctx = multiprocessing.get_context("spawn")
-    except ValueError:
-        mp_ctx = multiprocessing.get_context()
 
     futures = {}
     with ProcessPoolExecutor(
@@ -3859,6 +3895,7 @@ def analyze_encoding_performance(
                 analysis_results[video_name] = result
 
     _EVALUATION_CONTEXT = None
+    _FVMD_DEVICE_LOCKS = {}
 
     if analysis_results:
         _generate_quality_visualizations(analysis_results, heatmaps_dir)
@@ -4060,47 +4097,90 @@ def _evaluate_single_video_metrics(
     result['background']['vmaf_std'] = float(vmaf_bg.get('std', 0))
 
     if ctx.enable_fvmd:
-        fvmd_indices = list(range(0, frame_count, fvmd_stride))
+        min_fvmd_samples = FVMD_MIN_FRAMES
+        total_available_frames = frame_count
+        if fvmd_max_frames is not None and fvmd_max_frames > 0:
+            total_available_frames = min(total_available_frames, fvmd_max_frames)
+
+        effective_stride = max(1, fvmd_stride)
+        if total_available_frames >= min_fvmd_samples:
+            max_stride_for_min_samples = max(1, total_available_frames // min_fvmd_samples)
+            effective_stride = min(effective_stride, max_stride_for_min_samples)
+        else:
+            effective_stride = 1
+
+        if effective_stride != fvmd_stride:
+            _safe_print(
+                f"    Adjusted FVMD stride from {fvmd_stride} to {effective_stride} for '{video_name}' to sample enough frames."
+            )
+
+        fvmd_indices = list(range(0, frame_count, effective_stride))
         if not fvmd_indices:
             fvmd_indices = [0]
         if fvmd_max_frames is not None and fvmd_max_frames > 0:
             fvmd_indices = fvmd_indices[:fvmd_max_frames]
 
-        ref_fg_fvmd_frames = [masked_reference_fg_frames[i] for i in fvmd_indices]
-        dec_fg_fvmd_frames = [masked_decoded_fg_frames[i] for i in fvmd_indices]
-        ref_bg_fvmd_frames = [masked_reference_bg_frames[i] for i in fvmd_indices]
-        dec_bg_fvmd_frames = [masked_decoded_bg_frames[i] for i in fvmd_indices]
+        if len(fvmd_indices) < min_fvmd_samples:
+            _safe_print(
+                f"    Skipping FVMD for '{video_name}': only {len(fvmd_indices)} sampled frame(s); need at least {min_fvmd_samples}."
+            )
+        else:
+            ref_fg_fvmd_frames = [masked_reference_fg_frames[i] for i in fvmd_indices]
+            dec_fg_fvmd_frames = [masked_decoded_fg_frames[i] for i in fvmd_indices]
+            ref_bg_fvmd_frames = [masked_reference_bg_frames[i] for i in fvmd_indices]
+            dec_bg_fvmd_frames = [masked_decoded_bg_frames[i] for i in fvmd_indices]
 
-        fvmd_log_dir = os.path.join(ctx.fvmd_log_root, slug)
-        os.makedirs(fvmd_log_dir, exist_ok=True)
+            fvmd_log_dir = os.path.join(ctx.fvmd_log_root, slug)
+            os.makedirs(fvmd_log_dir, exist_ok=True)
 
-        fg_fvmd_mean, fg_fvmd_std = calculate_fvmd(
-            ref_fg_fvmd_frames,
-            dec_fg_fvmd_frames,
-            log_root=fvmd_log_dir,
-            stride=1,
-            max_frames=None,
-            early_stop_delta=fvmd_early_stop_delta,
-            early_stop_window=fvmd_early_stop_window,
-            device=fvmd_device,
-            verbose=False,
-        )
-        bg_fvmd_mean, bg_fvmd_std = calculate_fvmd(
-            ref_bg_fvmd_frames,
-            dec_bg_fvmd_frames,
-            log_root=fvmd_log_dir,
-            stride=1,
-            max_frames=None,
-            early_stop_delta=fvmd_early_stop_delta,
-            early_stop_window=fvmd_early_stop_window,
-            device=fvmd_device,
-            verbose=False,
-        )
+            fvmd_lock = None
+            lock_acquired = False
+            if _FVMD_DEVICE_LOCKS:
+                if fvmd_device in _FVMD_DEVICE_LOCKS:
+                    fvmd_lock = _FVMD_DEVICE_LOCKS[fvmd_device]
+                elif None in _FVMD_DEVICE_LOCKS:
+                    fvmd_lock = _FVMD_DEVICE_LOCKS[None]
 
-        result['foreground']['fvmd'] = fg_fvmd_mean
-        result['foreground']['fvmd_std'] = fg_fvmd_std
-        result['background']['fvmd'] = bg_fvmd_mean
-        result['background']['fvmd_std'] = bg_fvmd_std
+            try:
+                if fvmd_lock is not None:
+                    if fvmd_lock.acquire(block=False):
+                        lock_acquired = True
+                    else:
+                        device_label = f"cuda:{fvmd_device}" if fvmd_device is not None else "cpu"
+                        _safe_print(f"    Waiting for FVMD device {device_label} to become available...")
+                        fvmd_lock.acquire()
+                        lock_acquired = True
+
+                fg_fvmd_mean, fg_fvmd_std = calculate_fvmd(
+                    ref_fg_fvmd_frames,
+                    dec_fg_fvmd_frames,
+                    log_root=fvmd_log_dir,
+                    stride=1,
+                    max_frames=None,
+                    early_stop_delta=fvmd_early_stop_delta,
+                    early_stop_window=fvmd_early_stop_window,
+                    device=fvmd_device,
+                    verbose=False,
+                )
+                bg_fvmd_mean, bg_fvmd_std = calculate_fvmd(
+                    ref_bg_fvmd_frames,
+                    dec_bg_fvmd_frames,
+                    log_root=fvmd_log_dir,
+                    stride=1,
+                    max_frames=None,
+                    early_stop_delta=fvmd_early_stop_delta,
+                    early_stop_window=fvmd_early_stop_window,
+                    device=fvmd_device,
+                    verbose=False,
+                )
+            finally:
+                if lock_acquired and fvmd_lock is not None:
+                    fvmd_lock.release()
+
+            result['foreground']['fvmd'] = fg_fvmd_mean
+            result['foreground']['fvmd_std'] = fg_fvmd_std
+            result['background']['fvmd'] = bg_fvmd_mean
+            result['background']['fvmd_std'] = bg_fvmd_std
 
     sample_frames = [idx for idx in ctx.sample_frames if idx < frame_count]
     for frame_idx in sample_frames:
@@ -4379,6 +4459,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     os.makedirs(experiment_dir, exist_ok=True)
 
     execution_times: Dict[str, float] = {}
+    approach_times = defaultdict(float)
 
     if config.force_framerate is not None:
         framerate = float(config.force_framerate)
@@ -4540,7 +4621,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     reference_frames = [cv2.imread(os.path.join(reference_frames_dir, f)) for f in frame_files]
 
     end = time.time()
-    execution_times["preprocessing"] = end - start
+    execution_times["Preprocessing"] = end - start
     print(f"Video preprocessing completed in {end - start:.2f} seconds.\n")
 
     # Removability scores
@@ -4557,7 +4638,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         smoothing_beta=config.removability_smoothing_beta,
     )
     end = time.time()
-    execution_times["removability_score_calculation"] = end - start
+    execution_times["Removability Calculation"] = end - start
     print(f"Removability scores calculation completed in {end - start:.2f} seconds.\n")
 
     # Baseline encoding
@@ -4575,12 +4656,13 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         pix_fmt=config.baseline_encode_pix_fmt,
     )
     end = time.time()
-    execution_times["baseline_encoding"] = end - start
-    print(f"Baseline encoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_BASELINE] += duration
+    print(f"Baseline encoding completed in {duration:.2f} seconds.\n")
 
-    # ELVIS v1 shrinking
+    # ELVIS shrinking
     start = time.time()
-    print("Shrinking and encoding frames with ELVIS v1...")
+    print(f"Shrinking and encoding frames with {APPROACH_ELVIS}...")
     shrunk_frames_dir = os.path.join(experiment_dir, "frames", "shrunk")
     os.makedirs(shrunk_frames_dir, exist_ok=True)
 
@@ -4615,8 +4697,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         shape=removal_masks_np.shape,
     )
     end = time.time()
-    execution_times["elvis_v1_shrinking"] = end - start
-    print(f"ELVIS v1 shrinking completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_ELVIS] += duration
+    print(f"{APPROACH_ELVIS} shrinking completed in {duration:.2f} seconds.\n")
 
     # Adaptive ROI encoding
     start = time.time()
@@ -4647,12 +4730,13 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         qp_maps_dir=qp_maps_dir,
     )
     end = time.time()
-    execution_times["adaptive_encoding"] = end - start
-    print(f"Adaptive encoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_QP] += duration
+    print(f"{APPROACH_PRESLEY_QP} encoding completed in {duration:.2f} seconds.\n")
 
-    # ELVIS v2 Downsample
+    # PRESLEY RealESRGAN
     start = time.time()
-    print("Applying ELVIS v2 Downsample adaptive filtering and encoding...")
+    print(f"Applying {APPROACH_PRESLEY_REALESRGAN} adaptive filtering and encoding...")
     downsampled_frames_dir = os.path.join(experiment_dir, "frames", "downsampled")
     os.makedirs(downsampled_frames_dir, exist_ok=True)
 
@@ -4686,12 +4770,13 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         target_bitrate=config.downsample_strength_target_bitrate,
     )
     end = time.time()
-    execution_times["elvis_v2_downsampling"] = end - start
-    print(f"ELVIS v2 Downsample filtering and encoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_REALESRGAN] += duration
+    print(f"{APPROACH_PRESLEY_REALESRGAN} filtering and encoding completed in {duration:.2f} seconds.\n")
 
-    # ELVIS v2 Gaussian
+    # PRESLEY InstantIR
     start = time.time()
-    print("Applying ELVIS v2 Gaussian adaptive filtering and encoding...")
+    print(f"Applying {APPROACH_PRESLEY_INSTANTIR} adaptive filtering and encoding...")
     gaussian_frames_dir = os.path.join(experiment_dir, "frames", "gaussian")
     os.makedirs(gaussian_frames_dir, exist_ok=True)
 
@@ -4725,12 +4810,13 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         target_bitrate=config.gaussian_strength_target_bitrate,
     )
     end = time.time()
-    execution_times["elvis_v2_gaussian"] = end - start
-    print(f"ELVIS v2 Gaussian filtering and encoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_INSTANTIR] += duration
+    print(f"{APPROACH_PRESLEY_INSTANTIR} filtering and encoding completed in {duration:.2f} seconds.\n")
 
     # Client-side stretching
     start = time.time()
-    print("Decoding and stretching ELVIS v1 video...")
+    print(f"Decoding and stretching {APPROACH_ELVIS} video...")
     removal_masks_file = np.load(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz"))
     removal_masks_loaded = np.unpackbits(removal_masks_file['packed'])
     removal_masks = removal_masks_loaded[:np.prod(removal_masks_file['shape'])].reshape(removal_masks_file['shape'])
@@ -4765,8 +4851,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
         cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
     end = time.time()
-    execution_times["elvis_v1_stretching"] = end - start
-    print(f"ELVIS v1 stretching completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_ELVIS] += duration
+    print(f"{APPROACH_ELVIS} stretching completed in {duration:.2f} seconds.\n")
 
     stretched_video = os.path.join(experiment_dir, "stretched.mp4")
     encode_video(
@@ -4788,8 +4875,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
     end = time.time()
-    execution_times["elvis_v1_inpainting_cv2"] = end - start
-    print(f"ELVIS v1 CV2 inpainting completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_ELVIS_CV2] += duration
+    print(f"{APPROACH_ELVIS_CV2} inpainting completed in {duration:.2f} seconds.\n")
 
     inpainted_cv2_video = os.path.join(experiment_dir, "inpainted_cv2.mp4")
     encode_video(
@@ -4824,8 +4912,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         chunk_overlap=config.propainter_chunk_overlap,
     )
     end = time.time()
-    execution_times["elvis_v1_inpainting_propainter"] = end - start
-    print(f"ELVIS v1 ProPainter inpainting completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_ELVIS_PROP] += duration
+    print(f"{APPROACH_ELVIS_PROP} inpainting completed in {duration:.2f} seconds.\n")
 
     inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
     encode_video(
@@ -4856,8 +4945,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         mask_dilation=config.e2fgvi_mask_dilation,
     )
     end = time.time()
-    execution_times["elvis_v1_inpainting_e2fgvi"] = end - start
-    print(f"ELVIS v1 E2FGVI inpainting completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_ELVIS_E2FGVI] += duration
+    print(f"{APPROACH_ELVIS_E2FGVI} inpainting completed in {duration:.2f} seconds.\n")
 
     inpainted_e2fgvi_video = os.path.join(experiment_dir, "inpainted_e2fgvi.mp4")
     encode_video(
@@ -4869,9 +4959,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         target_bitrate=None,
     )
 
-    # ELVIS v2 Downsample restoration
+    # PRESLEY RealESRGAN restoration
     start = time.time()
-    print("Decoding ELVIS v2 Downsample video and strength maps...")
+    print(f"Decoding {APPROACH_PRESLEY_REALESRGAN} video and strength maps...")
     downsampled_frames_decoded_dir = os.path.join(experiment_dir, "frames", "downsampled_decoded")
     if not decode_video(
         downsampled_video,
@@ -4885,11 +4975,12 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
     strength_maps = decode_strength_maps(downsample_maps_video, block_size, downsampled_maps_decoded_dir)
     end = time.time()
-    execution_times["elvis_v2_downsampling_decoding"] = end - start
-    print(f"Decoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_REALESRGAN] += duration
+    print(f"Decoding completed in {duration:.2f} seconds.\n")
 
     start = time.time()
-    print("Applying adaptive upsampling restoration for ELVIS v2 Downsample...")
+    print(f"Applying adaptive upsampling restoration for {APPROACH_PRESLEY_REALESRGAN}...")
     downsampled_restored_frames_dir = os.path.join(experiment_dir, "frames", "downsampled_restored")
     os.makedirs(downsampled_restored_frames_dir, exist_ok=True)
     restore_downsampled_with_realesrgan(
@@ -4909,8 +5000,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         model_path=config.realesrgan_model_path,
     )
     end = time.time()
-    execution_times["elvis_v2_downsampling_restoration"] = end - start
-    print(f"Adaptive upsampling restoration completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_REALESRGAN] += duration
+    print(f"{APPROACH_PRESLEY_REALESRGAN} restoration completed in {duration:.2f} seconds.\n")
 
     downsampled_restored_video = os.path.join(experiment_dir, "downsampled_restored.mp4")
     encode_video(
@@ -4924,7 +5016,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
 
     # Gaussian restoration
     start = time.time()
-    print("Decoding ELVIS v2 Gaussian video and strength maps...")
+    print(f"Decoding {APPROACH_PRESLEY_INSTANTIR} video and strength maps...")
     gaussian_frames_decoded_dir = os.path.join(experiment_dir, "frames", "gaussian_decoded")
     if not decode_video(
         gaussian_video,
@@ -4938,11 +5030,12 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
     strength_maps_gaussian = decode_strength_maps(gaussian_maps_video, block_size, gaussian_maps_decoded_dir)
     end = time.time()
-    execution_times["elvis_v2_gaussian_decoding"] = end - start
-    print(f"Decoding completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_INSTANTIR] += duration
+    print(f"Decoding completed in {duration:.2f} seconds.\n")
 
     start = time.time()
-    print("Applying adaptive deblurring restoration for ELVIS v2 Gaussian...")
+    print(f"Applying adaptive deblurring restoration for {APPROACH_PRESLEY_INSTANTIR}...")
     instantir_work_dir = os.path.join(experiment_dir, "instantir_work")
     gaussian_instantir_input_dir = os.path.join(instantir_work_dir, "gaussian_decoded")
     os.makedirs(gaussian_instantir_input_dir, exist_ok=True)
@@ -4988,8 +5081,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
             )
 
     end = time.time()
-    execution_times["elvis_v2_gaussian_restoration"] = end - start
-    print(f"Adaptive deblurring restoration completed in {end - start:.2f} seconds.\n")
+    duration = end - start
+    approach_times[APPROACH_PRESLEY_INSTANTIR] += duration
+    print(f"{APPROACH_PRESLEY_INSTANTIR} restoration completed in {duration:.2f} seconds.\n")
 
     gaussian_restored_video = os.path.join(experiment_dir, "gaussian_restored.mp4")
     encode_video(
@@ -5006,11 +5100,11 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     start = time.time()
 
     video_sizes = {
-        "Baseline": os.path.getsize(baseline_video),
-        "ELVIS v1": os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
-        "Adaptive": os.path.getsize(adaptive_video),
-        "ELVIS v2 Downsample": os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
-        "ELVIS v2 Gaussian": os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video),
+        APPROACH_BASELINE: os.path.getsize(baseline_video),
+        APPROACH_ELVIS: os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
+        APPROACH_PRESLEY_QP: os.path.getsize(adaptive_video),
+        APPROACH_PRESLEY_REALESRGAN: os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
+        APPROACH_PRESLEY_INSTANTIR: os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video),
     }
 
     frame_count = len(frame_files)
@@ -5024,13 +5118,13 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         print(f"{key} bitrate: {bitrate / 1_000_000:.2f} Mbps")
 
     encoded_videos = {
-        "Baseline": baseline_video,
-        "Adaptive": adaptive_video,
-        "ELVIS v1 CV2": inpainted_cv2_video,
-        "ELVIS v1 ProPainter": inpainted_video,
-        "ELVIS v1 E2FGVI": inpainted_e2fgvi_video,
-        "ELVIS v2 Downsample": downsampled_restored_video,
-        "ELVIS v2 Gaussian": gaussian_restored_video,
+        APPROACH_BASELINE: baseline_video,
+        APPROACH_PRESLEY_QP: adaptive_video,
+        APPROACH_ELVIS_CV2: inpainted_cv2_video,
+        APPROACH_ELVIS_PROP: inpainted_video,
+        APPROACH_ELVIS_E2FGVI: inpainted_e2fgvi_video,
+        APPROACH_PRESLEY_REALESRGAN: downsampled_restored_video,
+        APPROACH_PRESLEY_INSTANTIR: gaussian_restored_video,
     }
 
     ufo_masks_dir = os.path.join(experiment_dir, "maps", "ufo_masks")
@@ -5042,8 +5136,8 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     pipeline_params["derived"]["analysis_sample_frames"] = sample_frames
 
     strength_maps_dict = {
-        "ELVIS v2 Downsample": strength_maps,
-        "ELVIS v2 Gaussian": strength_maps_gaussian,
+        APPROACH_PRESLEY_REALESRGAN: strength_maps,
+        APPROACH_PRESLEY_INSTANTIR: strength_maps_gaussian,
     }
 
     if config.generate_opencv_benchmarks:
@@ -5085,7 +5179,10 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     )
 
     end = time.time()
-    execution_times["performance_evaluation"] = end - start
+    execution_times["Performance Evaluation"] = end - start
+
+    for approach, total in approach_times.items():
+        execution_times[approach] = total
 
     analysis_results["execution_times_seconds"] = execution_times
     analysis_results["video_name"] = reference_video
@@ -5132,7 +5229,7 @@ def _load_config_from_cli() -> ElvisConfig:
     parser.add_argument("--width", type=int, help="Target frame width.")
     parser.add_argument("--height", type=int, help="Target frame height.")
     parser.add_argument("--block-size", type=int, help="Processing block size.")
-    parser.add_argument("--shrink-amount", type=float, help="Shrink amount for ELVIS v1.")
+    parser.add_argument("--shrink-amount", type=float, help="Shrink amount for ELVIS.")
     parser.add_argument("--quality-factor", type=float, help="Quality factor for target bitrate calculation.")
     parser.add_argument("--target-bitrate", type=int, help="Override target bitrate in bits per second")
     parser.add_argument("--framerate", type=float, help="Override source framerate.")
