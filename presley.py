@@ -89,7 +89,8 @@ class ElvisConfig:
     gaussian_encode_preset: str = "medium"
     gaussian_encode_pix_fmt: str = "yuv420p"
     roi_save_qp_maps: bool = True
-    strength_maps_target_bitrate: int = 50000
+    downsample_strength_target_bitrate: int = 50000
+    gaussian_strength_target_bitrate: int = 50000
     propainter_dir: Optional[str] = None
     propainter_resize_ratio: float = 1.0
     propainter_ref_stride: int = 20
@@ -136,7 +137,6 @@ class ElvisConfig:
     fvmd_early_stop_delta: float = 0.002
     fvmd_early_stop_window: int = 50
     vmaf_stride: int = 1
-    minimal_figures: bool = False
     
 
 # ---------------------------------------------------------------------------
@@ -172,7 +172,6 @@ class _EvaluationContext:
     fvmd_log_root: str
     sample_frames: List[int]
     enable_fvmd: bool
-    minimal_figures: bool
     fvmd_device_locks: Dict[Optional[int], Any]
 
 
@@ -529,29 +528,7 @@ def _masked_ssim(ref: np.ndarray, dec: np.ndarray, mask: Optional[np.ndarray] = 
         ref_y[~mask_crop] = 0
         dec_y[~mask_crop] = 0
 
-    # skimage.metrics.structural_similarity uses a default win_size of 7 which
-    # fails for small crops. Compute a safe odd win_size not larger than the
-    # smallest image side, and at least 3.
-    h, w = ref_y.shape[:2]
-    smallest_dim = min(h, w)
-    if smallest_dim < 3:
-        # Too small to compute a meaningful SSIM window; treat as perfect.
-        return 1.0
-
-    if smallest_dim < 7:
-        win_size = smallest_dim if (smallest_dim % 2 == 1) else max(3, smallest_dim - 1)
-    else:
-        win_size = 7
-
-    return float(
-        ssim(
-            ref_y,
-            dec_y,
-            data_range=255,
-            gaussian_weights=True,
-            win_size=win_size,
-        )
-    )
+    return float(ssim(ref_y, dec_y, data_range=255, gaussian_weights=True))
 
 
 def _block_ssim(ref_block: np.ndarray, dec_block: np.ndarray) -> float:
@@ -3761,7 +3738,6 @@ def analyze_encoding_performance(
     fvmd_early_stop_window: int = 50,
     vmaf_stride: int = 1,
     enable_fvmd: bool = True,
-    minimal_figures: bool = False,
 ) -> Dict:
     """Analyze encoded videos with mask-aware metrics leveraging per-approach processes."""
 
@@ -3855,7 +3831,6 @@ def analyze_encoding_performance(
         fvmd_log_root=fvmd_log_root,
         sample_frames=sample_frames_unique,
         enable_fvmd=enable_fvmd,
-        minimal_figures=minimal_figures,
         fvmd_device_locks=fvmd_device_locks,
     )
     _EVALUATION_CONTEXT = evaluation_context
@@ -3924,24 +3899,20 @@ def analyze_encoding_performance(
 
     if analysis_results:
         _generate_quality_visualizations(analysis_results, heatmaps_dir)
-        if not minimal_figures:
-            decoded_frames_cache = {
-                name: _decode_video_to_frames(encoded_videos[name])
-                for name in analysis_results.keys()
-                if os.path.exists(encoded_videos.get(name, ""))
-            }
-            _generate_patch_comparison(
-                reference_frames=reference_frames,
-                decoded_frames_cache=decoded_frames_cache,
-                results=analysis_results,
-                fg_masks=fg_masks,
-                heatmaps_dir=heatmaps_dir,
-                sample_frame_idx=len(reference_frames) // 2,
-                patch_size=128,
-            )
-        else:
-            print("  - minimal_figures enabled: skipping patch comparison and per-frame heatmaps.")
-
+        decoded_frames_cache = {
+            name: _decode_video_to_frames(encoded_videos[name])
+            for name in analysis_results.keys()
+            if os.path.exists(encoded_videos.get(name, ""))
+        }
+        _generate_patch_comparison(
+            reference_frames=reference_frames,
+            decoded_frames_cache=decoded_frames_cache,
+            results=analysis_results,
+            fg_masks=fg_masks,
+            heatmaps_dir=heatmaps_dir,
+            sample_frame_idx=len(reference_frames) // 2,
+            patch_size=128,
+        )
         _print_summary_report(analysis_results)
     else:
         print("No results to display.")
@@ -4211,37 +4182,33 @@ def _evaluate_single_video_metrics(
             result['background']['fvmd'] = bg_fvmd_mean
             result['background']['fvmd_std'] = bg_fvmd_std
 
-    if not ctx.minimal_figures:
-        sample_frames = [idx for idx in ctx.sample_frames if idx < frame_count]
-        for frame_idx in sample_frames:
-            ref_frame = reference_frames[frame_idx]
-            dec_frame = decoded_frames[frame_idx]
-            try:
-                ref_blocks = split_image_into_blocks(ref_frame, block_size)
-                dec_blocks = split_image_into_blocks(dec_frame, block_size)
-            except ValueError:
-                continue
+    sample_frames = [idx for idx in ctx.sample_frames if idx < frame_count]
+    for frame_idx in sample_frames:
+        ref_frame = reference_frames[frame_idx]
+        dec_frame = decoded_frames[frame_idx]
+        try:
+            ref_blocks = split_image_into_blocks(ref_frame, block_size)
+            dec_blocks = split_image_into_blocks(dec_frame, block_size)
+        except ValueError:
+            continue
 
-            psnr_map = calculate_blockwise_metric(ref_blocks, dec_blocks, psnr)
-            ssim_map = calculate_blockwise_metric(ref_blocks, dec_blocks, _block_ssim)
-            mask_img = fg_masks[frame_idx].astype(np.uint8) * 255
-            heatmap_path = os.path.join(
-                ctx.heatmaps_dir,
-                f"{slug}_frame_{frame_idx + 1:05d}.png",
-            )
-            _generate_and_save_heatmap(
-                ref_frame,
-                dec_frame,
-                mask_img,
-                {'PSNR': psnr_map, 'SSIM': ssim_map},
-                video_name,
-                frame_idx,
-                heatmap_path,
-                block_size,
-            )
-    else:
-        # Skip per-frame heatmaps when minimal_figures is requested to reduce output.
-        pass
+        psnr_map = calculate_blockwise_metric(ref_blocks, dec_blocks, psnr)
+        ssim_map = calculate_blockwise_metric(ref_blocks, dec_blocks, _block_ssim)
+        mask_img = fg_masks[frame_idx].astype(np.uint8) * 255
+        heatmap_path = os.path.join(
+            ctx.heatmaps_dir,
+            f"{slug}_frame_{frame_idx + 1:05d}.png",
+        )
+        _generate_and_save_heatmap(
+            ref_frame,
+            dec_frame,
+            mask_img,
+            {'PSNR': psnr_map, 'SSIM': ssim_map},
+            video_name,
+            frame_idx,
+            heatmap_path,
+            block_size,
+        )
 
     print(f"  ✓ Completed evaluation for '{video_name}'.")
     return result
@@ -4800,7 +4767,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         strength_maps=list(downsample_maps),
         output_video=downsample_maps_video,
         framerate=framerate,
-        target_bitrate=config.strength_maps_target_bitrate,
+        target_bitrate=config.downsample_strength_target_bitrate,
     )
     end = time.time()
     duration = end - start
@@ -4840,7 +4807,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         strength_maps=list(gaussian_maps),
         output_video=gaussian_maps_video,
         framerate=framerate,
-        target_bitrate=config.strength_maps_target_bitrate,
+        target_bitrate=config.gaussian_strength_target_bitrate,
     )
     end = time.time()
     duration = end - start
@@ -5209,7 +5176,6 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         fvmd_early_stop_window=config.fvmd_early_stop_window,
         vmaf_stride=config.vmaf_stride,
         enable_fvmd=config.enable_fvmd,
-        minimal_figures=config.minimal_figures,
     )
 
     end = time.time()
@@ -5283,9 +5249,6 @@ def _load_config_from_cli() -> ElvisConfig:
     parser.add_argument("--fvmd-early-stop-delta", type=float, help="Early stop delta for FVMD.")
     parser.add_argument("--fvmd-early-stop-window", type=int, help="Early stop window for FVMD.")
     parser.add_argument("--vmaf-stride", type=int, help="Stride for VMAF computation.")
-    parser.add_argument("--minimal-figures", dest="minimal_figures", action="store_true", help="Disable most performance figures and only generate the overall quality comparison figure.")
-    parser.add_argument("--no-minimal-figures", dest="minimal_figures", action="store_false", help="Ensure full set of performance figures is generated.")
-    parser.set_defaults(minimal_figures=None)
 
     args = parser.parse_args()
 
@@ -5315,7 +5278,6 @@ def _load_config_from_cli() -> ElvisConfig:
         "fvmd_early_stop_delta": args.fvmd_early_stop_delta,
         "fvmd_early_stop_window": args.fvmd_early_stop_window,
         "vmaf_stride": args.vmaf_stride,
-        "minimal_figures": args.minimal_figures,
     }
 
     for key, value in overrides.items():
