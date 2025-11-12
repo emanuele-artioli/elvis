@@ -165,4 +165,4 @@ experiment*/
 Real-ESRGAN/
 *.pt
 *.bin
-*_search_results*/
+*search_results*/

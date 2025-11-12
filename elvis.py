@@ -108,6 +108,9 @@ class ElvisConfig:
     e2fgvi_neighbor_stride: int = 5
     e2fgvi_num_ref: int = -1
     e2fgvi_mask_dilation: int = 4
+    e2fgvi_devices: Optional[List[Union[int, str]]] = None
+    e2fgvi_parallel_chunk_length: Optional[int] = None
+    e2fgvi_chunk_overlap: Optional[int] = None
     realesrgan_dir: Optional[str] = None
     realesrgan_model_name: str = "RealESRGAN_x4plus"
     realesrgan_denoise_strength: float = 1.0
@@ -1380,6 +1383,15 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
     null_device = NULL_DEVICE
     
     try:
+        extra_params = {key: value for key, value in extra_params.items() if value is not None}
+        pass1_extra_params = {key: value for key, value in extra_params.items() if key != "qpfile"}
+
+        def _extend_x265_params(base: str, params: Dict[str, Any]) -> str:
+            if not params:
+                return base
+            suffix = "".join(f":{key}={value}" for key, value in params.items())
+            return f"{base}{suffix}"
+
         # Base command shared by both passes
 
         base_cmd = [
@@ -1395,19 +1407,21 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
             x265_base_params = "lossless=1"
             
             # Pass 1
+            pass1_params = _extend_x265_params(
+                f"{x265_base_params}:pass=1:stats={passlog_file}", pass1_extra_params
+            )
             pass1_cmd = base_cmd + [
                 "-c:v", "libx265",
                 "-preset", preset,
-                "-x265-params", f"{x265_base_params}:pass=1:stats={passlog_file}",
+                "-x265-params", pass1_params,
                 "-f", "mp4", "-y", null_device
             ]
             subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
             
             # Pass 2
-            pass2_params = f"{x265_base_params}:pass=2:stats={passlog_file}"
-            if extra_params:
-                for key, value in extra_params.items():
-                    pass2_params += f":{key}={value}"
+            pass2_params = _extend_x265_params(
+                f"{x265_base_params}:pass=2:stats={passlog_file}", extra_params
+            )
             
             pass2_cmd = base_cmd + [
                 "-c:v", "libx265",
@@ -1422,6 +1436,9 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
             # Lossy encoding with bitrate control and two passes
             
             # Pass 1
+            pass1_params = _extend_x265_params(
+                f"pass=1:stats={passlog_file}", pass1_extra_params
+            )
             pass1_cmd = base_cmd + [
                 "-c:v", "libx265",
                 "-b:v", str(target_bitrate),
@@ -1430,16 +1447,15 @@ def encode_video(input_frames_dir: str, output_video: str, framerate: float, wid
                 "-bufsize", str(target_bitrate),
                 "-preset", preset,
                 "-g", str(framerate),  # Set GOP size to framerate for approx 1-second keyframes
-                "-x265-params", f"pass=1:stats={passlog_file}",
+                "-x265-params", pass1_params,
                 "-f", "mp4", "-y", null_device
             ]
             subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
             
             # Pass 2
-            pass2_params = f"pass=2:stats={passlog_file}"
-            if extra_params:
-                for key, value in extra_params.items():
-                    pass2_params += f":{key}={value}"
+            pass2_params = _extend_x265_params(
+                f"pass=2:stats={passlog_file}", extra_params
+            )
             
             pass2_cmd = base_cmd + [
                 "-c:v", "libx265",
@@ -1918,14 +1934,30 @@ def inpaint_with_propainter(
     finally:
         os.chdir(original_dir)
 
-def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, output_frames_dir: str, width: int, height: int, framerate: float, e2fgvi_dir: str = None, model: str = "e2fgvi_hq", ckpt: str = None, ref_stride: int = 10, neighbor_stride: int = 5, num_ref: int = -1, mask_dilation: int = 4) -> None:
+def inpaint_with_e2fgvi(
+    stretched_frames_dir: str,
+    removal_masks_dir: str,
+    output_frames_dir: str,
+    width: int,
+    height: int,
+    framerate: float,
+    e2fgvi_dir: str = None,
+    model: str = "e2fgvi_hq",
+    ckpt: str = None,
+    ref_stride: int = 10,
+    neighbor_stride: int = 5,
+    num_ref: int = -1,
+    mask_dilation: int = 4,
+    devices: Optional[Sequence[Union[int, str, torch.device]]] = None,
+    parallel_chunk_length: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+) -> None:
     """
     Uses E2FGVI to inpaint stretched frames with removed blocks.
-    
-    This function:
-    1. Runs E2FGVI test.py directly on stretched frames and masks
-    2. Extracts inpainted frames to the output directory
-    
+
+    When more than one CUDA device is available the workload is split into
+    overlapping chunks so that multiple GPUs can run E2FGVI in parallel.
+
     Args:
         stretched_frames_dir: Directory containing stretched frames with black regions
         removal_masks_dir: Directory containing binary mask images (white = regions to inpaint)
@@ -1940,14 +1972,50 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
         neighbor_stride: Stride of neighboring frames (default: 5)
         num_ref: Number of reference frames (default: -1 for all)
         mask_dilation: Mask dilation iterations (default: 4)
+        devices: Optional sequence of device specifiers. When multiple CUDA
+            devices are provided the frames are processed in parallel.
+        parallel_chunk_length: Optional maximum number of core frames assigned to a
+            single chunk. Defaults to an even split across the selected devices.
+        chunk_overlap: Optional number of frames of temporal overlap between
+            adjacent chunks. Defaults to 2 * neighbor_stride.
     """
-    
     stretched_frames_abs = os.path.abspath(stretched_frames_dir)
     removal_masks_abs = os.path.abspath(removal_masks_dir)
     output_frames_abs = os.path.abspath(output_frames_dir)
 
-    use_installed_package = e2fgvi_dir is None
+    frames_path = Path(stretched_frames_abs)
+    masks_path = Path(removal_masks_abs)
+    output_path = Path(output_frames_abs)
 
+    if not frames_path.is_dir():
+        raise ValueError(f"Stretched frames directory does not exist: {stretched_frames_abs}")
+    if not masks_path.is_dir():
+        raise ValueError(f"Removal masks directory does not exist: {removal_masks_abs}")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    valid_suffixes = (".png", ".jpg", ".jpeg")
+
+    frame_paths = sorted([p for p in frames_path.iterdir() if p.suffix.lower() in valid_suffixes])
+    if not frame_paths:
+        raise ValueError(f"No frames found in {stretched_frames_abs}")
+    mask_paths = sorted([p for p in masks_path.iterdir() if p.suffix.lower() in valid_suffixes])
+    if len(frame_paths) != len(mask_paths):
+        raise ValueError(
+            f"Frame count ({len(frame_paths)}) does not match mask count ({len(mask_paths)})."
+        )
+
+    for frame_file, mask_file in zip(frame_paths, mask_paths):
+        if frame_file.stem != mask_file.stem:
+            raise ValueError(
+                f"Frame/mask mismatch: {frame_file.name} vs {mask_file.name}"
+            )
+
+    for stale_file in output_path.iterdir():
+        if stale_file.is_file() and stale_file.suffix.lower() in valid_suffixes:
+            stale_file.unlink()
+
+    use_installed_package = e2fgvi_dir is None
     if use_installed_package:
         try:
             import e2fgvi as e2fgvi_pkg  # type: ignore[import-untyped]
@@ -1956,7 +2024,7 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
                 "E2FGVI package is not available. Install it with `pip install e2fgvi`."
             ) from exc
         package_dir = Path(e2fgvi_pkg.__file__).resolve().parent
-        e2fgvi_cmd = [
+        base_cmd_prefix = [
             sys.executable,
             "-m",
             "e2fgvi",
@@ -1976,7 +2044,7 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
         test_script = (repo_root / "test.py").resolve()
         if not test_script.exists():
             raise RuntimeError(f"E2FGVI test entry point not found at {test_script}")
-        e2fgvi_cmd = [
+        base_cmd_prefix = [
             sys.executable,
             str(test_script),
         ]
@@ -1986,69 +2054,256 @@ def inpaint_with_e2fgvi(stretched_frames_dir: str, removal_masks_dir: str, outpu
     else:
         ckpt_path = Path(ckpt).resolve()
 
-    e2fgvi_cmd.extend([
-        "--model",
-        model,
-        "--video",
-        stretched_frames_abs,
-        "--mask",
-        removal_masks_abs,
-        "--ckpt",
-        str(ckpt_path),
-        "--step",
-        str(ref_stride),
-        "--num_ref",
-        str(num_ref),
-        "--neighbor_stride",
-        str(neighbor_stride),
-        "--set_size",
-        "--width",
-        str(width),
-        "--height",
-        str(height),
-        "--savefps",
-        str(int(framerate)),
-        "--save_frames",
-        output_frames_abs,
-    ])
+    if framerate is None:
+        raise ValueError("`framerate` must be provided for E2FGVI inference.")
 
-    print("Running E2FGVI inference...")
-    result = subprocess.run(e2fgvi_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"E2FGVI stdout: {result.stdout}")
-        print(f"E2FGVI stderr: {result.stderr}")
-        raise RuntimeError(f"E2FGVI inference failed: {result.stderr}")
+    def _build_command(video_dir: str, mask_dir: str, save_dir: str) -> List[str]:
+        cmd = list(base_cmd_prefix)
+        cmd.extend(
+            [
+                "--model",
+                model,
+                "--video",
+                video_dir,
+                "--mask",
+                mask_dir,
+                "--ckpt",
+                str(ckpt_path),
+                "--step",
+                str(ref_stride),
+                "--num_ref",
+                str(num_ref),
+                "--neighbor_stride",
+                str(neighbor_stride),
+                "--set_size",
+                "--width",
+                str(width),
+                "--height",
+                str(height),
+                "--savefps",
+                str(int(framerate)),
+                "--save_frames",
+                save_dir,
+            ]
+        )
+        return cmd
 
-    print(f"E2FGVI output: {result.stdout}")
+    total_frames = len(frame_paths)
+    resolved_devices = _resolve_device_list(devices, prefer_cuda=True, allow_cpu_fallback=True)
+    cuda_devices = [dev for dev in resolved_devices if dev.type == "cuda"]
 
-    generated_frames = list(Path(output_frames_abs).glob("*.png"))
-    if generated_frames:
+    preferred_device: Optional[torch.device] = None
+    if cuda_devices:
+        preferred_device = cuda_devices[0]
+    elif resolved_devices:
+        preferred_device = resolved_devices[0]
+
+    def _device_label(device_obj: Optional[torch.device]) -> str:
+        if device_obj is None:
+            return "default"
+        if device_obj.type == "cuda":
+            idx = device_obj.index if device_obj.index is not None else 0
+            return f"cuda:{idx}"
+        return str(device_obj)
+
+    def _run_single(device_override: Optional[torch.device]) -> None:
+        print("Running E2FGVI inference...")
+        cmd = _build_command(stretched_frames_abs, removal_masks_abs, output_frames_abs)
+        env = os.environ.copy()
+        if device_override is not None:
+            if device_override.type == "cuda":
+                cuda_idx = device_override.index if device_override.index is not None else 0
+                env["CUDA_VISIBLE_DEVICES"] = str(cuda_idx)
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            print(f"E2FGVI stdout: {result.stdout}")
+            print(f"E2FGVI stderr: {result.stderr}")
+            raise RuntimeError(f"E2FGVI inference failed: {result.stderr}")
+        if result.stdout:
+            print(f"E2FGVI output: {result.stdout}")
+
+        generated_frames = list(output_path.glob("*.png"))
+        if generated_frames:
+            print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
+            return
+
+        results_dir = package_dir / "results"
+        if not results_dir.exists():
+            raise RuntimeError(f"E2FGVI results directory not found at {results_dir}")
+
+        result_videos = [f for f in results_dir.iterdir() if f.suffix == ".mp4"]
+        if not result_videos:
+            raise RuntimeError(f"No result video found in {results_dir}")
+
+        result_videos.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        result_video_path = result_videos[0]
+
+        print("Decoding E2FGVI result video to frames...")
+
+        if not decode_video(
+            str(result_video_path),
+            output_frames_abs,
+            framerate=framerate,
+            start_number=1,
+            quality=1,
+        ):
+            raise RuntimeError(f"Failed to decode E2FGVI result video: {result_video_path}")
+
         print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
-        return
 
-    results_dir = package_dir / "results"
-    if not results_dir.exists():
-        raise RuntimeError(f"E2FGVI results directory not found at {results_dir}")
+        try:
+            result_video_path.unlink()
+        except OSError:
+            pass
 
-    result_videos = [f for f in results_dir.iterdir() if f.suffix == ".mp4"]
-    if not result_videos:
-        raise RuntimeError(f"No result video found in {results_dir}")
+    def _run_parallel(device_list: Sequence[torch.device]) -> None:
+        default_overlap = max(neighbor_stride, 1) * 2
+        overlap = int(chunk_overlap) if chunk_overlap is not None else default_overlap
+        overlap = max(0, overlap)
+        if total_frames == 1:
+            overlap = 0
+        else:
+            overlap = min(overlap, total_frames - 1)
 
-    result_videos.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    result_video_path = result_videos[0]
+        if parallel_chunk_length is None or parallel_chunk_length <= 0:
+            chunk_len = math.ceil(total_frames / len(device_list))
+        else:
+            chunk_len = int(parallel_chunk_length)
 
-    print("Decoding E2FGVI result video to frames...")
+        chunk_len = max(1, min(chunk_len, total_frames))
+        if chunk_len <= overlap:
+            chunk_len = min(total_frames, overlap + 1)
 
-    if not decode_video(str(result_video_path), output_frames_abs, framerate=framerate, start_number=1, quality=1):
-        raise RuntimeError(f"Failed to decode E2FGVI result video: {result_video_path}")
+        class _E2FGVIChunk(NamedTuple):
+            index: int
+            chunk_start: int
+            chunk_end: int
+            core_start: int
+            core_end: int
 
-    print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
+        chunks: List[_E2FGVIChunk] = []
+        cursor = 0
+        idx = 0
+        while cursor < total_frames:
+            core_end = min(total_frames, cursor + chunk_len)
+            chunk_start = max(0, cursor - (overlap if cursor > 0 else 0))
+            chunk_end = min(total_frames, core_end + (overlap if core_end < total_frames else 0))
+            chunks.append(
+                _E2FGVIChunk(
+                    index=idx,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    core_start=cursor,
+                    core_end=core_end,
+                )
+            )
+            cursor = core_end
+            idx += 1
 
-    # Remove the mp4 artefact so subsequent runs start cleanly
-    try:
-        result_video_path.unlink()
-    except OSError:
-        pass
+        device_labels = [_device_label(dev) for dev in device_list]
+        print("Running E2FGVI inference across multiple devices...")
+        print(
+            f"  Devices: {', '.join(device_labels)} | chunk length: {chunk_len} | overlap: {overlap} | total chunks: {len(chunks)}"
+        )
+
+        def _link_or_copy(src: Path, dst: Path) -> None:
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+
+        def _process_chunk(chunk: _E2FGVIChunk, device_obj: torch.device) -> None:
+            device_label = _device_label(device_obj)
+            print(
+                f"    -> E2FGVI chunk {chunk.index + 1}/{len(chunks)} frames {chunk.core_start + 1}-{chunk.core_end} on {device_label}"
+            )
+            with tempfile.TemporaryDirectory(prefix=f"e2fgvi_chunk_{chunk.index:03d}_") as tmp_root:
+                tmp_root_path = Path(tmp_root)
+                chunk_frames_path = tmp_root_path / "frames"
+                chunk_masks_path = tmp_root_path / "masks"
+                chunk_output_path = tmp_root_path / "output"
+                chunk_frames_path.mkdir(parents=True, exist_ok=True)
+                chunk_masks_path.mkdir(parents=True, exist_ok=True)
+                chunk_output_path.mkdir(parents=True, exist_ok=True)
+
+                chunk_indices = list(range(chunk.chunk_start, chunk.chunk_end))
+
+                for seq_idx, original_idx in enumerate(chunk_indices, start=1):
+                    frame_src = frame_paths[original_idx]
+                    mask_src = mask_paths[original_idx]
+
+                    frame_dest = chunk_frames_path / f"{seq_idx:05d}{frame_src.suffix}"
+                    mask_dest = chunk_masks_path / f"{seq_idx:05d}{mask_src.suffix}"
+
+                    _link_or_copy(frame_src, frame_dest)
+                    _link_or_copy(mask_src, mask_dest)
+
+                cmd = _build_command(str(chunk_frames_path), str(chunk_masks_path), str(chunk_output_path))
+
+                env = os.environ.copy()
+                if device_obj.type == "cuda":
+                    cuda_idx = device_obj.index if device_obj.index is not None else 0
+                    env["CUDA_VISIBLE_DEVICES"] = str(cuda_idx)
+                else:
+                    env["CUDA_VISIBLE_DEVICES"] = ""
+
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                if result.returncode != 0:
+                    print(f"E2FGVI stdout (chunk {chunk.index}): {result.stdout}")
+                    print(f"E2FGVI stderr (chunk {chunk.index}): {result.stderr}")
+                    raise RuntimeError(f"E2FGVI inference failed for chunk {chunk.index}: {result.stderr}")
+
+                output_files = sorted(
+                    [p for p in chunk_output_path.iterdir() if p.suffix.lower() in valid_suffixes],
+                    key=lambda p: p.name,
+                )
+                if len(output_files) != len(chunk_indices):
+                    raise RuntimeError(
+                        f"Mismatch between produced frames ({len(output_files)}) and expected count ({len(chunk_indices)}) "
+                        f"for E2FGVI chunk {chunk.index}."
+                    )
+
+                for rel_idx, original_idx in enumerate(chunk_indices):
+                    if original_idx < chunk.core_start or original_idx >= chunk.core_end:
+                        continue
+                    output_file = output_files[rel_idx]
+                    final_path = output_path / frame_paths[original_idx].name
+                    if final_path.exists():
+                        final_path.unlink()
+                    shutil.copy2(output_file, final_path)
+
+        max_workers = len(device_list)
+        if max_workers <= 0:
+            raise RuntimeError("No devices available for E2FGVI parallel execution.")
+
+        chunk_iter = iter(chunks)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while True:
+                futures = []
+                for device_obj in device_list:
+                    chunk = next(chunk_iter, None)
+                    if chunk is None:
+                        break
+                    futures.append(executor.submit(_process_chunk, chunk, device_obj))
+                if not futures:
+                    break
+                for future in futures:
+                    future.result()
+
+        missing = [path.name for path in frame_paths if not (output_path / path.name).exists()]
+        if missing:
+            raise RuntimeError(
+                f"E2FGVI parallel execution missing {len(missing)} frame(s); examples: {', '.join(missing[:5])}"
+            )
+
+        print(f"E2FGVI inpainted frames saved to {output_frames_abs}")
+
+    if len(cuda_devices) >= 2 and total_frames > 1:
+        _run_parallel(cuda_devices)
+    else:
+        _run_single(preferred_device)
 
 # Elvis v2 functions
 
@@ -2091,7 +2346,51 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
         print("Generating detailed qpfile for per-block quality control...")
 
         # Map normalized scores [0, 1] to QP offsets [-1, 1]
-        qp_maps = np.clip((removability_scores * 2.0) - 1.0, -1.0, 1.0)
+        qp_maps = np.clip((removability_scores * 2.0) - 1.0, -1.0, 1.0).astype(np.float32)
+
+        valid_ctu_sizes = [16, 32, 64]
+        largest_dimension = max(width, height)
+        min_ctu_by_resolution = 16
+        if largest_dimension >= 4320:
+            min_ctu_by_resolution = 64
+        elif largest_dimension >= 2160:
+            min_ctu_by_resolution = 32
+
+        nearest_ctu = min(valid_ctu_sizes, key=lambda size: abs(size - block_size))
+        if nearest_ctu < block_size:
+            larger_sizes = [size for size in valid_ctu_sizes if size >= block_size]
+            ctu_size = larger_sizes[0] if larger_sizes else valid_ctu_sizes[-1]
+        else:
+            ctu_size = nearest_ctu
+
+        if ctu_size < min_ctu_by_resolution:
+            compliant_sizes = [size for size in valid_ctu_sizes if size >= min_ctu_by_resolution]
+            if compliant_sizes:
+                ctu_size = compliant_sizes[0]
+            else:
+                ctu_size = valid_ctu_sizes[-1]
+
+        ctu_cols = math.ceil(width / ctu_size)
+        ctu_rows = math.ceil(height / ctu_size)
+
+        qp_maps_aligned = np.empty((num_frames, ctu_rows, ctu_cols), dtype=np.float32)
+        if (ctu_rows, ctu_cols) != (num_blocks_y, num_blocks_x):
+            print(
+                f"Resizing per-block QP maps from {num_blocks_y}x{num_blocks_x} blocks to CTU grid {ctu_rows}x{ctu_cols} (CTU={ctu_size})."
+            )
+
+        for frame_idx in range(num_frames):
+            frame_map = qp_maps[frame_idx]
+            if frame_map.shape == (ctu_rows, ctu_cols):
+                qp_maps_aligned[frame_idx] = frame_map
+                continue
+
+            interpolation = cv2.INTER_AREA if ctu_size >= block_size else cv2.INTER_LINEAR
+            qp_maps_aligned[frame_idx] = cv2.resize(
+                frame_map,
+                (ctu_cols, ctu_rows),
+                interpolation=interpolation,
+            )
 
         # Generate qpfile with optimized string building
         with open(qpfile_path, 'w') as f:
@@ -2100,11 +2399,13 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 # The '-1' for QP indicates we are providing per-block QPs
                 line_parts = [f"{frame_idx} P -1"]
                 
-                # Append QP for each block in raster-scan order - build list then join once
-                qp_frame = qp_maps[frame_idx]
-                block_qps = [f"{bx},{by},{qp_frame[by, bx]}" 
-                            for by in range(num_blocks_y) 
-                            for bx in range(num_blocks_x)]
+                # Append QP offsets for each CTU in raster order
+                qp_frame = qp_maps_aligned[frame_idx]
+                block_qps = [
+                    f"{bx},{by},{qp_frame[by, bx]:.4f}"
+                    for by in range(ctu_rows)
+                    for bx in range(ctu_cols)
+                ]
                 line_parts.extend(block_qps)
 
                 f.write(" ".join(line_parts) + "\n")
@@ -2116,17 +2417,12 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 qp_maps_dir = os.path.join(temp_dir, "qp_maps")
             os.makedirs(qp_maps_dir, exist_ok=True)
             for frame_idx in range(num_frames):
-                qp_map_image = (qp_maps[frame_idx] / 50.0 * 255).astype(np.uint8)  # Scale to [0, 255]
+                qp_map_image = np.clip((qp_maps_aligned[frame_idx] + 1.0) * 127.5, 0, 255).astype(np.uint8)
                 cv2.imwrite(os.path.join(qp_maps_dir, f"qp_map_{frame_idx:05d}.png"), qp_map_image)
             print(f"QP maps saved to {qp_maps_dir}")
 
         # --- Part 2: Run Global Two-Pass Encode with QP file ---
-        # x265 requires CTU size to be 16, 32, or 64. Map block_size to nearest valid CTU.
-        # The qpfile will still use the block_size grid, but CTU sets the encoding block size.
-        valid_ctu_sizes = [16, 32, 64]
-        ctu_size = min(valid_ctu_sizes, key=lambda x: abs(x - block_size))
-        
-        print("Starting two-pass encoding with per-block QP control...")
+        print(f"Starting two-pass encoding with per-block QP control (CTU {ctu_size})...")
         encode_video(
             input_frames_dir=input_frames_dir,
             output_video=output_video,
@@ -4551,6 +4847,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
                 "neighbor_stride": config.e2fgvi_neighbor_stride,
                 "num_ref": config.e2fgvi_num_ref,
                 "mask_dilation": config.e2fgvi_mask_dilation,
+                "devices": _list_or_none(config.e2fgvi_devices),
+                "parallel_chunk_length": config.e2fgvi_parallel_chunk_length,
+                "chunk_overlap": config.e2fgvi_chunk_overlap,
             },
             "restore_downsampled_with_realesrgan": {
                 "realesrgan_dir": config.realesrgan_dir,
@@ -4976,6 +5275,9 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         neighbor_stride=config.e2fgvi_neighbor_stride,
         num_ref=config.e2fgvi_num_ref,
         mask_dilation=config.e2fgvi_mask_dilation,
+        devices=config.e2fgvi_devices,
+        parallel_chunk_length=config.e2fgvi_parallel_chunk_length,
+        chunk_overlap=config.e2fgvi_chunk_overlap,
     )
     end = time.time()
     duration = end - start

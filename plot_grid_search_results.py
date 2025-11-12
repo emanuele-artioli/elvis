@@ -147,6 +147,25 @@ def _derive_video_name(rel_parent: Path) -> str:
         text = str(candidate)
     return text or "unknown"
 
+def _shorten_video_name(video_name: str) -> str:
+    """
+    Return a short video label from a potentially long path or name.
+    Uses the path basename then takes the last dash-separated token (and strips extension).
+    Example: "/home/.../avc_encoded-walking.mp4" -> "walking"
+    """
+    try:
+        base = Path(str(video_name)).name
+    except Exception:
+        base = str(video_name)
+    # remove common extensions
+    for ext in (".pmp4", ".mp4", ".mov", ".mkv"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    # take last dash-separated token
+    short = base.split("-")[-1]
+    return short or base
+
 
 def _extract_foreground_background_arrays(
     entries: Sequence[Dict[str, Any]]
@@ -179,7 +198,7 @@ def _parse_args() -> argparse.Namespace:
             "generate a foreground/background scatter plot for the main metrics."
         )
     )
-    default_root = Path(__file__).resolve().parent / "grid_search_results"
+    default_root = Path(__file__).resolve().parent / "search_results"
     parser.add_argument(
         "--root",
         nargs="?",
@@ -187,7 +206,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Path to the grid search results directory "
             f"(default: {default_root})."
-        ),
+        )
     )
     parser.add_argument(
         "--metrics",
@@ -215,6 +234,15 @@ def _parse_args() -> argparse.Namespace:
         "--show",
         action="store_true",
         help="Display the plot window in addition to saving the file.",
+    )
+    parser.add_argument(
+        "--include-lanczos-unsharp",
+        action="store_true",
+        default=False,
+        help=(
+            "Include lanczos and unsharp approaches in plots. By default these are excluded "
+            "from generated plots. Use this flag to include them."
+        ),
     )
     return parser.parse_args()
 
@@ -249,7 +277,20 @@ def _prepare_data(
         except ValueError:
             rel_parent = path.parent
 
-        video_name = _derive_video_name(rel_parent)
+        # prefer an explicit video_name inside the summary, otherwise derive from path
+        try:
+            payload_video_name = payload.get("video_name")
+        except Exception:
+            payload_video_name = None
+
+        if payload_video_name:
+            # take last path component if payload contains a full path
+            try:
+                video_name = str(payload_video_name).split("/")[-1]
+            except Exception:
+                video_name = str(payload_video_name)
+        else:
+            video_name = _derive_video_name(rel_parent)
         frame_count = _estimate_frame_count(payload)
         times_entry = payload.get("execution_times_seconds")
         if isinstance(times_entry, dict):
@@ -302,6 +343,136 @@ def _prepare_data(
     return metric_points, approaches, execution_samples
 
 
+def _plot_parameter_correlation(
+    report_paths: Sequence[Path],
+    metrics: Sequence[str],
+    output_path: Path,
+    dpi: int,
+    show_plot: bool,
+) -> None:
+    # Build paired samples of (parameter, metric) across all experiments found in report_paths
+    # For each parameter in PARAMETER_KEYS_FOR_CORRELATION and each metric in metrics,
+    # collect numeric samples and compute Pearson correlation.
+    param_metric_values: Dict[Tuple[str, str], Tuple[List[float], List[float]]] = {}
+
+    for path in report_paths:
+        try:
+            payload = _load_json(path)
+        except Exception:
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        # first, see if file contains top-level per-experiment dicts
+        for exp_name, exp_data in payload.items():
+            if exp_name == "execution_times_seconds":
+                continue
+            if not isinstance(exp_data, dict):
+                continue
+
+            # extract overrides/candidate parameter values
+            overrides = {}
+            if isinstance(exp_data.get("overrides"), dict):
+                overrides = exp_data.get("overrides") or {}
+            elif isinstance(payload.get("overrides"), dict):
+                overrides = payload.get("overrides") or {}
+            else:
+                # fallback: some keys may be present directly in the exp_data
+                overrides = {k: exp_data.get(k) for k in PARAMETER_KEYS_FOR_CORRELATION}
+
+            # for each metric, get foreground value if present
+            foregrounds = exp_data.get("foreground") if isinstance(exp_data.get("foreground"), dict) else {}
+            for metric in metrics:
+                try:
+                    metric_val = foregrounds.get(metric)
+                except Exception:
+                    metric_val = None
+                if metric_val is None:
+                    continue
+                try:
+                    metric_val = float(metric_val)
+                except (TypeError, ValueError):
+                    continue
+
+                for param in PARAMETER_KEYS_FOR_CORRELATION:
+                    raw = overrides.get(param)
+                    if raw is None:
+                        continue
+                    if isinstance(raw, bool):
+                        pval = float(int(raw))
+                    elif isinstance(raw, (int, float)):
+                        pval = float(raw)
+                    else:
+                        # try to coerce strings that look numeric
+                        try:
+                            pval = float(raw)
+                        except Exception:
+                            continue
+
+                    key = (param, metric)
+                    if key not in param_metric_values:
+                        param_metric_values[key] = ([], [])
+                    param_metric_values[key][0].append(pval)
+                    param_metric_values[key][1].append(metric_val)
+
+    # Build matrix of correlations parameter x metric
+    params = list(PARAMETER_KEYS_FOR_CORRELATION)
+    mets = list(metrics)
+    corr_matrix = np.full((len(params), len(mets)), np.nan, dtype=float)
+
+    for i, param in enumerate(params):
+        for j, metric in enumerate(mets):
+            key = (param, metric)
+            if key not in param_metric_values:
+                continue
+            xs, ys = param_metric_values[key]
+            if len(xs) < 2 or len(ys) < 2:
+                continue
+            try:
+                # compute Pearson r using numpy
+                r = np.corrcoef(np.asarray(xs), np.asarray(ys))[0, 1]
+            except Exception:
+                r = float('nan')
+            corr_matrix[i, j] = float(r)
+
+    if np.all(np.isnan(corr_matrix)):
+        print("No parameter/metric numeric pairs found for correlation; skipping.")
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.5 * len(mets)), max(6.0, 0.35 * len(params))))
+    im = ax.imshow(corr_matrix, cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect='auto')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Pearson r")
+
+    ax.set_xticks(range(len(mets)))
+    ax.set_xticklabels([m.replace('_', '\n') for m in mets], rotation=45, ha="right")
+    ax.set_yticks(range(len(params)))
+    ax.set_yticklabels(params)
+
+    # annotate
+    for i in range(len(params)):
+        for j in range(len(mets)):
+            val = corr_matrix[i, j]
+            if np.isnan(val):
+                txt = ""
+            else:
+                txt = f"{val:.2f}"
+            ax.text(j, i, txt, ha="center", va="center", fontsize=7, color="black")
+
+    ax.set_title("Pearson Correlation: Parameters vs Metrics")
+    fig.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    print(f"Saved parameter vs metric correlation plot to {output_path}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def _plot_metric_scatter(
     metric_points: Dict[str, List[Dict[str, Any]]],
     metrics: Sequence[str],
@@ -315,7 +486,7 @@ def _plot_metric_scatter(
         raise RuntimeError("No metrics with foreground/background pairs were found.")
 
     num_metrics = len(metrics_to_plot)
-    cols = min(3, num_metrics)
+    cols = min(5, num_metrics)
     rows = math.ceil(num_metrics / cols)
 
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 5.5, rows * 5.0))
@@ -346,54 +517,70 @@ def _plot_metric_scatter(
         for approach, style in approach_styles.items()
     ]
 
-    point_size = 80
+    point_size = 120
 
     for idx, metric in enumerate(metrics_to_plot):
         ax = axes_iter[idx]
         points = metric_points[metric]
         metric_root = _metric_root(metric)
         use_log_scale = metric_root in LOG_SCALE_METRICS
-        fg_values: List[float] = []
-        bg_values: List[float] = []
+
+        # Aggregate by approach: compute mean and std for foreground and background
+        grouped: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+        for point in points:
+            try:
+                fg_val = float(point["foreground"])
+                bg_val = float(point["background"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            approach = point.get("approach") or point.get("experiment") or "default"
+            grouped[approach].append((fg_val, bg_val))
+
+        fg_means: List[float] = []
+        bg_means: List[float] = []
         extent_values: List[float] = []
 
-        for point in points:
-            fg_val = float(point["foreground"])
-            bg_val = float(point["background"])
-            fg_plot = fg_val
-            bg_plot = bg_val
-            if use_log_scale:
-                fg_plot = max(fg_plot, MIN_LOG_VALUE)
-                bg_plot = max(bg_plot, MIN_LOG_VALUE)
+        for approach in unique_approaches:
+            samples = grouped.get(approach, [])
+            if not samples:
+                continue
+            fg_vals = [s[0] for s in samples if math.isfinite(s[0])]
+            bg_vals = [s[1] for s in samples if math.isfinite(s[1])]
+            if not fg_vals or not bg_vals:
+                continue
+            fg_mean = float(statistics.fmean(fg_vals))
+            bg_mean = float(statistics.fmean(bg_vals))
+            fg_std = float(statistics.pstdev(fg_vals)) if len(fg_vals) > 1 else 0.0
+            bg_std = float(statistics.pstdev(bg_vals)) if len(bg_vals) > 1 else 0.0
 
-            fg_values.append(fg_plot)
-            bg_values.append(bg_plot)
+            fg_plot = max(fg_mean, MIN_LOG_VALUE) if use_log_scale else fg_mean
+            bg_plot = max(bg_mean, MIN_LOG_VALUE) if use_log_scale else bg_mean
 
-            approach = point.get("approach") or point.get("experiment") or "default"
             style = approach_styles.get(approach, {"color": "#999999", "marker": "o"})
             point_color = style["color"]
+
+            # main dot (no transparency)
             ax.scatter(
                 [bg_plot],
                 [fg_plot],
                 color=point_color,
-                alpha=0.85,
+                alpha=1.0,
                 marker=style["marker"],
-                edgecolor="white",
-                linewidth=0.5,
+                edgecolor="black",
+                linewidth=0.6,
                 s=point_size,
             )
 
-            fg_std = point.get("foreground_std")
-            bg_std = point.get("background_std")
-            if fg_std is not None and bg_std is not None and (fg_std > 0 or bg_std > 0):
+            # circle/ellipse representing std
+            if fg_std > 0 or bg_std > 0:
                 ellipse = Ellipse(
                     xy=(bg_plot, fg_plot),
-                    width=max(1e-6, 2 * bg_std),
-                    height=max(1e-6, 2 * fg_std),
+                    width=max(1e-6, 2 * (bg_std if not use_log_scale else max(bg_std, MIN_LOG_VALUE))),
+                    height=max(1e-6, 2 * (fg_std if not use_log_scale else max(fg_std, MIN_LOG_VALUE))),
                     edgecolor=point_color,
                     facecolor="none",
-                    linewidth=1.0,
-                    alpha=0.4,
+                    linewidth=1.2,
+                    alpha=0.5,
                 )
                 ax.add_patch(ellipse)
                 candidate_values = [
@@ -409,7 +596,10 @@ def _plot_metric_scatter(
                 else:
                     extent_values.extend([candidate for candidate in candidate_values if math.isfinite(candidate)])
 
-        combined = fg_values + bg_values + extent_values
+            fg_means.append(fg_plot)
+            bg_means.append(bg_plot)
+
+        combined = fg_means + bg_means + extent_values
         finite_values = [val for val in combined if math.isfinite(val)]
         if use_log_scale:
             finite_values = [val for val in finite_values if val > 0]
@@ -466,7 +656,159 @@ def _plot_metric_scatter(
 
     if legend_elements:
         fig.legend(legend_elements, [elem.get_label() for elem in legend_elements], loc="lower right", title="Approach")
-    fig.suptitle("Foreground vs Background Metric Scatter", fontsize=16, fontweight="bold")
+    fig.suptitle("Foreground vs Background Metric Scatter (per-approach means ± std)", fontsize=16, fontweight="bold")
+    fig.tight_layout(rect=(0.02, 0.02, 0.92, 0.95))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi)
+    print(f"Saved scatter plot to {output_path}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    point_size = 120
+
+    for idx, metric in enumerate(metrics_to_plot):
+        ax = axes_iter[idx]
+        points = metric_points[metric]
+        metric_root = _metric_root(metric)
+        use_log_scale = metric_root in LOG_SCALE_METRICS
+
+        # Aggregate by approach: compute mean and std for foreground and background
+        grouped: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+        for point in points:
+            try:
+                fg_val = float(point["foreground"])
+                bg_val = float(point["background"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            approach = point.get("approach") or point.get("experiment") or "default"
+            grouped[approach].append((fg_val, bg_val))
+
+        fg_means: List[float] = []
+        bg_means: List[float] = []
+        extent_values: List[float] = []
+
+        for approach in unique_approaches:
+            samples = grouped.get(approach, [])
+            if not samples:
+                continue
+            fg_vals = [s[0] for s in samples if math.isfinite(s[0])]
+            bg_vals = [s[1] for s in samples if math.isfinite(s[1])]
+            if not fg_vals or not bg_vals:
+                continue
+            fg_mean = float(statistics.fmean(fg_vals))
+            bg_mean = float(statistics.fmean(bg_vals))
+            fg_std = float(statistics.pstdev(fg_vals)) if len(fg_vals) > 1 else 0.0
+            bg_std = float(statistics.pstdev(bg_vals)) if len(bg_vals) > 1 else 0.0
+
+            fg_plot = max(fg_mean, MIN_LOG_VALUE) if use_log_scale else fg_mean
+            bg_plot = max(bg_mean, MIN_LOG_VALUE) if use_log_scale else bg_mean
+
+            style = approach_styles.get(approach, {"color": "#999999", "marker": "o"})
+            point_color = style["color"]
+
+            # main dot
+            # main dot (no transparency)
+            ax.scatter(
+                [bg_plot],
+                [fg_plot],
+                color=point_color,
+                alpha=1.0,
+                marker=style["marker"],
+                edgecolor="black",
+                linewidth=0.6,
+                s=point_size,
+            )
+
+            # circle/ellipse representing std
+            if fg_std > 0 or bg_std > 0:
+                ellipse = Ellipse(
+                    xy=(bg_plot, fg_plot),
+                    width=max(1e-6, 2 * (bg_std if not use_log_scale else max(bg_std, MIN_LOG_VALUE))),
+                    height=max(1e-6, 2 * (fg_std if not use_log_scale else max(fg_std, MIN_LOG_VALUE))),
+                    edgecolor=point_color,
+                    facecolor="none",
+                    linewidth=1.2,
+                    alpha=0.5,
+                )
+                ax.add_patch(ellipse)
+                candidate_values = [
+                    fg_plot + fg_std,
+                    fg_plot - fg_std,
+                    bg_plot + bg_std,
+                    bg_plot - bg_std,
+                ]
+                if use_log_scale:
+                    for candidate in candidate_values:
+                        if math.isfinite(candidate):
+                            extent_values.append(max(candidate, MIN_LOG_VALUE))
+                else:
+                    extent_values.extend([candidate for candidate in candidate_values if math.isfinite(candidate)])
+
+            fg_means.append(fg_plot)
+            bg_means.append(bg_plot)
+
+        combined = fg_means + bg_means + extent_values
+        finite_values = [val for val in combined if math.isfinite(val)]
+        if use_log_scale:
+            finite_values = [val for val in finite_values if val > 0]
+
+        line_lower = None
+        line_upper = None
+        if finite_values:
+            min_val = min(finite_values)
+            max_val = max(finite_values)
+            if use_log_scale:
+                log_min = math.log10(min_val)
+                log_max = math.log10(max_val)
+                if math.isclose(log_min, log_max):
+                    delta = 0.5
+                else:
+                    delta = (log_max - log_min) * 0.05
+                lower = 10 ** (log_min - delta)
+                upper = 10 ** (log_max + delta)
+                lower = max(lower, MIN_LOG_VALUE)
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+            else:
+                span = max_val - min_val
+                padding = 1.0 if span < 1e-6 else span * 0.05
+                lower = min_val - padding
+                upper = max_val + padding
+            if upper <= lower:
+                if use_log_scale:
+                    upper = lower * 1.1
+                else:
+                    upper = lower + 1.0
+            ax.set_xlim(lower, upper)
+            ax.set_ylim(lower, upper)
+            line_lower, line_upper = lower, upper
+        elif use_log_scale:
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+
+        if line_lower is not None and line_upper is not None:
+            ax.plot([line_lower, line_upper], [line_lower, line_upper], linestyle="--", color="#666666", linewidth=1.0)
+
+        title = metric.replace("_mean", "").replace("_", " ").upper()
+        ax.set_title(title)
+        ax.set_xlabel("Background")
+        ax.set_ylabel("Foreground")
+        grid_kwargs = {"linestyle": "--", "alpha": 0.3}
+        if use_log_scale:
+            ax.grid(True, which="both", **grid_kwargs)
+        else:
+            ax.grid(True, **grid_kwargs)
+
+    for ax in axes_iter[num_metrics:]:
+        ax.axis("off")
+
+    if legend_elements:
+        fig.legend(legend_elements, [elem.get_label() for elem in legend_elements], loc="lower right", title="Approach")
+    fig.suptitle("Foreground vs Background Metric Scatter (per-approach means ± std)", fontsize=16, fontweight="bold")
     fig.tight_layout(rect=(0.02, 0.02, 0.92, 0.95))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -830,7 +1172,8 @@ def _plot_metric_violin_foreground(
         print("No metric data available for foreground violin plot; skipping.")
         return
 
-    cols = min(3, len(metrics_to_plot))
+    # place up to 5 subplots on the first row for consistency with other figures
+    cols = min(5, len(metrics_to_plot))
     rows = math.ceil(len(metrics_to_plot) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 5.5, rows * 5.0))
     axes_iter = np.atleast_1d(axes).ravel()
@@ -850,9 +1193,12 @@ def _plot_metric_violin_foreground(
             if not filtered and approach == "default":
                 filtered = entries
             _, foregrounds = _extract_foreground_background_arrays(filtered)
-            if foregrounds.size == 0:
+            # keep only finite values so violin can be created even when some NaNs exist
+            finite_fg = foregrounds[np.isfinite(foregrounds)]
+            if finite_fg.size == 0:
+                # still skip approaches with no finite samples
                 continue
-            distributions.append(foregrounds)
+            distributions.append(finite_fg)
             labels.append(approach)
             colors.append(approach_colors.get(approach, "#888888"))
 
@@ -1013,56 +1359,117 @@ def _plot_metric_stacked_bar(
         print("No metric data available for stacked bar plot; skipping.")
         return
 
-    cols = min(2, len(metrics_to_plot))
+    # place up to 5 subplots on the first row
+    cols = min(5, len(metrics_to_plot))
     rows = math.ceil(len(metrics_to_plot) / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 7.0, rows * 5.5))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 6.0, rows * 5.5))
     axes_iter = np.atleast_1d(axes).ravel()
 
     for idx, metric in enumerate(metrics_to_plot):
         ax = axes_iter[idx]
         entries = metric_points.get(metric, [])
-        video_map: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: {"foreground": [], "background": []})
 
+        # Build mapping: video_name -> approach -> lists of fg/bg
+        video_approach_map: Dict[str, Dict[str, Dict[str, List[float]]]] = defaultdict(lambda: defaultdict(lambda: {"foreground": [], "background": []}))
+
+        all_approaches = []
         for entry in entries:
-            video_name = entry.get("video_name") or entry.get("label") or "unknown"
+            raw_video = entry.get("video_name") or entry.get("label") or "unknown"
+            try:
+                last = str(raw_video).split("/")[-1]
+            except Exception:
+                last = str(raw_video)
+            if "." in last:
+                last = last.rsplit(".", 1)[0]
+            video_name = _shorten_video_name(last)
+
+            approach = entry.get("approach") or entry.get("experiment") or "default"
+            if approach not in all_approaches:
+                all_approaches.append(approach)
+
             fg = entry.get("foreground")
             bg = entry.get("background")
             try:
                 if fg is not None:
-                    video_map[video_name]["foreground"].append(float(fg))
+                    video_approach_map[video_name][approach]["foreground"].append(float(fg))
                 if bg is not None:
-                    video_map[video_name]["background"].append(float(bg))
+                    video_approach_map[video_name][approach]["background"].append(float(bg))
             except (TypeError, ValueError):
                 continue
 
-        aggregated = []
-        for video, values in video_map.items():
-            if values["foreground"]:
-                fg_mean = statistics.fmean(values["foreground"])
-                bg_mean = statistics.fmean(values["background"]) if values["background"] else 0.0
-                aggregated.append((video, fg_mean, bg_mean))
-
-        if not aggregated:
+        if not video_approach_map:
             ax.set_visible(False)
             continue
 
-        aggregated.sort(key=lambda item: item[1], reverse=True)
-        videos = [item[0] for item in aggregated]
-        foreground = np.array([item[1] for item in aggregated])
-        background = np.array([item[2] for item in aggregated])
+        # Aggregate means per video per approach
+        aggregated_videos: List[Tuple[str, Dict[str, Tuple[float, float]]]] = []
+        for video, apr_map in video_approach_map.items():
+            approach_stats: Dict[str, Tuple[float, float]] = {}
+            for apr, vals in apr_map.items():
+                fg_mean = statistics.fmean(vals["foreground"]) if vals["foreground"] else 0.0
+                bg_mean = statistics.fmean(vals["background"]) if vals["background"] else 0.0
+                approach_stats[apr] = (fg_mean, bg_mean)
+            aggregated_videos.append((video, approach_stats))
 
-        indices = np.arange(len(videos))
-        ax.bar(indices, foreground, label="Foreground", color="#1f77b4")
-        ax.bar(indices, background, bottom=foreground, label="Background", color="#ff7f0e", alpha=0.8)
+        # Score videos by mean foreground across approaches (for sorting)
+        def video_score(item: Tuple[str, Dict[str, Tuple[float, float]]]) -> float:
+            stats = item[1]
+            if not stats:
+                return 0.0
+            vals = [s[0] for s in stats.values()]
+            return float(statistics.fmean(vals)) if vals else 0.0
 
-        ax.set_xticks(indices)
-        ax.set_xticklabels(videos, rotation=45, ha="right")
+        aggregated_videos.sort(key=video_score, reverse=True)
+
+        # keep at most 5 videos evenly distributed across the sorted list
+        max_titles = 5
+        total_v = len(aggregated_videos)
+        if total_v <= max_titles:
+            selected = aggregated_videos
+        else:
+            indices = [round(i * (total_v - 1) / (max_titles - 1)) for i in range(max_titles)]
+            selected = [aggregated_videos[i] for i in indices]
+
+        selected_videos = [v for v, _ in selected]
+
+        # determine approaches (preserve order found)
+        unique_approaches = all_approaches
+        n_apr = max(1, len(unique_approaches))
+
+        # plotting parameters
+        group_width = 0.8
+        bar_width = group_width / n_apr
+        base_indices = np.arange(len(selected_videos))
+
+        # prepare legend handles
+        cmap = plt.get_cmap("tab20", max(1, len(unique_approaches)))
+        legend_handles = []
+
+        for k, apr in enumerate(unique_approaches):
+            fg_vals = []
+            bg_vals = []
+            for vid in selected_videos:
+                stats = dict(selected)[vid]
+                apr_stats = stats.get(apr, (0.0, 0.0))
+                fg_vals.append(apr_stats[0])
+                bg_vals.append(apr_stats[1])
+
+            positions = base_indices - group_width / 2.0 + k * bar_width + bar_width / 2.0
+            fg_arr = np.array(fg_vals)
+            bg_arr = np.array(bg_vals)
+            color = cmap(k % cmap.N)
+            ax.bar(positions, fg_arr, width=bar_width, label=apr, color=color)
+            ax.bar(positions, bg_arr, width=bar_width, bottom=fg_arr, color=color, alpha=0.85)
+            legend_handles.append(Line2D([0], [0], color=color, lw=4, label=apr))
+
+        ax.set_xticks(base_indices)
+        ax.set_xticklabels(selected_videos, rotation=30, ha="right")
         ax.set_ylabel("Metric Value")
-        ax.set_title(f"{metric.replace('_', ' ').title()} Sorted by Foreground")
+        ax.set_title(f"{metric.replace('_', ' ').title()} (per-approach) — sample videos")
         if metric in LOG_SCALE_METRICS:
             ax.set_yscale("log")
         ax.grid(True, axis="y", linestyle="--", alpha=0.25)
-        ax.legend(loc="upper right")
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
 
     for ax in axes_iter[len(metrics_to_plot) :]:
         ax.remove()
@@ -1081,69 +1488,138 @@ def _plot_metric_stacked_bar(
 
 
 def _plot_parameter_correlation(
-    summary_path: Path,
+    report_paths: Sequence[Path],
+    metrics: Sequence[str],
     output_path: Path,
     dpi: int,
     show_plot: bool,
 ) -> None:
-    if not summary_path.exists():
-        print(f"No summary file at {summary_path}; skipping parameter correlation plot.")
+    """
+    Compute Pearson correlation between each parameter (rows) and each metric (columns).
+    The data is gathered from the same analysis JSON files used by the other plots.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for path in report_paths:
+        try:
+            payload = _load_json(path)
+        except Exception:
+            continue
+
+        if isinstance(payload, dict):
+            # experiments are top-level keys -> each exp_data may contain overrides and metrics
+            for exp_name, exp_data in payload.items():
+                if not isinstance(exp_data, dict):
+                    continue
+                # collect parameter values
+                overrides = exp_data.get("overrides") if isinstance(exp_data.get("overrides"), dict) else payload.get("overrides") if isinstance(payload.get("overrides"), dict) else {}
+                param_vals: Dict[str, Any] = {}
+                for key in PARAMETER_KEYS_FOR_CORRELATION:
+                    val = overrides.get(key) if overrides and key in overrides else exp_data.get(key)
+                    param_vals[key] = val
+
+                # collect metric values (prefer foreground values)
+                fg = exp_data.get("foreground") if isinstance(exp_data.get("foreground"), dict) else {}
+                bg = exp_data.get("background") if isinstance(exp_data.get("background"), dict) else {}
+                metric_vals: Dict[str, Any] = {}
+                any_metric = False
+                for metric in metrics:
+                    mv = fg.get(metric, None)
+                    if mv is None:
+                        mv = bg.get(metric, None)
+                    # if list/tuple take first
+                    if isinstance(mv, (list, tuple)):
+                        mv = mv[0] if mv else None
+                    metric_vals[metric] = mv
+                    if mv is not None:
+                        any_metric = True
+
+                if any_metric and any(v is not None for v in param_vals.values()):
+                    rows.append({"params": param_vals, "metrics": metric_vals})
+
+        elif isinstance(payload, list):
+            # runs_summary-style list
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                overrides = entry.get("overrides") or {}
+                param_vals = {key: overrides.get(key) for key in PARAMETER_KEYS_FOR_CORRELATION}
+                metric_vals = {}
+                fg = entry.get("foreground") or {}
+                bg = entry.get("background") or {}
+                any_metric = False
+                for metric in metrics:
+                    mv = fg.get(metric) if isinstance(fg, dict) else None
+                    if mv is None:
+                        mv = bg.get(metric) if isinstance(bg, dict) else None
+                    if isinstance(mv, (list, tuple)):
+                        mv = mv[0] if mv else None
+                    metric_vals[metric] = mv
+                    if mv is not None:
+                        any_metric = True
+                if any_metric and any(v is not None for v in param_vals.values()):
+                    rows.append({"params": param_vals, "metrics": metric_vals})
+
+    if not rows:
+        print("No parameter/metric rows found for correlation; skipping parameter correlation plot.")
         return
 
-    with summary_path.open("r", encoding="utf-8") as fp:
-        summary_data = json.load(fp)
+    # For each parameter and metric pair, collect paired numeric samples and compute Pearson r
+    param_keys = list(PARAMETER_KEYS_FOR_CORRELATION)
+    metric_keys = list(metrics)
+    corr_matrix = np.full((len(param_keys), len(metric_keys)), np.nan, dtype=float)
 
-    if not summary_data:
-        print("Summary file is empty; skipping parameter correlation plot.")
-        return
+    for i, pkey in enumerate(param_keys):
+        for j, mkey in enumerate(metric_keys):
+            xs: List[float] = []
+            ys: List[float] = []
+            for r in rows:
+                pval = r["params"].get(pkey)
+                mval = r["metrics"].get(mkey)
+                try:
+                    if isinstance(pval, bool):
+                        xv = float(int(pval))
+                    else:
+                        xv = float(pval)
+                except Exception:
+                    continue
+                try:
+                    yv = float(mval)
+                except Exception:
+                    continue
+                if not (math.isfinite(xv) and math.isfinite(yv)):
+                    continue
+                xs.append(xv)
+                ys.append(yv)
 
-    parameter_rows: List[Dict[str, Any]] = []
-    for entry in summary_data:
-        overrides = entry.get("overrides") or {}
-        parameter_rows.append({key: overrides.get(key) for key in PARAMETER_KEYS_FOR_CORRELATION})
+            if len(xs) >= 2 and len(set(xs)) > 1 and len(set(ys)) > 1:
+                try:
+                    corr_val = float(np.corrcoef(np.array(xs), np.array(ys))[0, 1])
+                except Exception:
+                    corr_val = np.nan
+                corr_matrix[i, j] = corr_val
 
-    numeric_keys: List[str] = []
-    numeric_columns: List[List[float]] = []
-    for key in PARAMETER_KEYS_FOR_CORRELATION:
-        column: List[float] = []
-        valid = True
-        for row in parameter_rows:
-            value = row.get(key)
-            if value is None:
-                valid = False
-                break
-            if isinstance(value, bool):
-                value = int(value)
-            if isinstance(value, (int, float)):
-                column.append(float(value))
-            else:
-                valid = False
-                break
-        if valid and len(column) >= 2 and len(set(column)) > 1:
-            numeric_keys.append(key)
-            numeric_columns.append(column)
+    # Plot heatmap (parameters on y, metrics on x)
+    fig_w = max(6.0, 0.5 * len(metric_keys))
+    fig_h = max(6.0, 0.35 * len(param_keys))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(corr_matrix, cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect="auto")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Pearson r")
 
-    if len(numeric_keys) < 2:
-        print("Not enough numeric parameter variation for correlation plot; skipping.")
-        return
+    ax.set_xticks(range(len(metric_keys)))
+    ax.set_xticklabels([m.replace("_", " ") for m in metric_keys], rotation=45, ha="right")
+    ax.set_yticks(range(len(param_keys)))
+    ax.set_yticklabels(param_keys)
 
-    data = np.column_stack(numeric_columns)
-    corr = np.corrcoef(data, rowvar=False)
+    # annotate
+    for i in range(len(param_keys)):
+        for j in range(len(metric_keys)):
+            val = corr_matrix[i, j]
+            text = "" if np.isnan(val) else f"{val:.2f}"
+            ax.text(j, i, text, ha="center", va="center", color="black", fontsize=8)
 
-    fig_size = max(6.0, 0.6 * len(numeric_keys))
-    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-    im = ax.imshow(corr, cmap="coolwarm", vmin=-1.0, vmax=1.0)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
-    ax.set_xticks(range(len(numeric_keys)))
-    ax.set_xticklabels(numeric_keys, rotation=45, ha="right")
-    ax.set_yticks(range(len(numeric_keys)))
-    ax.set_yticklabels(numeric_keys)
-
-    for i in range(len(numeric_keys)):
-        for j in range(len(numeric_keys)):
-            ax.text(j, i, f"{corr[i, j]:.2f}", ha="center", va="center", fontsize=8, color="black")
-
-    ax.set_title("Correlation Between Grid Search Parameters")
+    ax.set_title("Parameter vs Metric Pearson Correlation")
     fig.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1154,6 +1630,7 @@ def _plot_parameter_correlation(
         plt.show()
     else:
         plt.close(fig)
+    
 
 
 def main() -> None:
@@ -1179,6 +1656,25 @@ def main() -> None:
 
     metric_points, approaches, execution_throughput = _prepare_data(report_paths, metrics, root)
 
+    # optionally exclude lanczos/unsharp approaches from plots (default: excluded)
+    if not getattr(args, "include_lanczos_unsharp", False):
+        excluded_set = {"lanczos", "unsharp"}
+        def is_excluded_name(name: str) -> bool:
+            if not name:
+                return False
+            lower = str(name).lower()
+            return any(ex in lower for ex in excluded_set)
+
+        for metric in list(metric_points.keys()):
+            filtered = [
+                e
+                for e in metric_points.get(metric, [])
+                if not is_excluded_name(e.get("approach") or e.get("experiment") or "")
+            ]
+            metric_points[metric] = filtered
+        # filter approaches list as well (keep original order)
+        approaches = [a for a in approaches if not is_excluded_name(a)]
+
     for metric in metrics:
         count = len(metric_points.get(metric, []))
         print(f"  - {metric}: {count} data points")
@@ -1196,26 +1692,28 @@ def main() -> None:
             else:
                 print(f"  - {task}: mean={avg:.2f} fps")
 
-    scatter_output = Path(args.output) if args.output else root / "grid_search_metric_scatter.png"
+    # ensure plots are saved under a 'plots' subfolder inside the root (or inside provided output)
+    if args.output:
+        out_path = Path(args.output)
+        if out_path.is_dir():
+            plots_dir = out_path / "plots"
+        else:
+            plots_dir = out_path.parent / "plots"
+    else:
+        plots_dir = root / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    scatter_output = plots_dir / "grid_search_metric_scatter.png"
     _plot_metric_scatter(metric_points, metrics, approaches, scatter_output, args.dpi, args.show)
 
-    hexbin_output = scatter_output.with_name(METRIC_HEXBIN_FIGURE_NAME)
-    _plot_metric_hexbin(metric_points, metrics, hexbin_output, args.dpi, args.show)
-
-    kde_output = scatter_output.with_name(METRIC_KDE_FIGURE_NAME)
-    _plot_metric_kde(metric_points, metrics, kde_output, args.dpi, args.show)
-
-    violin_output = scatter_output.with_name(METRIC_VIOLIN_FIGURE_NAME)
+    # Removed hexbin/kde/alpha-scatter plots per request; keep violin, stacked bar and throughput/correlation.
+    violin_output = plots_dir / METRIC_VIOLIN_FIGURE_NAME
     _plot_metric_violin_foreground(metric_points, metrics, approaches, violin_output, args.dpi, args.show)
 
-    alpha_output = scatter_output.with_name(METRIC_ALPHA_SCATTER_FIGURE_NAME)
-    _plot_metric_alpha_scatter(metric_points, metrics, approaches, alpha_output, args.dpi, args.show)
-
-    stacked_output = scatter_output.with_name(METRIC_STACKED_BAR_FIGURE_NAME)
+    stacked_output = plots_dir / METRIC_STACKED_BAR_FIGURE_NAME
     _plot_metric_stacked_bar(metric_points, metrics, stacked_output, args.dpi, args.show)
 
-    correlation_output = scatter_output.with_name(PARAM_CORRELATION_FIGURE_NAME)
-    _plot_parameter_correlation(root / "runs_summary.json", correlation_output, args.dpi, args.show)
+    correlation_output = plots_dir / PARAM_CORRELATION_FIGURE_NAME
+    _plot_parameter_correlation(report_paths, metrics, correlation_output, args.dpi, args.show)
 
 
 if __name__ == "__main__":

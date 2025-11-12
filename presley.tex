@@ -916,6 +916,37 @@ The TikZ figure illustrates the staged pipeline with overlap+feather to mitigate
 \end{algorithmic}
 \end{algorithm}
 
+\begin{algorithm}[H]
+\caption{Adaptive Deblurring Restoration}
+\label{alg:adaptive-deblurring}
+\begin{algorithmic}[1]
+\Require Input frames directory $\mathcal{D}_{\text{in}}$, output directory $\mathcal{D}_{\text{out}}$, noise maps $\mathbf{N}\!\in\!\mathbb{Z}^{N\times n_y\times n_x}$ (rounds per block), block size $b$, ordered noise levels $0 = \eta_0 < \eta_1 < \dots < \eta_L$, deblurring model $\mathcal{B}(\cdot,\eta)$
+\Ensure Restored frames in $\mathcal{D}_{\text{out}}$
+\State Collect sorted frame paths $P[0{:}N-1]$ and verify $\mathbf{N}$ shape
+\State $\kappa \leftarrow \max(\mathbf{N})$ \Comment{number of degradation rounds}
+\For{$\ell \leftarrow 1$ \textbf{to} $\kappa$}
+  \State $\Delta_\ell \leftarrow \{(i,j,n) \mid \mathbf{N}[n,i,j] \ge \ell\}$
+  \If{$\Delta_\ell = \emptyset$} \textbf{continue}
+  \EndIf
+  \For{$n \leftarrow 0$ \textbf{to} $N-1$}
+    \State $I \leftarrow \text{ReadImage}(P[n])$
+    \State $\widehat{I} \leftarrow \mathcal{B}\big(I,\,\eta_\ell\big)$ \Comment{global pass at noise level $\eta_\ell$}
+    \State $\mathcal{B}_{\text{tiles}} \leftarrow \text{SplitBlocks}(\widehat{I}, b)$
+    \State $\mathcal{O}_{\text{tiles}} \leftarrow \text{SplitBlocks}(I, b)$
+    \For{each block index $(i,j)$}
+      \If{$(i,j,n) \in \Delta_\ell$}
+        \State $\mathcal{O}_{\text{tiles}}[i,j] \leftarrow \text{FeatherBlend}\big(\mathcal{O}_{\text{tiles}}[i,j],\; \mathcal{B}_{\text{tiles}}[i,j]\big)$
+        \State $\mathbf{N}[n,i,j] \leftarrow \mathbf{N}[n,i,j] - 1$
+      \EndIf
+    \EndFor
+    \State $I_{\text{upd}} \leftarrow \text{CombineBlocks}(\mathcal{O}_{\text{tiles}})$
+    \State $\text{WriteImage}(P[n], I_{\text{upd}})$
+  \EndFor
+\EndFor
+\State Copy restored frames to $\mathcal{D}_{\text{out}}$; return
+\end{algorithmic}
+\end{algorithm}
+
 Based on the degradation strategy used at the server, PRESLEY applies the corresponding restoration method:
 \begin{itemize}
     \item[Super-Resolution] 
@@ -928,8 +959,138 @@ Based on the degradation strategy used at the server, PRESLEY applies the corres
     The full process is delineated in Algorithm~\ref{alg:adaptive-realesrgan} 
     and repeats until all blocks are restored to their intended resolution.
     \item[Deblurring] 
-    If blocks were degraded via Gaussian noise injection, PRESLEY performs iterative generative deblurring.
-    The client decompresses the noise maps from the NPZ file, then processes the entire frame using a deblurring model (e.g., InstantIR~\cite{instantir}).
-    After each round, blocks whose degradation severity matches the current level are finalized.
-    Subsequent rounds target progressively less degraded blocks, refining their clarity based on preserved image context.
+    If blocks were degraded via Gaussian noise injection, PRESLEY performs iterative generative deblurring 
+    as summarized in Algorithm~\ref{alg:adaptive-deblurring}. 
+    The client first decompresses the noise maps from the NPZ file and uses them to schedule adaptive restoration rounds.
+    For each round $\ell$ the client performs a global pass of the trained deblurring model (e.g., InstantIR~\cite{instantir}) 
+    at the corresponding noise level $\eta_\ell$, splits both the model output and the original frame into $b\times b$ tiles, 
+    and finalizes tiles whose remaining noise rounds match the current threshold by feather-blending the restored tile into the output frame.
+    Finalized tiles are written back and removed from further processing; 
+    the procedure repeats for progressively less degraded tiles until all blocks are restored.
 \end{itemize}
+
+\subsection{Quality measurement}
+The last component of the orchestrator script is the quality measurement module. 
+This is the reason for having previously processed the reference and benchmark videos. 
+We compare the reference video with the benchmark (whose only difference is that the former is encoded losslessly, 
+while the latter is encoded at the bitrate calculated previously), and again the reference with the in-painted 
+(whose frames were shrunk, encoded at the same bitrate as the benchmark, decoded, stretched, and in-painted) 
+to gauge which process resulted in a better quality video at a given bitrate. 
+Consequently, our goal is to have an in-painted video that presents a better trade-off of computational cost and bandwidth requirements, 
+compared to the benchmark video.
+We use the ffmpeg-quality-metrics~\cite{ffmpeg_quality_metrics} Python package to compute MSE~\cite{mse}, PSNR~\cite{psnr}, 
+SSIM~\cite{ssim}, and VMAF~\cite{vmaf}, and add to those the more recent and generated image-based LPIPS metric~\cite{lpips},
+and the FVMD metric~\cite{fvmd}, which is specifically designed for video quality assessment of AI-generated videos.
+
+After computing these metrics, they are saved in a single \textit{in-painted-metrics.csv} file, 
+and finally gathered by the Python script \textit{collect-metrics}, together with the time required for each step of the processing, 
+and the list of arguments that identify the experiment, in a \textit{experiment-results.csv} file.
+This file, together with the benchmark and inpainted videos, is considered the final output of this implementation of ELVIS, 
+and can be queried (for example, via a Python interactive notebook), for insights into the results of each experiment.
+For example, one might be interested in which combination of parameters shows more promise and how well the in-painting process stacks 
+against the SOTA encoders.
+
+\section{Performance Evaluation} \label{sec:evaluation}
+
+An integral part of the architecture is monitoring the behavior and results of each component, to identify bottlenecks and improvements. 
+Monitoring spans both server and client components, recording the time taken by each pipeline stage and evaluating the quality of the final output.
+
+To assess the effectiveness of the pipeline, we run experiments in which the in-painted video is compared against a benchmark video 
+encoded at the same resolution and file size but without client-side enhancements, 
+across a range of metrics traditionally used for video evaluation (MSE, PSNR, SSIM, VMAF) 
+as well as metrics specifically suited for in-painted content (LPIPS, FVMD). 
+This allows us to quantify the benefits of the restoration process 
+and determine whether the experiment's parameter configuration has resulted in meaningful improvements.
+
+We conducted a series of experiments to evaluate the performance, by running the pipeline on a Ubuntu 20.04 LTS server, 
+equipped with an Intel Xeon Gold 5218 CPU with 64 cores running at \qty{2.30}{GHz}, and two NVIDIA Quadro RTX 8000 GPUs having \qty{48}{GB} of memory. 
+The experiments were designed to test each major component: degradation, encoding, metadata compression, restoration, and quality measurement, 
+across a varied range of parameter configurations, shown in Table~\ref{tab:parameters}. 
+We processed sequences from the DAVIS dataset~\cite{davis}, known for its scene variety in terms of compositions and camera motions, 
+and resolutions in line with video streaming requirements (480p and 1080p).
+Given the computationally intensive nature of this task, we ended up running \num{200} valid experiments on \num{10} different videos, 
+which we consider a varied dataset from which to draw valuable insights.
+
+The method presented so far, by which we runs several tests on each video sequence, each with a different configuration of parameters, 
+is akin to training phase of a machine learning model. 
+Indeed, in both cases the model is looking for the optimal configuration of its parameters that result in the best output value, 
+in this case, the best improvement over benchmark video quality. 
+Therefore, the more time is available on the server side to compute experiments on a particular video sequence, 
+the higher the likelihood that it will find a configuration that improves the quality significantly. 
+
+\subsection{ELVIS Results}
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/Correlation Matrix.pdf}
+    \caption{Impact of each parameter on quality metrics}
+    \label{fig:correlation}
+\end{figure}
+
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\columnwidth]{Figures/VMAF-by-block-size.png}
+%     \caption{VMAF comparison at different block sizes}
+%     \label{fig:VMAF-by-block-size}
+% \end{figure}
+
+Figure~\ref{fig:correlation} presents the Pearson correlation between ELVIS’s parameters and key quality metrics, 
+including encoding and in-painting times. 
+This analysis provides insights into how parameter configurations impact final video quality. 
+As expected, bitrate and the fraction of blocks removed exhibit the strongest correlations. 
+Higher bitrates improve video quality but increase computational demands, while larger removed fractions degrade quality 
+by making precise in-painting more difficult. 
+Interestingly, the correlation between the removed fraction and modern metrics like VMAF and LPIPS is limited, 
+but a thorough investigation is deemed beyond the scope of this work.
+
+\begin{figure}[b]
+    \centering\includegraphics[width=\columnwidth]{Figures/VMAF-Alpha.pdf}
+    \vspace{-4mm}
+    \caption{VMAF distribution over $\alpha$.}
+    \label{fig:vmaf-alpha}
+    \vspace{-4mm}
+\end{figure}
+
+Figure~\ref{fig:vmaf-alpha} shows how variations in $\alpha$, the spatial-to-temporal complexity weighting parameter, affect VMAF scores. 
+An interesting trend is observed: values of $\alpha$ toward the extremes, which emphasize either spatial or temporal complexity in block removal decisions, tend to result in better video quality. 
+Similar trends were observed for $\beta$, which controls temporal smoothing and block size.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/comparison.pdf}
+    \caption{Comparison of benchmark and in-painted metrics.}
+    \label{fig:comparison}
+\end{figure*}
+
+Figure~\ref{fig:comparison} compares quality metrics for benchmark and in-painted videos across all experiments. 
+Note that, for MSE and LPIPS, lower means better, while for PSNR, SSIM, and VMAF, higher means better.
+For most cases, in-painting improves VMAF and LPIPS scores, which are the metrics most attuned to human perception, with gains of up to 10 VMAF points and 0.2 LPIPS points. 
+Additionally, the overall quality tends to be relatively low, primarily due to the significant difference in resolution between the uncompressed input video and the benchmark and inpainted videos.
+However, some experiments showed reduced quality, in which cases, ELVIS would transmit the benchmark video, ensuring that in-painting never degrades video quality for viewers.
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/New Figures/VMAF_difference.png}
+    \caption{VMAF improvement of in-painted over benchmark, by video name.}
+    \label{fig:VMAF-by-title}
+    \vspace{-5mm}
+\end{figure}
+
+Figure~\ref{fig:VMAF-by-title} highlights VMAF improvements by video title. On average, in-painting yields an increase of 2-3 VMAF points, with some videos benefiting from improvements of up to \num{11} points, corresponding to a very noticeable improvement.
+
+\begin{figure}[b]
+    \centering
+    \includegraphics[width=\columnwidth]{Figures/New Figures/time_complexity.png}
+    \caption{Time complexity of encoding and in-painting, by video name.}
+    \label{fig:time-complexity}
+    \vspace{-5mm}
+\end{figure}
+
+Figure~\ref{fig:time-complexity} depicts the time complexity of ELVIS’s encoding and in-painting stages. 
+Generative AI models, while powerful, are not yet optimized for efficiency and require significant GPU power, making higher resolution videos impossible to process.
+Experiments often took \num{10} times longer than the video’s duration to complete in-painting, rendering real-time application infeasible on current consumer systems. 
+Furthermore, encoding with HNeRV was an order of magnitude slower than in-painting, likely as a combination of the complexity of HNeRV and sub-optimal configuration inside of ELVIS for lack of documentation. Unfortunately, we could not reach the authors for help.
+This highlights the need for advancements in both in-painting and neural encoding to support real-time streaming.
+
+\subsection{PRESLEY Results}
+
