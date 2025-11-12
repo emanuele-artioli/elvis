@@ -1045,22 +1045,20 @@ but a thorough investigation is deemed beyond the scope of this work.
 
 \begin{figure}[b]
     \centering\includegraphics[width=\columnwidth]{Figures/VMAF-Alpha.pdf}
-    \vspace{-4mm}
     \caption{VMAF distribution over $\alpha$.}
     \label{fig:vmaf-alpha}
-    \vspace{-4mm}
 \end{figure}
 
 Figure~\ref{fig:vmaf-alpha} shows how variations in $\alpha$, the spatial-to-temporal complexity weighting parameter, affect VMAF scores. 
 An interesting trend is observed: values of $\alpha$ toward the extremes, which emphasize either spatial or temporal complexity in block removal decisions, tend to result in better video quality. 
 Similar trends were observed for $\beta$, which controls temporal smoothing and block size.
 
-\begin{figure*}[t]
+\begin{figure}[t]
     \centering
     \includegraphics[width=\textwidth]{Figures/comparison.pdf}
     \caption{Comparison of benchmark and in-painted metrics.}
     \label{fig:comparison}
-\end{figure*}
+\end{figure}
 
 Figure~\ref{fig:comparison} compares quality metrics for benchmark and in-painted videos across all experiments. 
 Note that, for MSE and LPIPS, lower means better, while for PSNR, SSIM, and VMAF, higher means better.
@@ -1094,3 +1092,7 @@ This highlights the need for advancements in both in-painting and neural encodin
 
 \subsection{PRESLEY Results}
 
+Given the way we wrote ELVIS results subsection in #file:presley.tex, write the PRESLEY subsection describing the figures we generate with #file:plot_grid_search_results.py. Since you can't see the result numbers, here is their gist: 
+First, we talk about parameter correlations with metric scores, and we say that while most correlations remain insignificant in PRESLEY
+
+For the results in ELVIS were good at very low bitrates (VMAF up to 20) but could not keep up with the baseline AVC at higher qualities. PRESLEY's approaches (namely, RealESRGAN SR and InstantIR restoration) are much better compared to ELVIS at high bitrates, where they consistenty score around 5 VMAF higher than HEVC. 
