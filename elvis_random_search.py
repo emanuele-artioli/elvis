@@ -49,8 +49,8 @@ PARAMETER_GRID: Dict[str, List[Any]] = {
         # "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/tennis.mp4",
         ],
     "experiment_dir": ["experiment"],
-    "width": [640, 1280, 1920, 3840],
-    "height": [360, 720, 1080, 2160],
+    "width": [640, 1280, 1920],
+    "height": [360, 720, 1080],
     "block_size": [8, 16, 32, 64],
     "shrink_amount": [0.1, 0.25, 0.5],
     "enable_fvmd": [False, False, False, False, True], # FVMD is expensive, bias towards False

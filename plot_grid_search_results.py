@@ -1569,7 +1569,7 @@ def _plot_execution_throughput_by_resolution(
             ax.plot([high_whisker, high_whisker], [y_center - box_height * 0.25, y_center + box_height * 0.25], color="black", linewidth=0.8)
             # Outliers
             if outliers.size:
-                ax.scatter(outliers, np.full(outliers.shape, y_center), s=10, c=color, edgecolors="black", linewidths=0.4, alpha=0.8)
+                ax.scatter(outliers, np.full(outliers.shape, y_center), s=10, color=color, edgecolors="black", linewidths=0.4, alpha=0.8)
             # Mean annotation positioned beyond whiskers/outliers
             mean_val = float(statistics.fmean(data)) if data.size else q2
             label = f"{mean_val:.1f} fps"
@@ -2033,10 +2033,16 @@ def _plot_metric_stacked_bar(
                 continue
             video_fg[video].append(fg_val)
 
-        ranked = sorted(
-            ((statistics.fmean(values), video) for video, values in video_fg.items()),
-            key=lambda item: item[0],
-        )
+        # Filter videos with at least one non-zero fvmd value and compute median
+        video_medians = []
+        for video, values in video_fg.items():
+            if values:
+                median_val = statistics.median(values)
+                if median_val > 0.0:
+                    video_medians.append((median_val, video))
+        
+        # Sort by lowest median first
+        ranked = sorted(video_medians, key=lambda item: item[0])
         ordered = [video for _, video in ranked[:limit]]
 
         if len(ordered) < limit:
@@ -2100,12 +2106,16 @@ def _plot_metric_stacked_bar(
         for video, apr_map in video_approach_map.items():
             stats: Dict[str, Tuple[float, float]] = {}
             for apr, vals in apr_map.items():
-                fg_mean = statistics.fmean(vals["foreground"]) if vals["foreground"] else 0.0
-                bg_mean = statistics.fmean(vals["background"]) if vals["background"] else 0.0
-                stats[apr] = (fg_mean, bg_mean)
+                # Filter out nan and inf values before computing median
+                fg_clean = [v for v in vals["foreground"] if math.isfinite(v)]
+                bg_clean = [v for v in vals["background"] if math.isfinite(v)]
+                
+                fg_median = statistics.median(fg_clean) if fg_clean else 0.0
+                bg_median = statistics.median(bg_clean) if bg_clean else 0.0
+                stats[apr] = (fg_median, bg_median)
             aggregated_videos.append((video, stats))
 
-        aggregated_videos.sort(key=lambda item: statistics.fmean([vals[0] for vals in item[1].values()]) if item[1] else float("inf"))
+        aggregated_videos.sort(key=lambda item: statistics.median([vals[0] for vals in item[1].values()]) if item[1] else float("inf"))
         aggregated_map = {video: stats for video, stats in aggregated_videos}
 
         selected_videos = [video for video in target_videos if video in aggregated_map][:max_titles]
@@ -2167,7 +2177,7 @@ def _plot_metric_stacked_bar(
         ax.set_xticks(base_indices)
         ax.set_xticklabels(selected_videos, rotation=30, ha="right")
         ax.set_ylabel("Metric Value")
-        ax.set_title(f"{metric.replace('_', ' ').title()} (per-approach) — sample videos")
+        ax.set_title(f"{metric.replace('_', ' ').title()} (median per-approach) — sample videos")
         if metric in LOG_SCALE_METRICS:
             ax.set_yscale("log")
         ax.grid(True, axis="y", linestyle="--", alpha=0.25)
