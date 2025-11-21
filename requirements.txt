@@ -23,6 +23,7 @@ openmim
 pywavelets
 scikit-image
 numpy<2
+ipykernel
 
 # pip packages from environment.yml
 decord
