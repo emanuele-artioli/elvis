@@ -90,6 +90,7 @@ class ElvisConfig:
     gaussian_encode_pix_fmt: str = "yuv420p"
     roi_save_qp_maps: bool = True
     strength_maps_target_bitrate: int = 50000
+    strength_maps_use_npz: bool = True
     propainter_dir: Optional[str] = None
     propainter_resize_ratio: float = 1.0
     propainter_ref_stride: int = 20
@@ -507,6 +508,27 @@ def _masked_psnr(ref: np.ndarray, dec: np.ndarray, mask: Optional[np.ndarray] = 
     return float(min(psnr_val, 100.0))
 
 
+def _masked_mse(ref: np.ndarray, dec: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    """Compute MSE (Mean Squared Error) restricted to masked pixels."""
+
+    if ref is None or dec is None:
+        return 0.0
+
+    ref_f = ref.astype(np.float32)
+    dec_f = dec.astype(np.float32)
+
+    if mask is not None:
+        valid = mask.astype(bool)
+        if not np.any(valid):
+            return 0.0
+        diff = ref_f[valid] - dec_f[valid]
+    else:
+        diff = ref_f - dec_f
+
+    mse = float(np.mean(diff ** 2)) if diff.size else 0.0
+    return mse
+
+
 def _masked_ssim(ref: np.ndarray, dec: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
     """Compute SSIM on luminance channel within the mask."""
 
@@ -593,14 +615,14 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
 
     video_names = list(results.keys())
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
-
-    metrics = [
+    # Define metrics in desired order: PSNR, SSIM, VMAF (row 1), MSE, LPIPS, FVMD (row 2)
+    all_metrics = [
+        ('psnr_mean', 'PSNR (dB)', None),
         ('ssim_mean', 'SSIM', [0, 1]),
         ('vmaf_mean', 'VMAF', [0, 100]),
-        ('lpips_mean', 'LPIPS (lower is better)', [0, 0.6]),
-        ('fvmd', 'FVMD (lower is better)', None),
+        ('mse_mean', 'MSE', None),
+        ('lpips_mean', 'LPIPS', [0, 0.6]),
+        ('fvmd', 'FVMD', None),
     ]
 
     def _metric_available(metric_key: str) -> bool:
@@ -611,14 +633,23 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
                     return False
         return True
 
-    metrics = [entry for entry in metrics if _metric_available(entry[0])]
+    metrics = [entry for entry in all_metrics if _metric_available(entry[0])]
 
     if not metrics:
         print("  - Skipping quality visualization; no finite metrics available.")
         return
 
+    # Create 2x3 grid for the 6 metrics
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle('Quality Metrics Comparison (Foreground vs Background)', fontsize=16, fontweight='bold')
+    
+    # Flatten axes for easier indexing
+    axes = axes.flatten()
+
     for idx, (metric_key, metric_label, ylim) in enumerate(metrics):
-        ax = axes[idx // 2, idx % 2]
+        if idx >= len(axes):
+            break
+        ax = axes[idx]
 
         fg_values = [results[name]['foreground'].get(metric_key, 0) for name in video_names]
         bg_values = [results[name]['background'].get(metric_key, 0) for name in video_names]
@@ -629,10 +660,10 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
         bars1 = ax.bar(x - width / 2, fg_values, width, label='Foreground', alpha=0.8, color='#2E86AB')
         bars2 = ax.bar(x + width / 2, bg_values, width, label='Background', alpha=0.8, color='#A23B72')
 
-        if metric_key == 'vmaf_mean':
+        if metric_key in ('vmaf_mean', 'psnr_mean'):
             ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.1f'))
-        elif metric_key == 'fvmd':
-            ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.0f'))
+        elif metric_key in ('fvmd', 'mse_mean'):
+            ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.2f'))
         else:
             ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.3f'))
 
@@ -653,10 +684,10 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
         for bars in [bars1, bars2]:
             for bar in bars:
                 height = bar.get_height()
-                if metric_key == 'vmaf_mean':
+                if metric_key in ('vmaf_mean', 'psnr_mean'):
                     value_label = f'{height:.1f}'
-                elif metric_key == 'fvmd':
-                    value_label = f'{height:.0f}'
+                elif metric_key in ('fvmd', 'mse_mean'):
+                    value_label = f'{height:.2f}'
                 else:
                     value_label = f'{height:.3f}'
                 ax.text(
@@ -667,6 +698,10 @@ def _generate_quality_visualizations(results: Dict, heatmaps_dir: str) -> None:
                     va='bottom',
                     fontsize=8,
                 )
+
+    # Hide any unused subplots
+    for idx in range(len(metrics), len(axes)):
+        axes[idx].set_visible(False)
 
     plt.tight_layout()
     output_path = os.path.join(heatmaps_dir, '1_overall_quality_comparison.png')
@@ -2417,9 +2452,11 @@ def encode_with_roi(input_frames_dir: str, output_video: str, removability_score
                 qp_maps_dir = os.path.join(temp_dir, "qp_maps")
             os.makedirs(qp_maps_dir, exist_ok=True)
             for frame_idx in range(num_frames):
-                qp_map_image = np.clip((qp_maps_aligned[frame_idx] + 1.0) * 127.5, 0, 255).astype(np.uint8)
+                # Save at block resolution, not CTU resolution
+                qp_map_block_res = qp_maps[frame_idx]  # Original block resolution
+                qp_map_image = np.clip((qp_map_block_res + 1.0) * 127.5, 0, 255).astype(np.uint8)
                 cv2.imwrite(os.path.join(qp_maps_dir, f"qp_map_{frame_idx:05d}.png"), qp_map_image)
-            print(f"QP maps saved to {qp_maps_dir}")
+            print(f"QP maps saved to {qp_maps_dir} at block resolution ({num_blocks_y}x{num_blocks_x})")
 
         # --- Part 2: Run Global Two-Pass Encode with QP file ---
         print(f"Starting two-pass encoding with per-block QP control (CTU {ctu_size})...")
@@ -2643,6 +2680,52 @@ def decode_strength_maps(video_path: str, block_size: int, frames_dir: str) -> n
 
     # Stack all strength maps into a 3D array
     return np.stack(strength_maps, axis=0)
+
+def encode_strength_maps_to_npz(strength_maps: np.ndarray, output_path: str) -> None:
+    """
+    Encodes strength maps as a compressed numpy array (.npz file).
+    
+    This method uses numpy's native compression to efficiently store the strength maps
+    as metadata without the artifacts introduced by lossy video encoding. The maps are
+    stored as uint8 arrays to minimize file size while preserving exact values.
+    
+    Args:
+        strength_maps: 3D array of shape (num_frames, num_blocks_y, num_blocks_x) or list of 2D arrays
+        output_path: Path to output .npz file (should be in maps directory)
+    """
+    # Convert list to array if needed
+    if isinstance(strength_maps, list):
+        strength_maps = np.stack(strength_maps, axis=0)
+    
+    # Convert to uint8 if not already (strength maps are typically integers in range 0-10)
+    if strength_maps.dtype != np.uint8:
+        strength_maps = strength_maps.astype(np.uint8)
+    
+    # Save with compression
+    np.savez_compressed(output_path, strength_maps=strength_maps)
+    
+    print(f"  Strength maps saved to {output_path} ({os.path.getsize(output_path) / 1024:.2f} KB)")
+
+def decode_strength_maps_from_npz(npz_path: str) -> np.ndarray:
+    """
+    Decodes strength maps from a compressed numpy array (.npz file).
+    
+    Args:
+        npz_path: Path to the .npz file containing the strength maps
+    
+    Returns:
+        3D array of strength values with shape (num_frames, num_blocks_y, num_blocks_x)
+    """
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(f"Strength maps file not found: {npz_path}")
+    
+    # Load the compressed array
+    data = np.load(npz_path)
+    strength_maps = data['strength_maps']
+    
+    print(f"  Strength maps loaded from {npz_path} ({os.path.getsize(npz_path) / 1024:.2f} KB)")
+    
+    return strength_maps
 
 def upscale_realesrgan_2x(image: np.ndarray, realesrgan_dir: str = None, temp_dir: str = None) -> np.ndarray:
     """
@@ -4306,10 +4389,12 @@ def _evaluate_single_video_metrics(
 
     fg_psnr_vals: List[float] = []
     fg_ssim_vals: List[float] = []
+    fg_mse_vals: List[float] = []
     fg_ref_lpips_frames: List[np.ndarray] = []
     fg_dec_lpips_frames: List[np.ndarray] = []
     bg_psnr_vals: List[float] = []
     bg_ssim_vals: List[float] = []
+    bg_mse_vals: List[float] = []
     bg_ref_lpips_frames: List[np.ndarray] = []
     bg_dec_lpips_frames: List[np.ndarray] = []
 
@@ -4325,11 +4410,13 @@ def _evaluate_single_video_metrics(
 
         fg_psnr_vals.append(_masked_psnr(ref_roi, dec_roi, fg_mask_roi))
         fg_ssim_vals.append(_masked_ssim(ref_roi, dec_roi, fg_mask_roi))
+        fg_mse_vals.append(_masked_mse(ref_roi, dec_roi, fg_mask_roi))
         fg_ref_lpips_frames.append(masked_reference_fg_frames[idx][roi_slice])
         fg_dec_lpips_frames.append(masked_decoded_fg_frames[idx][roi_slice])
 
         bg_psnr_vals.append(_masked_psnr(ref_frame, dec_frame, bg_mask))
         bg_ssim_vals.append(_masked_ssim(ref_frame, dec_frame, bg_mask))
+        bg_mse_vals.append(_masked_mse(ref_frame, dec_frame, bg_mask))
         bg_ref_lpips_frames.append(masked_reference_bg_frames[idx])
         bg_dec_lpips_frames.append(masked_decoded_bg_frames[idx])
 
@@ -4339,12 +4426,16 @@ def _evaluate_single_video_metrics(
             'psnr_std': float(np.std(fg_psnr_vals)) if fg_psnr_vals else 0.0,
             'ssim_mean': float(np.mean(fg_ssim_vals)) if fg_ssim_vals else 0.0,
             'ssim_std': float(np.std(fg_ssim_vals)) if fg_ssim_vals else 0.0,
+            'mse_mean': float(np.mean(fg_mse_vals)) if fg_mse_vals else 0.0,
+            'mse_std': float(np.std(fg_mse_vals)) if fg_mse_vals else 0.0,
         },
         'background': {
             'psnr_mean': float(np.mean(bg_psnr_vals)) if bg_psnr_vals else 0.0,
             'psnr_std': float(np.std(bg_psnr_vals)) if bg_psnr_vals else 0.0,
             'ssim_mean': float(np.mean(bg_ssim_vals)) if bg_ssim_vals else 0.0,
             'ssim_std': float(np.std(bg_ssim_vals)) if bg_ssim_vals else 0.0,
+            'mse_mean': float(np.mean(bg_mse_vals)) if bg_mse_vals else 0.0,
+            'mse_std': float(np.std(bg_mse_vals)) if bg_mse_vals else 0.0,
         },
         'bitrate_mbps': bitrate_bps / 1_000_000,
     }
@@ -4650,9 +4741,9 @@ def _print_summary_report(results: Dict) -> None:
         return f"{value:+.2f}%"
 
     # Unified metrics table
-    print(f"\n{'QUALITY METRICS (Foreground / Background)':^180}")
-    print(f"{'Method':<20} {'PSNR (dB)':<25} {'SSIM':<25} {'LPIPS':<25} {'FVMD':<25} {'VMAF':<25} {'Bitrate (Mbps)':<15}")
-    print(f"{'-'*180}")
+    print(f"\n{'QUALITY METRICS (Foreground / Background)':^200}")
+    print(f"{'Method':<20} {'PSNR (dB)':<25} {'SSIM':<25} {'MSE':<25} {'LPIPS':<25} {'FVMD':<25} {'VMAF':<25} {'Bitrate (Mbps)':<15}")
+    print(f"{'-'*200}")
 
     for video_name, data in results.items():
         fg_data = data['foreground']
@@ -4661,21 +4752,22 @@ def _print_summary_report(results: Dict) -> None:
         # Format metric strings (FG / BG)
         psnr_str = _format_pair(fg_data.get('psnr_mean'), bg_data.get('psnr_mean'), precision_fg=2)
         ssim_str = _format_pair(fg_data.get('ssim_mean'), bg_data.get('ssim_mean'), precision_fg=4, precision_bg=4)
+        mse_str = _format_pair(fg_data.get('mse_mean'), bg_data.get('mse_mean'), precision_fg=2, precision_bg=2)
         lpips_str = _format_pair(fg_data.get('lpips_mean'), bg_data.get('lpips_mean'), precision_fg=4, precision_bg=4)
         fvmd_str = _format_pair(fg_data.get('fvmd'), bg_data.get('fvmd'), precision_fg=2)
         vmaf_str = _format_pair(fg_data.get('vmaf_mean'), bg_data.get('vmaf_mean'), precision_fg=2)
         bitrate_str = _format_single(data.get('bitrate_mbps'), precision=2)
 
-        print(f"{video_name:<20} {psnr_str:<25} {ssim_str:<25} {lpips_str:<25} {fvmd_str:<25} {vmaf_str:<25} {bitrate_str:<15}")
+        print(f"{video_name:<20} {psnr_str:<25} {ssim_str:<25} {mse_str:<25} {lpips_str:<25} {fvmd_str:<25} {vmaf_str:<25} {bitrate_str:<15}")
 
-    print(f"{'-'*180}")
+    print(f"{'-'*200}")
 
     # Trade-off analysis against the first video as baseline
     if len(results) > 1:
         baseline_name = list(results.keys())[0]
-        print(f"\n{'TRADE-OFF ANALYSIS (vs. ' + baseline_name + ')':^180}")
-        print(f"{'Method':<20} {'PSNR FG %':<15} {'PSNR BG %':<15} {'SSIM FG %':<15} {'SSIM BG %':<15} {'LPIPS FG %':<15} {'LPIPS BG %':<15} {'FVMD FG %':<15} {'FVMD BG %':<15} {'VMAF FG %':<15} {'VMAF BG %':<15}")
-        print(f"{'-'*180}")
+        print(f"\n{'TRADE-OFF ANALYSIS (vs. ' + baseline_name + ')':^200}")
+        print(f"{'Method':<20} {'PSNR FG %':<15} {'PSNR BG %':<15} {'SSIM FG %':<15} {'SSIM BG %':<15} {'MSE FG %':<15} {'MSE BG %':<15} {'LPIPS FG %':<15} {'LPIPS BG %':<15} {'FVMD FG %':<15} {'FVMD BG %':<15} {'VMAF FG %':<15} {'VMAF BG %':<15}")
+        print(f"{'-'*200}")
 
         for video_name in list(results.keys())[1:]:
             # Calculate changes for all metrics
@@ -4683,6 +4775,8 @@ def _print_summary_report(results: Dict) -> None:
             psnr_bg_change = math.nan
             ssim_fg_change = math.nan
             ssim_bg_change = math.nan
+            mse_fg_change = math.nan
+            mse_bg_change = math.nan
             lpips_fg_change = math.nan
             lpips_bg_change = math.nan
             fvmd_fg_change = math.nan
@@ -4690,7 +4784,7 @@ def _print_summary_report(results: Dict) -> None:
             vmaf_fg_change = math.nan
             vmaf_bg_change = math.nan
 
-            for metric in ['psnr', 'ssim', 'lpips', 'vmaf']:
+            for metric in ['psnr', 'ssim', 'mse', 'lpips', 'vmaf']:
                 for region in ['foreground', 'background']:
                     baseline_val = results[baseline_name][region].get(f'{metric}_mean')
                     current_val = results[video_name][region].get(f'{metric}_mean')
@@ -4717,6 +4811,10 @@ def _print_summary_report(results: Dict) -> None:
                         ssim_fg_change = change
                     elif metric == 'ssim' and region == 'background':
                         ssim_bg_change = change
+                    elif metric == 'mse' and region == 'foreground':
+                        mse_fg_change = change
+                    elif metric == 'mse' and region == 'background':
+                        mse_bg_change = change
                     elif metric == 'lpips' and region == 'foreground':
                         lpips_fg_change = change
                     elif metric == 'lpips' and region == 'background':
@@ -4751,6 +4849,8 @@ def _print_summary_report(results: Dict) -> None:
             psnr_bg_change_str = _format_change(psnr_bg_change)
             ssim_fg_change_str = _format_change(ssim_fg_change)
             ssim_bg_change_str = _format_change(ssim_bg_change)
+            mse_fg_change_str = _format_change(mse_fg_change)
+            mse_bg_change_str = _format_change(mse_bg_change)
             lpips_fg_change_str = _format_change(lpips_fg_change)
             lpips_bg_change_str = _format_change(lpips_bg_change)
             fvmd_fg_change_str = _format_change(fvmd_fg_change)
@@ -4762,6 +4862,7 @@ def _print_summary_report(results: Dict) -> None:
                 f"{video_name:<20} "
                 f"{psnr_fg_change_str:<15} {psnr_bg_change_str:<15} "
                 f"{ssim_fg_change_str:<15} {ssim_bg_change_str:<15} "
+                f"{mse_fg_change_str:<15} {mse_bg_change_str:<15} "
                 f"{lpips_fg_change_str:<15} {lpips_bg_change_str:<15} "
                 f"{fvmd_fg_change_str:<15} {fvmd_bg_change_str:<15} "
                 f"{vmaf_fg_change_str:<15} {vmaf_bg_change_str:<15}"
@@ -5094,13 +5195,21 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         pix_fmt=config.downsample_encode_pix_fmt,
     )
 
-    downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
-    encode_strength_maps(
-        strength_maps=list(downsample_maps),
-        output_video=downsample_maps_video,
-        framerate=framerate,
-        target_bitrate=config.strength_maps_target_bitrate,
-    )
+    # Encode strength maps using NPZ (default) or video encoding (legacy)
+    if config.strength_maps_use_npz:
+        downsample_maps_file = os.path.join(maps_dir, "downsample_maps.npz")
+        encode_strength_maps_to_npz(
+            strength_maps=list(downsample_maps),
+            output_path=downsample_maps_file,
+        )
+    else:
+        downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
+        encode_strength_maps(
+            strength_maps=list(downsample_maps),
+            output_video=downsample_maps_video,
+            framerate=framerate,
+            target_bitrate=config.strength_maps_target_bitrate,
+        )
     end = time.time()
     duration = end - start
     approach_times[APPROACH_PRESLEY_REALESRGAN] += duration
@@ -5134,13 +5243,21 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
         pix_fmt=config.gaussian_encode_pix_fmt,
     )
 
-    gaussian_maps_video = os.path.join(maps_dir, "gaussian_encoded.mp4")
-    encode_strength_maps(
-        strength_maps=list(gaussian_maps),
-        output_video=gaussian_maps_video,
-        framerate=framerate,
-        target_bitrate=config.strength_maps_target_bitrate,
-    )
+    # Encode strength maps using NPZ (default) or video encoding (legacy)
+    if config.strength_maps_use_npz:
+        gaussian_maps_file = os.path.join(maps_dir, "gaussian_maps.npz")
+        encode_strength_maps_to_npz(
+            strength_maps=list(gaussian_maps),
+            output_path=gaussian_maps_file,
+        )
+    else:
+        gaussian_maps_video = os.path.join(maps_dir, "gaussian_encoded.mp4")
+        encode_strength_maps(
+            strength_maps=list(gaussian_maps),
+            output_video=gaussian_maps_video,
+            framerate=framerate,
+            target_bitrate=config.strength_maps_target_bitrate,
+        )
     end = time.time()
     duration = end - start
     approach_times[APPROACH_PRESLEY_INSTANTIR] += duration
@@ -5176,12 +5293,26 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     for i, frame in enumerate(stretched_frames):
         cv2.imwrite(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"), frame)
 
+    # Save removal masks at block resolution (not scaled to video resolution)
     removal_masks_dir = os.path.join(maps_dir, "removal_masks")
     os.makedirs(removal_masks_dir, exist_ok=True)
     for i, mask in enumerate(removal_masks):
         mask_img = (mask * 255).astype(np.uint8)
-        mask_img = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
+        # Keep at block resolution - no resizing
         cv2.imwrite(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), mask_img)
+    num_blocks_y, num_blocks_x = removal_masks[0].shape
+    print(f"Removal masks saved at block resolution ({num_blocks_y}x{num_blocks_x})")
+    
+    # Create full-resolution masks for inpainting (separate from metadata masks)
+    removal_masks_fullres_dir = os.path.join(experiment_dir, "frames", "removal_masks_fullres")
+    os.makedirs(removal_masks_fullres_dir, exist_ok=True)
+    for i, mask in enumerate(removal_masks):
+        mask_img = (mask * 255).astype(np.uint8)
+        # Upscale to full video resolution for inpainting algorithms
+        mask_fullres = cv2.resize(mask_img, (width, height), interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(os.path.join(removal_masks_fullres_dir, f"{i+1:05d}.png"), mask_fullres)
+    print(f"Full-resolution masks for inpainting saved to {removal_masks_fullres_dir}")
+    
     end = time.time()
     duration = end - start
     approach_times[APPROACH_ELVIS] += duration
@@ -5203,7 +5334,8 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     os.makedirs(inpainted_cv2_frames_dir, exist_ok=True)
     for i in range(len(removal_masks)):
         stretched_frame = cv2.imread(os.path.join(stretched_frames_dir, f"{i+1:05d}.png"))
-        mask_img = cv2.imread(os.path.join(removal_masks_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        # Use full-resolution masks for inpainting
+        mask_img = cv2.imread(os.path.join(removal_masks_fullres_dir, f"{i+1:05d}.png"), cv2.IMREAD_GRAYSCALE)
         inpainted_frame = cv2.inpaint(stretched_frame, mask_img, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         cv2.imwrite(os.path.join(inpainted_cv2_frames_dir, f"{i+1:05d}.png"), inpainted_frame)
     end = time.time()
@@ -5226,7 +5358,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     inpainted_frames_dir = os.path.join(experiment_dir, "frames", "inpainted")
     inpaint_with_propainter(
         stretched_frames_dir=stretched_frames_dir,
-        removal_masks_dir=removal_masks_dir,
+        removal_masks_dir=removal_masks_fullres_dir,
         output_frames_dir=inpainted_frames_dir,
         width=width,
         height=height,
@@ -5248,7 +5380,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     approach_times[APPROACH_ELVIS_PROP] += duration
     print(f"{APPROACH_ELVIS_PROP} inpainting completed in {duration:.2f} seconds.\n")
 
-    inpainted_video = os.path.join(experiment_dir, "inpainted.mp4")
+    inpainted_video = os.path.join(experiment_dir, "inpainted_propainter.mp4")
     encode_video(
         input_frames_dir=inpainted_frames_dir,
         output_video=inpainted_video,
@@ -5263,7 +5395,7 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     inpainted_e2fgvi_frames_dir = os.path.join(experiment_dir, "frames", "inpainted_e2fgvi")
     inpaint_with_e2fgvi(
         stretched_frames_dir=stretched_frames_dir,
-        removal_masks_dir=removal_masks_dir,
+        removal_masks_dir=removal_masks_fullres_dir,
         output_frames_dir=inpainted_e2fgvi_frames_dir,
         width=width,
         height=height,
@@ -5307,8 +5439,22 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     ):
         raise RuntimeError(f"Failed to decode downsampled video: {downsampled_video}")
 
-    downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
-    strength_maps = decode_strength_maps(downsample_maps_video, block_size, downsampled_maps_decoded_dir)
+    # Decode strength maps from NPZ (default) or video (legacy)
+    if config.strength_maps_use_npz:
+        downsample_maps_file = os.path.join(maps_dir, "downsample_maps.npz")
+        strength_maps = decode_strength_maps_from_npz(downsample_maps_file)
+        # Save decoded maps as PNG for debugging
+        downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
+        os.makedirs(downsampled_maps_decoded_dir, exist_ok=True)
+        for i, map_frame in enumerate(strength_maps):
+            # Normalize to 0-255 for visualization
+            map_img = np.clip(map_frame.astype(np.float32) * 25.5, 0, 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(downsampled_maps_decoded_dir, f"{i+1:05d}.png"), map_img)
+        print(f"  Decoded downsample maps saved to {downsampled_maps_decoded_dir} at block resolution ({strength_maps.shape[1]}x{strength_maps.shape[2]})")
+    else:
+        downsampled_maps_decoded_dir = os.path.join(experiment_dir, "maps", "downsampled_maps_decoded")
+        downsample_maps_video = os.path.join(maps_dir, "downsample_encoded.mp4")
+        strength_maps = decode_strength_maps(downsample_maps_video, block_size, downsampled_maps_decoded_dir)
     end = time.time()
     duration = end - start
     approach_times[APPROACH_PRESLEY_REALESRGAN] += duration
@@ -5362,8 +5508,22 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     ):
         raise RuntimeError(f"Failed to decode Gaussian video: {gaussian_video}")
 
-    gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
-    strength_maps_gaussian = decode_strength_maps(gaussian_maps_video, block_size, gaussian_maps_decoded_dir)
+    # Decode strength maps from NPZ (default) or video (legacy)
+    if config.strength_maps_use_npz:
+        gaussian_maps_file = os.path.join(maps_dir, "gaussian_maps.npz")
+        strength_maps_gaussian = decode_strength_maps_from_npz(gaussian_maps_file)
+        # Save decoded maps as PNG for debugging
+        gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
+        os.makedirs(gaussian_maps_decoded_dir, exist_ok=True)
+        for i, map_frame in enumerate(strength_maps_gaussian):
+            # Normalize to 0-255 for visualization (gaussian maps are 0-10)
+            map_img = np.clip(map_frame.astype(np.float32) * 25.5, 0, 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(gaussian_maps_decoded_dir, f"{i+1:05d}.png"), map_img)
+        print(f"  Decoded gaussian maps saved to {gaussian_maps_decoded_dir} at block resolution ({strength_maps_gaussian.shape[1]}x{strength_maps_gaussian.shape[2]})")
+    else:
+        gaussian_maps_decoded_dir = os.path.join(experiment_dir, "maps", "gaussian_maps_decoded")
+        gaussian_maps_video = os.path.join(maps_dir, "gaussian_encoded.mp4")
+        strength_maps_gaussian = decode_strength_maps(gaussian_maps_video, block_size, gaussian_maps_decoded_dir)
     end = time.time()
     duration = end - start
     approach_times[APPROACH_PRESLEY_INSTANTIR] += duration
@@ -5434,12 +5594,20 @@ def run_elvis(config: ElvisConfig) -> Dict[str, Any]:
     print("Evaluating and comparing encoding performance...")
     start = time.time()
 
+    # Calculate video sizes including metadata
+    if config.strength_maps_use_npz:
+        downsample_maps_path = os.path.join(maps_dir, "downsample_maps.npz")
+        gaussian_maps_path = os.path.join(maps_dir, "gaussian_maps.npz")
+    else:
+        downsample_maps_path = os.path.join(maps_dir, "downsample_encoded.mp4")
+        gaussian_maps_path = os.path.join(maps_dir, "gaussian_encoded.mp4")
+    
     video_sizes = {
         APPROACH_BASELINE: os.path.getsize(baseline_video),
         APPROACH_ELVIS: os.path.getsize(shrunk_video) + os.path.getsize(os.path.join(experiment_dir, f"shrink_masks_{block_size}.npz")),
         APPROACH_PRESLEY_QP: os.path.getsize(adaptive_video),
-        APPROACH_PRESLEY_REALESRGAN: os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_video),
-        APPROACH_PRESLEY_INSTANTIR: os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_video),
+        APPROACH_PRESLEY_REALESRGAN: os.path.getsize(downsampled_video) + os.path.getsize(downsample_maps_path),
+        APPROACH_PRESLEY_INSTANTIR: os.path.getsize(gaussian_video) + os.path.getsize(gaussian_maps_path),
     }
 
     frame_count = len(frame_files)
