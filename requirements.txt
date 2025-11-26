@@ -12,6 +12,7 @@ torchvision==0.16.2
 torchaudio==2.1.2
 
 # Runtime libraries
+numpy<2
 pandas
 tqdm
 regex
@@ -31,7 +32,7 @@ pytorch_msssim
 dahuffman
 pytorchvideo
 lpips
-opencv-python==4.8.*
+opencv-python==4.8.0.76
 basicsr
 facexlib
 gfpgan
@@ -49,7 +50,6 @@ transformers==4.36
 gradio
 fvmd
 
-# Repos (editable installs from git)
 git+https://github.com/emanuele-artioli/EVCA.git
 git+https://github.com/emanuele-artioli/UFO.git
 git+https://github.com/emanuele-artioli/ProPainter.git
@@ -59,5 +59,8 @@ git+https://github.com/emanuele-artioli/InstantIR.git
 
 # Post-install: mmcv and related OpenMMLab packages
 # mmcv-full has native extensions that must match your CUDA / torch installation.
-# For reliability use OpenMIM to install the correct wheel for your env:
-## python -m mim install mmcv-full==1.7.2 mmdet==2.28.2 mmpose==0.29.0 mmpretrain
+# Run these commands AFTER installing the main requirements:
+#   python3 -m mim install mmcv-full==1.7.2 mmdet==2.28.2
+#   pip install mmpose==0.29.0 --no-deps
+#   python3 -m mim install mmpretrain
+# Note: mmpose is installed with --no-deps to avoid mmtrack/mmpycocotools build issues
