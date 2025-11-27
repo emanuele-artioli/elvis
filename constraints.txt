@@ -1,0 +1,27 @@
+# Constraints file for Elvis
+# This prevents pip from upgrading packages beyond these versions
+# when installing packages with loose dependency requirements.
+
+# PyTorch ecosystem - must stay at 2.1.2 for CUDA 12.1
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+
+# Packages with strict version requirements in Elvis
+opencv-python==4.8.0.76
+diffusers==0.30
+transformers==4.36
+peft==0.10.0
+
+# Packages constrained by fvmd
+einops==0.6.1
+scipy==1.10.1
+
+# Constrain pillow to avoid gradio incompatibility
+pillow<12.0
+
+# Constrain tokenizers for transformers 4.36 compatibility  
+tokenizers>=0.14,<0.19
+
+# Keep numpy < 2 for compatibility
+numpy<2

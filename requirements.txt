@@ -6,6 +6,13 @@
 # you can omit the three torch lines below and install them separately.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
+# Use constraints file to prevent dependency upgrades
+# Install with: pip install -r requirements.txt -c constraints.txt
+-c constraints.txt
+
+# Build tools (needed for proper pyproject.toml support)
+setuptools>=61.0
+
 # CUDA-enabled PyTorch (will be resolved using the extra-index-url above)
 torch==2.1.2
 torchvision==0.16.2
@@ -23,7 +30,7 @@ timm
 openmim
 pywavelets
 scikit-image
-numpy<2
+scipy==1.10.1
 ipykernel
 
 # pip packages from environment.yml
@@ -41,7 +48,7 @@ gfpgan
 diffusers==0.30
 accelerate
 datasets
-einops
+einops==0.6.1
 kornia
 peft==0.10.0
 pyrallis
@@ -56,6 +63,7 @@ git+https://github.com/emanuele-artioli/ProPainter.git
 git+https://github.com/emanuele-artioli/E2FGVI.git
 git+https://github.com/emanuele-artioli/Real-ESRGAN.git
 git+https://github.com/emanuele-artioli/InstantIR.git
+git+https://github.com/emanuele-artioli/Upscale-A-Video.git
 
 # Post-install: mmcv and related OpenMMLab packages
 # mmcv-full has native extensions that must match your CUDA / torch installation.
