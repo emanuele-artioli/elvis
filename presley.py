@@ -1,78 +1,101 @@
+"""
+PRESLEY: Extended ELVIS for Importance-Based Video Compression
+
+PRESLEY extends ELVIS with multiple quality-reduction strategies that leverage
+per-block importance scores to reduce bitrate while preserving foreground quality.
+
+Strategies:
+1. ELVIS (Frame Shrinking): Remove low-importance blocks, reconstruct via inpainting
+2. ROI Encoding: Per-CTU quality control using kvazaar's --roi option
+3. Block Degradation (planned): Blur/downscale blocks, restore via super-resolution
+
+Key components:
+- EVCA: Edge-based Video Complexity Analysis for spatial/temporal complexity
+- UFO: Unified Foundation Object segmentation for foreground detection
+- Kvazaar: HEVC encoder with per-CTU delta QP support via --roi option
+"""
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 import subprocess
-import math
 import tempfile
+import os
 import numpy as np
 import cv2
 import torch
+import pytorch_msssim
 
 from evca import analyze_frames, EVCAConfig
 from ufo import segment_frames
 
+
 @dataclass
-class ElvisConfig:
-    reference_video: str = "Datasets/DAVIS/avc_encoded/bear.mp4"
+class PresleyConfig:
+    """Configuration for the ELVIS/PRESLEY encoding pipeline."""
+    reference_video: str = "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4"
     width: int = 1280
     height: int = 720
-    framerate: float = None
-    quality_factor: float = 0.02
-    crf: Optional[int] = 30  # If set, use CRF mode instead of ABR
-    vbv_bufsize: int = 50  # VBV buffer size in kbits
-    encode_preset: str = "medium"
-    block_size: int = 16
-    gop_size: int = 24  # GOP size for QP-based encoding (frames per ROI map)
-    alpha: float = 0.5
-    beta: float = 0.5
-    shrink_amount: float = 0.25
-    propainter_resize_ratio: float = 1.0
-    propainter_ref_stride: int = 20
-    propainter_neighbor_length: int = 4
-    propainter_subvideo_length: int = 40
-    propainter_mask_dilation: int = 4
-    propainter_raft_iter: int = 20
-    propainter_fp16: bool = True
-    propainter_devices: Optional[List[Union[int, str]]] = None
-    propainter_parallel_chunk_length: Optional[int] = None
-    propainter_chunk_overlap: Optional[int] = None
-    e2fgvi_ref_stride: int = 10
-    e2fgvi_neighbor_stride: int = 5
-    e2fgvi_num_ref: int = -1
-    e2fgvi_mask_dilation: int = 4
-    e2fgvi_devices: Optional[List[Union[int, str]]] = None
-    e2fgvi_parallel_chunk_length: Optional[int] = None
-    e2fgvi_chunk_overlap: Optional[int] = None
-    realesrgan_denoise_strength: float = 1.0
-    realesrgan_tile: int = 0
-    realesrgan_tile_pad: int = 10
-    realesrgan_pre_pad: int = 0
-    realesrgan_fp32: bool = False
-    realesrgan_devices: Optional[List[Union[int, str]]] = None
-    realesrgan_parallel_chunk_length: Optional[int] = None
-    realesrgan_per_device_workers: int = 1
-    instantir_cfg: float = 7.0
-    instantir_creative_start: float = 1.0
-    instantir_preview_start: float = 0.0
-    instantir_seed: Optional[int] = 42
-    instantir_devices: Optional[List[Union[int, str]]] = None
-    instantir_batch_size: int = 4
-    instantir_parallel_chunk_length: Optional[int] = None
-    generate_opencv_benchmarks: bool = True
-    metric_stride: int = 1
-    fvmd_stride: int = 1
-    fvmd_max_frames: Optional[int] = None
-    fvmd_processes: Optional[int] = None
-    fvmd_early_stop_delta: float = 0.002
-    fvmd_early_stop_window: int = 50
-    vmaf_stride: int = 1
-    enable_fvmd: bool = True
+    framerate: float = None  # Auto-detected from reference video
+    base_qp: int = 45  # Base quality level for kvazaar encoding
+    qp_range: int = 15  # Delta QP range for ROI encoding
+    block_size: int = 16  # Block size for importance calculation
+    alpha: float = 0.5  # Weight for spatial vs temporal complexity
+    beta: float = 0.5  # Smoothing factor for importance scores
+    shrink_amount: float = 0.25  # Fraction of blocks to remove in shrinking
+    # propainter_resize_ratio: float = 1.0
+    # propainter_ref_stride: int = 20
+    # propainter_neighbor_length: int = 4
+    # propainter_subvideo_length: int = 40
+    # propainter_mask_dilation: int = 4
+    # propainter_raft_iter: int = 20
+    # propainter_fp16: bool = True
+    # propainter_devices: Optional[List[Union[int, str]]] = None
+    # propainter_parallel_chunk_length: Optional[int] = None
+    # propainter_chunk_overlap: Optional[int] = None
+    # e2fgvi_ref_stride: int = 10
+    # e2fgvi_neighbor_stride: int = 5
+    # e2fgvi_num_ref: int = -1
+    # e2fgvi_mask_dilation: int = 4
+    # e2fgvi_devices: Optional[List[Union[int, str]]] = None
+    # e2fgvi_parallel_chunk_length: Optional[int] = None
+    # e2fgvi_chunk_overlap: Optional[int] = None
+    # realesrgan_denoise_strength: float = 1.0
+    # realesrgan_tile: int = 0
+    # realesrgan_tile_pad: int = 10
+    # realesrgan_pre_pad: int = 0
+    # realesrgan_fp32: bool = False
+    # realesrgan_devices: Optional[List[Union[int, str]]] = None
+    # realesrgan_parallel_chunk_length: Optional[int] = None
+    # realesrgan_per_device_workers: int = 1
+    # instantir_cfg: float = 7.0
+    # instantir_creative_start: float = 1.0
+    # instantir_preview_start: float = 0.0
+    # instantir_seed: Optional[int] = 42
+    # instantir_devices: Optional[List[Union[int, str]]] = None
+    # instantir_batch_size: int = 4
+    # instantir_parallel_chunk_length: Optional[int] = None
+    # generate_opencv_benchmarks: bool = True
+    # metric_stride: int = 1
+    # fvmd_stride: int = 1
+    # fvmd_max_frames: Optional[int] = None
+    # fvmd_processes: Optional[int] = None
+    # fvmd_early_stop_delta: float = 0.002
+    # fvmd_early_stop_window: int = 50
+    # vmaf_stride: int = 1
+    # enable_fvmd: bool = True
 
-global config
-config = ElvisConfig()
 
+# Global config instance
+config = PresleyConfig()
+
+
+# =============================================================================
+# Video I/O Functions
+# =============================================================================
 
 def load_frames(video_path: str, width: int, height: int) -> List[np.ndarray]:
+    """Load video frames as RGB numpy arrays, scaled to target resolution."""
     command = [
         'ffmpeg', '-hide_banner', '-loglevel', 'warning',
         "-i", video_path,
@@ -97,6 +120,7 @@ def load_frames(video_path: str, width: int, height: int) -> List[np.ndarray]:
 
 
 def save_frames(frames: List[np.ndarray], output_folder: Path) -> None:
+    """Save frames as PNG images."""
     output_folder.mkdir(parents=True, exist_ok=True)
     for i, frame in enumerate(frames):
         frame_path = output_folder / f"frame_{i:05d}.png"
@@ -104,341 +128,307 @@ def save_frames(frames: List[np.ndarray], output_folder: Path) -> None:
 
 
 def get_video_framerate(video_path: str) -> float:
+    """Extract framerate from video file."""
     cap = cv2.VideoCapture(video_path)
     framerate = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
     return framerate
 
 
-def frames_to_blocks(frames: np.ndarray, block_size: int) -> np.ndarray:
-    """Convert frames (N, H, W, C) to blocks (N, blocks_y, block_size, blocks_x, block_size, C)."""
-    if frames.ndim == 3:  # Single frame (H, W, C)
-        frames = frames[np.newaxis, ...]
-    n, h, w, c = frames.shape
-    blocks_y, blocks_x = h // block_size, w // block_size
-    cropped = frames[:, :blocks_y * block_size, :blocks_x * block_size, :]
-    return cropped.reshape(n, blocks_y, block_size, blocks_x, block_size, c)
-
-
-def blocks_to_frames(blocks: np.ndarray) -> np.ndarray:
-    """Convert blocks (N, blocks_y, block_size, blocks_x, block_size, C) back to frames (N, H, W, C)."""
-    n, blocks_y, block_size_y, blocks_x, block_size_x, c = blocks.shape
-    return blocks.reshape(n, blocks_y * block_size_y, blocks_x * block_size_x, c)
-
-
-def encode_video(frames: List[np.ndarray], output_path: str, crf: Optional[int] = None, target_bitrate: Optional[int] = None, x265_params: Optional[str] = None, vf: Optional[str] = None) -> None:
+def encode_video(frames: List[np.ndarray], output_path: str, qp: int = 48, qp_range: int = 15, importance_scores: Optional[List[np.ndarray]] = None) -> None:
+    """Encode video using kvazaar HEVC encoder with optional ROI-based quality control."""
     height, width = frames[0].shape[:2]
-    # Detect input pixel format from frame shape
-    input_pix_fmt = "gray" if frames[0].ndim == 2 else "rgb24"
-    output_pix_fmt = "gray" if frames[0].ndim == 2 else "yuv444p"
-    x265_params = [x265_params] if x265_params else []
-    x265_params.append("log-level=1")
+    output_path = Path(output_path)
     
-    # Determine rate control mode
-    if crf:
-        x265_params.append(f"crf={crf}:vbv-bufsize={config.vbv_bufsize}:vbv-maxrate={config.vbv_bufsize}")
-        rate_args = []
-    elif target_bitrate:
-        x265_params.append(f"vbv-bufsize={config.vbv_bufsize}:vbv-maxrate={target_bitrate}")
-        rate_args = ["-b:v", f"{target_bitrate}k"]
-    else:
-        x265_params.append("lossless=1")
-        rate_args = []
+    # Create temporary Y4M file (kvazaar's preferred input format)
+    with tempfile.NamedTemporaryFile(suffix='.y4m', delete=False) as tmp:
+        y4m_path = tmp.name
     
-    x265_params = ":".join(x265_params)
+    # Write Y4M file with YUV420 color space
+    fps_num = int(round(config.framerate * 1000))
+    with open(y4m_path, 'wb') as f:
+        f.write(f"YUV4MPEG2 W{width} H{height} F{fps_num}:1000 Ip A1:1 C420\n".encode())
+        for frame in frames:
+            f.write(b"FRAME\n")
+            yuv = cv2.cvtColor(frame, cv2.COLOR_RGB2YUV_I420)
+            f.write(yuv.tobytes())
     
-    # Video filter arguments
-    vf_args = ["-vf", vf] if vf else []
-    command = [
+    # Build kvazaar command
+    hevc_path = str(output_path).replace('.mp4', '.hevc')
+    cmd = ["kvazaar", "-i", y4m_path, "-q", str(qp), "-o", hevc_path, "--preset", "medium"]
+    
+    # Add ROI file if importance scores provided
+    roi_path = None
+    if importance_scores is not None:
+        roi_path = str(output_path).replace('.mp4', '_roi.bin')
+        create_roi_file(importance_scores, roi_path, qp_range)
+        cmd.extend(["--roi", roi_path])
+    
+    # Run kvazaar (may crash at end due to memory bug, but output is valid)
+    subprocess.run(cmd, capture_output=True, text=True)
+    
+    if not os.path.exists(hevc_path) or os.path.getsize(hevc_path) == 0:
+        raise RuntimeError(f"Kvazaar failed to produce output: {hevc_path}")
+    
+    # Mux HEVC to MP4 using mkvmerge for proper timestamps, then ffmpeg for MP4
+    # Raw HEVC has no timestamps; mkvmerge adds them based on framerate
+    mkv_path = hevc_path.replace('.hevc', '.mkv')
+    subprocess.run([
+        "mkvmerge", "-o", mkv_path,
+        "--default-duration", f"0:{int(config.framerate)}fps",
+        hevc_path
+    ], check=True, capture_output=True)
+    
+    subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-        "-f", "rawvideo",
-        "-pix_fmt", input_pix_fmt,
-        "-s:v", f"{width}x{height}",
-        "-r", str(config.framerate),
-        "-i", "-",
-        *vf_args,
-        "-c:v", "libx265",
-        *rate_args,
-        "-x265-params", x265_params,
-        "-preset", config.encode_preset,
-        "-pix_fmt", output_pix_fmt,
+        "-i", mkv_path, "-c:v", "copy", "-movflags", "+faststart",
         str(output_path)
-    ]
-    process = subprocess.Popen(command, stdin=subprocess.PIPE)
-    for frame in frames:
-        process.stdin.write(frame.tobytes())
-    process.stdin.close()
-    process.wait()
+    ], check=True, capture_output=True)
+    
+    # Cleanup temporary files
+    os.unlink(y4m_path)
+    os.unlink(hevc_path)
+    os.unlink(mkv_path)
+    if roi_path:
+        os.unlink(roi_path)
 
+
+# =============================================================================
+# Quality Metrics
+# =============================================================================
+
+def calculate_block_ssim(frames1: List[np.ndarray], frames2: List[np.ndarray], block_size: int, device: str = "cuda" if torch.cuda.is_available() else "cpu") -> List[np.ndarray]:
+    """Calculate per-block SSIM between two frame sequences using GPU."""
+    ssim_maps = []
+    
+    for f1, f2 in zip(frames1, frames2):
+        h, w = f1.shape[:2]
+        blocks_y, blocks_x = h // block_size, w // block_size
+        
+        # Crop to block boundaries and convert to tensors
+        f1_crop = f1[:blocks_y * block_size, :blocks_x * block_size]
+        f2_crop = f2[:blocks_y * block_size, :blocks_x * block_size]
+        
+        t1 = torch.from_numpy(f1_crop.copy()).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
+        t2 = torch.from_numpy(f2_crop.copy()).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
+        
+        # Extract blocks using unfold
+        patches1 = t1.unfold(2, block_size, block_size).unfold(3, block_size, block_size)
+        patches2 = t2.unfold(2, block_size, block_size).unfold(3, block_size, block_size)
+        
+        c = patches1.shape[1]
+        patches1 = patches1.permute(0, 2, 3, 1, 4, 5).reshape(-1, c, block_size, block_size)
+        patches2 = patches2.permute(0, 2, 3, 1, 4, 5).reshape(-1, c, block_size, block_size)
+        
+        # Compute SSIM per block in batches
+        num_blocks = patches1.shape[0]
+        ssim_values = torch.zeros(num_blocks, device=device)
+        batch_size = min(256, num_blocks)
+        
+        for i in range(0, num_blocks, batch_size):
+            end = min(i + batch_size, num_blocks)
+            ssim_values[i:end] = pytorch_msssim.ssim(
+                patches1[i:end], patches2[i:end], data_range=1.0, size_average=False
+            )
+        
+        ssim_maps.append(ssim_values.reshape(blocks_y, blocks_x).cpu().numpy())
+    
+    return ssim_maps
+
+
+# =============================================================================
+# ELVIS: Frame Shrinking
+# Remove low-importance blocks to reduce frame size. The removed blocks can
+# later be reconstructed via video inpainting (e.g., ProPainter, E2FGVI).
+# =============================================================================
 
 def calculate_importance_scores(frames: List[np.ndarray], block_size: int, alpha: float, beta: float, complexities: np.ndarray, foreground_masks: np.ndarray) -> List[np.ndarray]:
-    frames = np.array(frames)
+    """Calculate per-block importance scores combining complexity and foreground detection."""
+    
+    # Combine spatial and temporal complexity
+    complexity = np.zeros_like(complexities.SC)
+    complexity[:-1] = alpha * complexities.SC[:-1] + (1 - alpha) * complexities.TC[1:]
+    complexity[-1] = complexities.SC[-1]  # Last frame has no future TC
 
-    # Combine spatial and temporal complexity scores
-    complexity_scores = np.zeros_like(complexities.SC)
-    complexity_scores[:-1] = alpha * complexities.SC[:-1] + (1 - alpha) * complexities.TC[1:]
-    # For the last frame, there is no successive temporal complexity, so we rely only on spatial
-    complexity_scores[-1] = complexities.SC[-1]
+    # Temporal smoothing
+    importance = np.zeros_like(complexity)
+    importance[0] = complexity[0]
+    importance[1:] = beta * complexity[1:] + (1 - beta) * complexity[:-1]
 
-    # Smooth importance scores with prior frame's score to balance sudden changes
-    importance_scores = np.zeros_like(complexity_scores)
-    # The first frame has no prior frame, so its scores remain unchanged.
-    importance_scores[0] = complexity_scores[0]
-    importance_scores[1:] = (beta * complexity_scores[1:] + (1 - beta) * complexity_scores[:-1])
+    # Invert importance for background (foreground_masks < 0.5)
+    fg = foreground_masks.copy()
+    fg[fg < 0.5] = -1.0
+    importance *= fg
+    
+    # Normalize to [0, 1]
+    min_val = importance.min(axis=(1, 2), keepdims=True)
+    max_val = importance.max(axis=(1, 2), keepdims=True)
+    importance = (importance - min_val) / (max_val - min_val + 1e-8)
 
-    # Multiply importance scores of background regions by -1 so that background is less important than foreground, and its complex regions have lowest scores
-    foreground_masks[foreground_masks < 0.5] = -1.0
-    importance_scores *= foreground_masks
-    # Normalize importance scores to [0, 1]
-    min_score = importance_scores.min(axis=(1, 2), keepdims=True)
-    max_score = importance_scores.max(axis=(1, 2), keepdims=True)
-    importance_scores = (importance_scores - min_score) / (max_score - min_score + 1e-8)
-
-    return [importance_scores[i] for i in range(importance_scores.shape[0])]
+    return [importance[i] for i in range(len(importance))]
 
 
-def shrink_frame(frame: np.ndarray, importance_score: np.ndarray, block_size: int, shrink_amount: float) -> tuple:
-    # Make writable copies
+def shrink_frame(frame: np.ndarray, importance: np.ndarray, block_size: int, shrink_amount: float):
+    """Iteratively removes the least important block from each row/column, producing a smaller frame. Also returns mask of removed blocks."""
+
     frame = frame.copy()
-    importance_score = importance_score.copy()
+    importance = importance.copy()
     
-    height, width, _ = frame.shape
-    orig_blocks_y = height // block_size
-    orig_blocks_x = width // block_size
-    blocks_y = orig_blocks_y
-    blocks_x = orig_blocks_x
+    height, width = frame.shape[:2]
+    blocks_y = height // block_size
+    blocks_x = width // block_size
+    orig_blocks_y, orig_blocks_x = blocks_y, blocks_x
     
-    # Reshape frame into blocks: (blocks_y, block_size, blocks_x, block_size, 3)
-    blocked_frame = frame[:blocks_y * block_size, :blocks_x * block_size].reshape(blocks_y, block_size, blocks_x, block_size, 3)
+    # Reshape into blocks
+    blocked = frame[:blocks_y * block_size, :blocks_x * block_size].reshape(blocks_y, block_size, blocks_x, block_size, 3)
     
-    # Track original positions of blocks: (orig_y, orig_x) for each current position
-    block_origins = np.empty((orig_blocks_y, orig_blocks_x, 2), dtype=np.int32)
-    for by in range(orig_blocks_y):
-        for bx in range(orig_blocks_x):
-            block_origins[by, bx] = [by, bx]
-    
-    # Track which original blocks have been removed
+    # Track original positions for removal mask
+    origins = np.empty((orig_blocks_y, orig_blocks_x, 2), dtype=np.int32)
+    origins = np.array([[(by, bx) for bx in range(orig_blocks_x)] for by in range(orig_blocks_y)])
     removal_mask = np.zeros((orig_blocks_y, orig_blocks_x), dtype=bool)
+    target_removals = int(orig_blocks_y * orig_blocks_x * shrink_amount)
+    removed = 0
     
-    target_blocks_to_remove = int(orig_blocks_y * orig_blocks_x * shrink_amount)
-    blocks_removed = 0
-    while blocks_removed < target_blocks_to_remove:
-        # For each row, remove the least important block by shifting all blocks after it
+    while removed < target_removals:
+        # Remove least important block from each row
         for by in range(blocks_y):
-            row_importance = importance_score[by, :blocks_x]
-            least_important_idx = np.argmin(row_importance)
-            # Record the original position of the removed block
-            orig_pos = block_origins[by, least_important_idx]
+            least_idx = np.argmin(importance[by, :blocks_x])
+            orig_pos = origins[by, least_idx]
             removal_mask[orig_pos[0], orig_pos[1]] = True
-            # Shift all blocks after the least important one to the left
-            blocked_frame[by, :, least_important_idx:blocks_x-1, :, :] = blocked_frame[by, :, least_important_idx+1:blocks_x, :, :].copy()
-            importance_score[by, least_important_idx:blocks_x-1] = importance_score[by, least_important_idx+1:blocks_x]
-            block_origins[by, least_important_idx:blocks_x-1] = block_origins[by, least_important_idx+1:blocks_x]
-            blocks_removed += 1
-        # Remove the last column of blocks
+            
+            # Shift blocks left
+            blocked[by, :, least_idx:blocks_x-1] = blocked[by, :, least_idx+1:blocks_x].copy()
+            importance[by, least_idx:blocks_x-1] = importance[by, least_idx+1:blocks_x]
+            origins[by, least_idx:blocks_x-1] = origins[by, least_idx+1:blocks_x]
+            removed += 1
+        
         blocks_x -= 1
-        importance_score = importance_score[:, :blocks_x]
-        if blocks_removed >= target_blocks_to_remove:
+        importance = importance[:, :blocks_x]
+        if removed >= target_removals:
             break
-            
-        # For each column, remove the least important block by shifting all blocks after it
+        
+        # Remove least important block from each column
         for bx in range(blocks_x):
-            col_importance = importance_score[:blocks_y, bx]
-            least_important_idx = np.argmin(col_importance)
-            # Record the original position of the removed block
-            orig_pos = block_origins[least_important_idx, bx]
+            least_idx = np.argmin(importance[:blocks_y, bx])
+            orig_pos = origins[least_idx, bx]
             removal_mask[orig_pos[0], orig_pos[1]] = True
-            # Shift all blocks after the least important one up
-            blocked_frame[least_important_idx:blocks_y-1, :, bx, :, :] = blocked_frame[least_important_idx+1:blocks_y, :, bx, :, :].copy()
-            importance_score[least_important_idx:blocks_y-1, bx] = importance_score[least_important_idx+1:blocks_y, bx]
-            block_origins[least_important_idx:blocks_y-1, bx] = block_origins[least_important_idx+1:blocks_y, bx]
-            blocks_removed += 1
-        # Remove the last row of blocks
+            
+            # Shift blocks up
+            blocked[least_idx:blocks_y-1, :, bx] = blocked[least_idx+1:blocks_y, :, bx].copy()
+            importance[least_idx:blocks_y-1, bx] = importance[least_idx+1:blocks_y, bx]
+            origins[least_idx:blocks_y-1, bx] = origins[least_idx+1:blocks_y, bx]
+            removed += 1
+        
         blocks_y -= 1
-        importance_score = importance_score[:blocks_y, :]
-        
-    # Reconstruct the shrunken frame
-    shrunken_frame = blocked_frame[:blocks_y, :, :blocks_x, :, :].reshape(
-        blocks_y * block_size, blocks_x * block_size, 3
-    )
-    return shrunken_frame, removal_mask
-
-
-def build_roi_filter(importance_map: np.ndarray, width: int, height: int, threshold: float = 0.2) -> Optional[str]:
-    """Build addroi filter string from a 2D importance map.
+        importance = importance[:blocks_y, :]
     
-    Args:
-        importance_map: 2D array (blocks_y, blocks_x) with values in [0, 1]
-        width: Frame width in pixels
-        height: Frame height in pixels
-        threshold: Only add ROI for blocks with |qoffset| > threshold
+    shrunken = blocked[:blocks_y, :, :blocks_x].reshape(blocks_y * block_size, blocks_x * block_size, 3)
+    return shrunken, removal_mask
+
+
+# =============================================================================
+# PRESLEY: ROI-Based Encoding
+# Use kvazaar's per-CTU delta QP to allocate more bits to important regions.
+# This is the only HEVC encoder we found that accepts external importance maps.
+# =============================================================================
+
+def create_roi_file(importance_scores: List[np.ndarray], roi_path: str, qp_range: int = 15) -> None:
+    """Create a kvazaar ROI file from importance scores."""
+
+    with open(roi_path, 'wb') as f:
+        for importance in importance_scores:
+            h, w = importance.shape
+            f.write(np.array([w, h], dtype=np.int32).tobytes())
+            delta_qp = ((1.0 - importance) * 2 * qp_range - qp_range).astype(np.int8)
+            f.write(delta_qp.tobytes())
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+if __name__ == "__main__":
+    # Setup experiment
+    experiment_name = f"{Path(config.reference_video).stem}_w{config.width}_h{config.height}_qp{config.base_qp}"
+    print(f"Experiment: {experiment_name}")
     
-    Returns:
-        Filter string or None if no significant ROIs
-    """
-    score_h, score_w = importance_map.shape
-    roi_block_h = height // score_h
-    roi_block_w = width // score_w
+    experiment_folder = Path("presley/experiments") / experiment_name
+    experiment_folder.mkdir(parents=True, exist_ok=True)
     
-    # Map importance [0,1] to QP offset [-0.5,0.5]: high importance = negative offset = better quality
-    qp_offsets = 0.5 - importance_map
+    config.framerate = get_video_framerate(config.reference_video)
+    reference_frames = load_frames(config.reference_video, config.width, config.height)
     
-    roi_filters = []
-    for by in range(score_h):
-        for bx in range(score_w):
-            offset = float(qp_offsets[by, bx])
-            if abs(offset) > threshold:
-                offset = max(-1.0, min(1.0, offset))
-                x = bx * roi_block_w
-                y = by * roi_block_h
-                roi_filters.append(f"addroi=x={x}:y={y}:w={roi_block_w}:h={roi_block_h}:qoffset={offset:.4f}")
+    # Baseline encoding
+    baseline_path = experiment_folder / "baseline.mp4"
+    encode_video(reference_frames, baseline_path, qp=config.base_qp)
+    print(f"Baseline encoded to {baseline_path}")
     
-    return ",".join(roi_filters) if roi_filters else None
-
-
-def encode_video_with_qp(frames: List[np.ndarray], output_path: str, importance_scores: List[np.ndarray], crf: Optional[int] = None, target_bitrate: Optional[int] = None, gop_size: Optional[int] = None) -> None:
-    """Encode video with per-GOP, per-block QP offsets using addroi filters.
+    # EVCA: spatial and temporal complexity analysis
+    evca = analyze_frames(np.array(reference_frames), EVCAConfig(block_size=config.block_size))
     
-    Splits the video into GOPs of gop_size frames, computes average importance
-    scores within each GOP, and encodes each GOP with its own ROI map. This
-    provides a tradeoff between:
-    - GOP=1: Per-frame ROI but loses inter-frame compression
-    - GOP=all: Single ROI map, maximum compression but loses temporal adaptivity
+    # UFO: foreground segmentation
+    ufo_masks = segment_frames(np.array(reference_frames), device="cuda:0" if torch.cuda.is_available() else "cpu")
+    ufo_masks = np.array([cv2.resize(m.astype(np.float32), (config.width // config.block_size, config.height // config.block_size), interpolation=cv2.INTER_NEAREST) for m in ufo_masks]) # Resize masks to block level
     
-    Args:
-        frames: List of frames to encode
-        output_path: Output video path
-        importance_scores: List of per-frame importance score maps
-        crf: Constant Rate Factor for quality control
-        target_bitrate: Target bitrate in kbps (alternative to CRF)
-        gop_size: Number of frames per GOP (default from config.gop_size)
-    """
-    if gop_size is None:
-        gop_size = config.gop_size
+    # Combine complexity and foreground into importance scores
+    importance_scores = calculate_importance_scores(reference_frames, config.block_size, config.alpha, config.beta, evca, ufo_masks)
+    print(f"Computed importance scores for {len(importance_scores)} frames")
     
-    height, width = frames[0].shape[:2]
-    scores_array = np.stack(importance_scores, axis=0)
-    num_frames = len(frames)
+    # Save visualizations
+    save_frames([(s * 255).astype(np.uint8) for s in importance_scores], experiment_folder / "importance")
+    save_frames([(m * 255).astype(np.uint8) for m in ufo_masks], experiment_folder / "foreground_masks")
     
-    # If gop_size >= num_frames, use single GOP (original behavior)
-    if gop_size >= num_frames:
-        avg_importance = scores_array.mean(axis=0)
-        vf = build_roi_filter(avg_importance, width, height)
-        if vf:
-            print(f"  Using single GOP with ROI-based encoding")
-        else:
-            print(f"  No significant QP variations, using standard encoding")
-        encode_video(frames, output_path, crf, target_bitrate, vf=vf)
-        return
+    # ROI-based encoding using importance scores
+    roi_path = experiment_folder / "roi_encoded.mp4"
+    encode_video(reference_frames, roi_path, qp=config.base_qp, importance_scores=importance_scores, qp_range=15)
+    print(f"ROI-encoded to {roi_path}")
     
-    # Split into GOPs and encode each separately
-    num_gops = math.ceil(num_frames / gop_size)
-    print(f"  Encoding {num_frames} frames in {num_gops} GOPs of up to {gop_size} frames each")
+    # Frame shrinking
+    shrunken_frames, removal_masks = [], []
+    for i, frame in enumerate(reference_frames):
+        shrunken, mask = shrink_frame(frame, importance_scores[i], config.block_size, config.shrink_amount)
+        shrunken_frames.append(shrunken)
+        removal_masks.append(mask)
+    shrunken_path = experiment_folder / "shrunken.mp4"
+    encode_video(shrunken_frames, shrunken_path, qp=config.base_qp)
+    print(f"Shrunken video ({shrunken_frames[0].shape[1]}x{shrunken_frames[0].shape[0]}) encoded to {shrunken_path}")
     
-    output_dir = Path(output_path).parent
-    gop_files = []
+    # Save removal masks
+    save_frames([(m * 255).astype(np.uint8) for m in removal_masks], experiment_folder / "removal_masks")
+    np.savez_compressed(experiment_folder / "removal_masks.npz", masks=np.array(removal_masks))
     
-    with tempfile.TemporaryDirectory(dir=output_dir) as temp_dir:
-        temp_path = Path(temp_dir).resolve()  # Use absolute path
-        
-        for gop_idx in range(num_gops):
-            start_frame = gop_idx * gop_size
-            end_frame = min(start_frame + gop_size, num_frames)
-            gop_frames = frames[start_frame:end_frame]
-            gop_scores = scores_array[start_frame:end_frame]
-            
-            # Average importance within this GOP
-            gop_avg_importance = gop_scores.mean(axis=0)
-            vf = build_roi_filter(gop_avg_importance, width, height)
-            
-            # Encode this GOP
-            gop_file = temp_path / f"gop_{gop_idx:04d}.mp4"
-            gop_files.append(gop_file)
-            
-            # Force keyframe at start of each GOP segment
-            x265_params = f"keyint={gop_size}:min-keyint={gop_size}"
-            encode_video(gop_frames, str(gop_file), crf, target_bitrate, x265_params=x265_params, vf=vf)
-        
-        # Concatenate all GOP files
-        concat_list = temp_path / "concat.txt"
-        with open(concat_list, 'w') as f:
-            for gop_file in gop_files:
-                # Use absolute path in concat file
-                f.write(f"file '{gop_file.resolve()}'\n")
-        
-        # Use ffmpeg concat demuxer to join segments
-        concat_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
-            str(output_path)
-        ]
-        subprocess.run(concat_cmd, check=True)
+    # Quality evaluation
+    print("\n=== Quality Metrics ===")
     
-    print(f"  Encoded {num_gops} GOPs with per-GOP ROI maps")
-
-
-# Setup
-experiment_name = f"elvis_{Path(config.reference_video).stem}_w{config.width}_h{config.height}_q{config.quality_factor}"
-print(f"Experiment Name: {experiment_name}")
-experiment_folder = Path("elvis/experiments") / experiment_name
-experiment_folder.mkdir(parents=True, exist_ok=True)
-config.framerate = get_video_framerate(config.reference_video)
-target_bitrate = (config.width * config.height * config.framerate * config.quality_factor) / 1000  # in kbps
-reference_frames = load_frames(config.reference_video, config.width, config.height)
-
-# Reference encoding
-encode_video(reference_frames, experiment_folder / "reference.mp4")
-print(f"Reference video encoded losslessly to {experiment_folder / 'reference.mp4'}.")
-
-# Baseline encoding
-encode_video(reference_frames, experiment_folder / "baseline.mp4", config.crf)
-print(f"Baseline video encoded to {experiment_folder / 'baseline.mp4'}.")
-
-# Complexity score calculation via EVCA
-evca = analyze_frames(np.array(reference_frames), EVCAConfig(block_size=config.block_size))
-evca_SC_folder = experiment_folder / "evca_SC"
-save_frames(evca.SC, evca_SC_folder)
-evca_TC_folder = experiment_folder / "evca_TC"
-save_frames(evca.TC, evca_TC_folder)
-ufo_masks = segment_frames(np.array(reference_frames), device="cuda:0" if torch.cuda.is_available() else "cpu")
-
-# UFO masks are 1 for foreground pixels and 0 for background pixels, resize to block level
-block_height = reference_frames[0].shape[0] // config.block_size
-block_width = reference_frames[0].shape[1] // config.block_size
-ufo_masks = np.array([cv2.resize(mask.astype(np.float32), (block_width, block_height), interpolation=cv2.INTER_NEAREST) for mask in ufo_masks])
-ufo_masks_folder = experiment_folder / "ufo_masks"
-save_frames([ (mask * 255).astype(np.uint8) for mask in ufo_masks ], ufo_masks_folder)
-
-# Importance score calculation
-importance_scores = calculate_importance_scores(reference_frames, config.block_size, config.alpha, config.beta, evca, ufo_masks)
-print(f"Calculated importance scores for {len(importance_scores)} frames.")
-importance_scores_folder = experiment_folder / "importance_scores"
-save_frames([ (score * 255).astype(np.uint8) for score in importance_scores ], importance_scores_folder)
-
-# QP-based encoding using importance scores
-qp_video_path = experiment_folder / "qp_encoded.mp4"
-encode_video_with_qp(reference_frames, qp_video_path, importance_scores, config.crf)
-print(f"QP-encoded video encoded to {qp_video_path}.")
-
-# Frame shrinking based on importance scores
-shrunken_frames = []
-removal_masks = []
-for i, frame in enumerate(reference_frames):
-    shrunken_frame, removal_mask = shrink_frame(frame, importance_scores[i], config.block_size, config.shrink_amount)
-    shrunken_frames.append(shrunken_frame)
-    removal_masks.append(removal_mask)
-encode_video(shrunken_frames, experiment_folder / "shrunken_video.mp4", config.crf)
-print(f"Shrunken video encoded to {experiment_folder / 'shrunken_video.mp4'} with resolution {shrunken_frame.shape[1]}x{shrunken_frame.shape[0]}.")
-
-# Removal masks encoding
-removal_masks_folder = experiment_folder / "removal_masks"
-save_frames([ (mask.astype(np.uint8) * 255) for mask in removal_masks ], removal_masks_folder)
-print(f"Removal masks saved to {removal_masks_folder}.")
-# Encode as video (masks are 2D arrays, encode_video will auto-detect gray format)
-encode_video([ (mask.astype(np.uint8) * 255) for mask in removal_masks ], experiment_folder / "removal_masks.mp4", config.crf)
-# Encode as npz
-np.savez_compressed(experiment_folder / "removal_masks.npz", removal_masks=np.array(removal_masks))
-print(f"Removal masks video and npz saved to {experiment_folder / 'removal_masks.mp4'} and {experiment_folder / 'removal_masks.npz'} for ablation tests.")
-
+    # Load encoded videos
+    baseline_frames = load_frames(str(baseline_path), config.width, config.height)
+    roi_frames = load_frames(str(roi_path), config.width, config.height)
+    
+    # Calculate and save block SSIM
+    ssim_baseline = calculate_block_ssim(reference_frames, baseline_frames, config.block_size)
+    ssim_roi = calculate_block_ssim(reference_frames, roi_frames, config.block_size)
+    save_frames([(s * 255).astype(np.uint8) for s in ssim_baseline], experiment_folder / "metrics/ssim_baseline")
+    save_frames([(s * 255).astype(np.uint8) for s in ssim_roi], experiment_folder / "metrics/ssim_roi")
+    
+    # Overall SSIM
+    avg_ssim_baseline = np.mean([s.mean() for s in ssim_baseline])
+    avg_ssim_roi = np.mean([s.mean() for s in ssim_roi])
+    print(f"Overall SSIM \n Baseline: {avg_ssim_baseline:.4f}, \n ROI: {avg_ssim_roi:.4f}")
+    
+    # Foreground-only SSIM
+    fg_ssim_baseline, fg_ssim_roi = [], []
+    for ssim_b, ssim_r, imp in zip(ssim_baseline, ssim_roi, importance_scores):
+        fg_mask = imp > 0.5
+        if fg_mask.any():
+            fg_ssim_baseline.append(ssim_b[fg_mask].mean())
+            fg_ssim_roi.append(ssim_r[fg_mask].mean())
+    avg_fg_baseline = np.mean(fg_ssim_baseline) if fg_ssim_baseline else 0.0
+    avg_fg_roi = np.mean(fg_ssim_roi) if fg_ssim_roi else 0.0
+    improvement = (avg_fg_roi - avg_fg_baseline) * 100
+    print(f"Foreground SSIM \n Baseline: {avg_fg_baseline:.4f}, \n ROI: {avg_fg_roi:.4f}")
+    print(f"Foreground SSIM improvement: {improvement:.2f}%")
+    
+    # File sizes
+    baseline_size = os.path.getsize(baseline_path)
+    roi_size = os.path.getsize(roi_path)
+    print(f"\nFile sizes \n Baseline: {baseline_size:,} bytes, \n ROI: {roi_size:,} bytes")
