@@ -847,8 +847,10 @@ def inpaint_with_propainter(frames: np.ndarray, masks: np.ndarray, model: ProPai
         fp16=config.propainter_fp16,
         device=torch.device(device)
     )
-    masks = [cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) for mask in masks] # Resize masks to frame size
-    return model.inpaint(frames, masks, config=pp_config)
+    # Resize masks to frame size
+    h, w = frames[0].shape[:2]
+    masks_resized = np.array([cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) for mask in masks])
+    return model.inpaint(frames, masks_resized, config=pp_config)
 
 
 @measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
@@ -862,8 +864,10 @@ def inpaint_with_e2fgvi(frames: np.ndarray, masks: np.ndarray, model: E2FGVIMode
         mask_dilation=config.e2fgvi_mask_dilation,
         device=torch.device(device)
     )
-    masks = [cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) for mask in masks] # Resize masks to frame size
-    return model.inpaint(frames, masks, config=e2_config)
+    # Resize masks to frame size
+    h, w = frames[0].shape[:2]
+    masks_resized = np.array([cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) for mask in masks])
+    return model.inpaint(frames, masks_resized, config=e2_config)
 
 
 # =============================================================================
@@ -1399,8 +1403,8 @@ if __name__ == "__main__":
 
     # Encode baseline videos
     print("Encoding baseline videos...")
-    encode_video(reference_frames, "kvazaar.mp4", config.quality, config.qp_range, encoder="kvazaar")
-    encode_video(reference_frames, "svtav1.mp4", config.quality, config.qp_range, encoder="svtav1")
+    encode_video(reference_frames, f"{experiment_folder}/kvazaar.mp4", config.quality, config.qp_range, encoder="kvazaar")
+    encode_video(reference_frames, f"{experiment_folder}/svtav1.mp4", config.quality, config.qp_range, encoder="svtav1")
 
     # ELVIS: shrink video frames
     print("Shrinking video frames...")
@@ -1417,6 +1421,12 @@ if __name__ == "__main__":
     print("Stretching video frames back to original size...")
     stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size)
     stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind_bool, config.block_size)
+
+    # Initialize inpainting models
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Loading inpainting models...")
+    propainter_model = ProPainterModel(device=torch.device(device), fp16=config.propainter_fp16)
+    e2fgvi_model = E2FGVIModel(model="e2fgvi_hq", device=torch.device(device))
 
     # ELVIS: inpaint removed regions
     print("Inpainting removed regions with OpenCV Telea...")
@@ -1438,10 +1448,7 @@ if __name__ == "__main__":
     create_svtav1_roi_file(importance_scores, str(svtav1_roi_path), base_crf=QUALITY_PRESETS[config.quality]["svtav1_crf"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"], width=config.width, height=config.height)
 
     # PRESLEY: Initialize restoration models
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Loading restoration models...")
-    propainter_model = ProPainterModel(device=torch.device(device), fp16=config.propainter_fp16) if ProPainterModel else None
-    e2fgvi_model = E2FGVIModel(model="e2fgvi_hq", device=torch.device(device)) if E2FGVIModel else None
     realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
     instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=device, torch_dtype=torch.float16)
     uav_upscaler = UpscaleAVideo(device=device).load_models()
