@@ -769,12 +769,12 @@ def shrink_video_frames(frames: List[np.ndarray], importance_scores: List[np.nda
     return shrunken_frames, removal_masks
 
 
-def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[Any], block_size: int) -> List[np.ndarray]:
+def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[np.ndarray], block_size: int) -> List[np.ndarray]:
     """Stretch a list of shrunken video frames using the removal masks.
     
     Args:
         shrunken_frames: List of shrunken frames (H', W', 3)
-        removal_masks: List of binary removal masks per frame
+        removal_masks: List of boolean removal masks per frame (True = removed block)
         block_size: Size of blocks for stretching
     
     Returns:
@@ -785,18 +785,26 @@ def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[
     for frame_idx, frame in enumerate(shrunken_frames):
         removal_mask = removal_masks[frame_idx]
         orig_blocks_y, orig_blocks_x = removal_mask.shape
+        
         h, w, c = frame.shape
         shrunk_blocks_y, shrunk_blocks_x = h // block_size, w // block_size
         
         shrunk_blocks = frame.reshape(shrunk_blocks_y, block_size, shrunk_blocks_x, block_size, c).swapaxes(1, 2)
         final_blocks = np.zeros((orig_blocks_y, orig_blocks_x, block_size, block_size, c), dtype=frame.dtype)
         
-        # For each row, place shrunk blocks at non-removed positions
+        # Get list of kept block positions in original grid (in row-major order)
+        kept_positions = []
         for orig_y in range(orig_blocks_y):
-            kept_cols = np.where(~removal_mask[orig_y, :])[0]
-            for shrunk_x, orig_x in enumerate(kept_cols):
-                if shrunk_x < shrunk_blocks_x:
-                    final_blocks[orig_y, orig_x] = shrunk_blocks[orig_y, shrunk_x]
+            for orig_x in range(orig_blocks_x):
+                if not removal_mask[orig_y, orig_x]:
+                    kept_positions.append((orig_y, orig_x))
+        
+        # Place shrunken blocks back at their original positions
+        for i, (orig_y, orig_x) in enumerate(kept_positions):
+            shrunk_y = i // shrunk_blocks_x
+            shrunk_x = i % shrunk_blocks_x
+            if shrunk_y < shrunk_blocks_y and shrunk_x < shrunk_blocks_x:
+                final_blocks[orig_y, orig_x] = shrunk_blocks[shrunk_y, shrunk_x]
         
         stretched = final_blocks.swapaxes(1, 2).reshape(orig_blocks_y * block_size, orig_blocks_x * block_size, c)
         stretched_frames.append(stretched)
@@ -1399,21 +1407,27 @@ if __name__ == "__main__":
     shrunk_frames_row_only, masks_row_only = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_row_only)
     shrunk_frames_rem_ind, masks_rem_ind = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_removal_indices)
 
+    # Convert removal_indices to boolean masks (masks_row_only are already boolean)
+    print("Converting removal indices to masks...")
+    orig_blocks_y = config.height // config.block_size
+    orig_blocks_x = config.width // config.block_size
+    masks_rem_ind_bool = [_removal_indices_to_mask(rm, orig_blocks_y, orig_blocks_x) for rm in masks_rem_ind]
+
     # ELVIS: stretch video frames back to original size
     print("Stretching video frames back to original size...")
     stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size)
-    stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind, config.block_size)
+    stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind_bool, config.block_size)
 
     # ELVIS: inpaint removed regions
     print("Inpainting removed regions with OpenCV Telea...")
     inpainted_frames_row_only_telea, performance_metrics['inpaint_row_only_telea'] = inpaint_with_opencv(np.array(stretched_frames_row_only), np.array(masks_row_only))
-    inpainted_frames_rem_ind_telea, performance_metrics['inpaint_rem_ind_telea'] = inpaint_with_opencv(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind))
+    inpainted_frames_rem_ind_telea, performance_metrics['inpaint_rem_ind_telea'] = inpaint_with_opencv(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool))
     print("Inpainting removed regions with ProPainter...")
     inpainted_frames_row_only_propainter, performance_metrics['inpaint_row_only_propainter'] = inpaint_with_propainter(np.array(stretched_frames_row_only), np.array(masks_row_only), model=propainter_model, device=device)
-    inpainted_frames_rem_ind_propainter, performance_metrics['inpaint_rem_ind_propainter'] = inpaint_with_propainter(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind), model=propainter_model, device=device)
+    inpainted_frames_rem_ind_propainter, performance_metrics['inpaint_rem_ind_propainter'] = inpaint_with_propainter(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool), model=propainter_model, device=device)
     print("Inpainting removed regions with E2FGVI...")
     inpainted_frames_row_only_e2fgvi, performance_metrics['inpaint_row_only_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_row_only), np.array(masks_row_only), model=e2fgvi_model, device=device)
-    inpainted_frames_rem_ind_e2fgvi, performance_metrics['inpaint_rem_ind_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind), model=e2fgvi_model, device=device)
+    inpainted_frames_rem_ind_e2fgvi, performance_metrics['inpaint_rem_ind_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool), model=e2fgvi_model, device=device)
 
     # PRESLEY: create ROI files for Kvazaar and SVT-AV1
     print("Creating Kvazaar ROI file...")
