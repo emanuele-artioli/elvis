@@ -618,29 +618,6 @@ def shrink_frame_row_only(frame: np.ndarray, importance: np.ndarray, block_size:
     shrunken = blocked[:blocks_y, :, :blocks_x].reshape(blocks_y * block_size, blocks_x * block_size, 3)
     return shrunken, removal_mask
 
-
-def stretch_frame_row_only(shrunk_frame: np.ndarray, removal_mask: np.ndarray, block_size: int) -> np.ndarray:
-    """Reconstruct frame from row-only shrunk version.
-    
-    For row-only removal, blocks in each row of the shrunken frame map directly
-    to non-removed positions in that same row of the original.
-    """
-    orig_blocks_y, orig_blocks_x = removal_mask.shape
-    h, w, c = shrunk_frame.shape
-    shrunk_blocks_y, shrunk_blocks_x = h // block_size, w // block_size
-    
-    shrunk_blocks = shrunk_frame.reshape(shrunk_blocks_y, block_size, shrunk_blocks_x, block_size, c).swapaxes(1, 2)
-    final_blocks = np.zeros((orig_blocks_y, orig_blocks_x, block_size, block_size, c), dtype=shrunk_frame.dtype)
-    
-    # For each row, place shrunk blocks at non-removed positions
-    for orig_y in range(orig_blocks_y):
-        kept_cols = np.where(~removal_mask[orig_y, :])[0]
-        for shrunk_x, orig_x in enumerate(kept_cols):
-            if shrunk_x < shrunk_blocks_x:
-                final_blocks[orig_y, orig_x] = shrunk_blocks[orig_y, shrunk_x]
-    
-    return final_blocks.swapaxes(1, 2).reshape(orig_blocks_y * block_size, orig_blocks_x * block_size, c)
-
 # Shrinking Method 2: Row+Col removal with removal_indices list
 
 def shrink_frame_removal_indices(frame: np.ndarray, importance: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, list]:
@@ -719,79 +696,50 @@ def shrink_frame_removal_indices(frame: np.ndarray, importance: np.ndarray, bloc
     return shrunken, removal_indices
 
 
-def stretch_frame_removal_indices(shrunk_frame: np.ndarray, removal_indices: list, block_size: int) -> np.ndarray:
-    """Reconstruct frame by inverting the removal process using removal_indices.
-    Process removal_indices in reverse order, inserting black blocks at the recorded positions.
+def _removal_indices_to_mask(removal_indices: list, orig_blocks_y: int, orig_blocks_x: int) -> np.ndarray:
+    """Convert removal indices to boolean mask.
+    
+    Args:
+        removal_indices: List of arrays tracking removed indices per pass
+        orig_blocks_y: Original number of blocks vertically
+        orig_blocks_x: Original number of blocks horizontally
+    
+    Returns:
+        Boolean mask where True = removed block
     """
-    h, w, c = shrunk_frame.shape
-    # the number of blocks in the stretched frame equals the number of blocks in the shrunk frame, 
-    # plus half the number of list elements in removal_indices, with the odd element belonging to orig_blocks_y
-    blocks_y, blocks_x = h // block_size, w // block_size
-    orig_blocks_y = blocks_y + len(removal_indices) // 2
-    orig_blocks_x = blocks_x + len(removal_indices) // 2
-    if len(removal_indices) // 2 != 0:
-        orig_blocks_y += 1
+    mask = np.zeros((orig_blocks_y, orig_blocks_x), dtype=bool)
     
-    # Start with the shrunken blocks reshaped properly
-    blocked = shrunk_frame.reshape(blocks_y, block_size, blocks_x, block_size, c)
+    # Track current grid dimensions as we replay the removal process
+    blocks_y, blocks_x = orig_blocks_y, orig_blocks_x
     
-    # Process removal_indices in reverse to expand back
-    for pass_idx in range(len(removal_indices) - 1, -1, -1):
-        indices = removal_indices[pass_idx]
+    # Process removal_indices forward to mark removed positions
+    for pass_idx, indices in enumerate(removal_indices):
         is_row_pass = (pass_idx % 2 == 0)  # Even indices are row passes
         
         if is_row_pass:
-            # Row pass: we removed one block per row, so expand width
-            new_blocks_x = blocks_x + 1
-            new_blocked = np.zeros((blocks_y, block_size, new_blocks_x, block_size, c), dtype=blocked.dtype)
-            
-            # Process each row that had a removal
+            # Row pass: removed blocks from each row
             for by in range(min(len(indices), blocks_y)):
-                insert_idx = indices[by]
-                # Clamp insert_idx to valid range
-                insert_idx = min(insert_idx, blocks_x)
-                # Copy blocks before insertion point
-                if insert_idx > 0:
-                    new_blocked[by, :, :insert_idx] = blocked[by, :, :insert_idx]
-                # Insert black block at removal position (stays zeros)
-                # Copy blocks after insertion point
-                if insert_idx < blocks_x:
-                    new_blocked[by, :, insert_idx+1:new_blocks_x] = blocked[by, :, insert_idx:blocks_x]
-            
-            # Copy remaining rows unchanged (these didn't have a removal in this pass)
-            for by in range(len(indices), blocks_y):
-                new_blocked[by, :, :blocks_x] = blocked[by, :, :blocks_x]
-            
-            blocked = new_blocked
-            blocks_x = new_blocks_x
+                remove_idx = indices[by]
+                if remove_idx < blocks_x:
+                    # Find the actual column position in original grid
+                    # Count how many non-removed positions come before this one
+                    remaining_cols = np.where(~mask[by, :])[0]
+                    if remove_idx < len(remaining_cols):
+                        mask[by, remaining_cols[remove_idx]] = True
+            blocks_x -= 1
         else:
-            # Column pass: we removed one block per column, so expand height
-            new_blocks_y = blocks_y + 1
-            new_blocked = np.zeros((new_blocks_y, block_size, blocks_x, block_size, c), dtype=blocked.dtype)
-            
-            # Process each column that had a removal
+            # Column pass: removed blocks from each column
             for bx in range(min(len(indices), blocks_x)):
-                insert_idx = indices[bx]
-                # Clamp insert_idx to valid range
-                insert_idx = min(insert_idx, blocks_y)
-                # Copy blocks before insertion point
-                if insert_idx > 0:
-                    new_blocked[:insert_idx, :, bx] = blocked[:insert_idx, :, bx]
-                # Insert black block at removal position (stays zeros)
-                # Copy blocks after insertion point
-                if insert_idx < blocks_y:
-                    new_blocked[insert_idx+1:new_blocks_y, :, bx] = blocked[insert_idx:blocks_y, :, bx]
-            
-            # Copy remaining columns unchanged (these didn't have a removal in this pass)
-            for bx in range(len(indices), blocks_x):
-                new_blocked[:blocks_y, :, bx] = blocked[:blocks_y, :, bx]
-            
-            blocked = new_blocked
-            blocks_y = new_blocks_y
+                remove_idx = indices[bx]
+                if remove_idx < blocks_y:
+                    # Find the actual row position in original grid
+                    # Count how many non-removed positions come before this one
+                    remaining_rows = np.where(~mask[:, bx])[0]
+                    if remove_idx < len(remaining_rows):
+                        mask[remaining_rows[remove_idx], bx] = True
+            blocks_y -= 1
     
-    # Reshape to final image - crop to original size if needed
-    result = blocked.reshape(blocks_y * block_size, blocks_x * block_size, c)
-    return result[:orig_blocks_y * block_size, :orig_blocks_x * block_size]
+    return mask
 
 # Wrapper functions
 
@@ -821,22 +769,36 @@ def shrink_video_frames(frames: List[np.ndarray], importance_scores: List[np.nda
     return shrunken_frames, removal_masks
 
 
-def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[Any], block_size: int, method: Callable, **kwargs) -> List[np.ndarray]:
-    """Stretch a list of shrunken video frames using the specified stretching method.
+def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[Any], block_size: int) -> List[np.ndarray]:
+    """Stretch a list of shrunken video frames using the removal masks.
     
     Args:
         shrunken_frames: List of shrunken frames (H', W', 3)
-        removal_masks: List of removal masks per frame
+        removal_masks: List of binary removal masks per frame
         block_size: Size of blocks for stretching
-        method: Stretching method function to use
     
     Returns:
         stretched_frames: List of reconstructed frames
     """
     stretched_frames = []
     
-    for shrunk_frame, removal_mask in zip(shrunken_frames, removal_masks):
-        stretched = method(shrunk_frame, removal_mask, block_size)
+    for frame_idx, frame in enumerate(shrunken_frames):
+        removal_mask = removal_masks[frame_idx]
+        orig_blocks_y, orig_blocks_x = removal_mask.shape
+        h, w, c = frame.shape
+        shrunk_blocks_y, shrunk_blocks_x = h // block_size, w // block_size
+        
+        shrunk_blocks = frame.reshape(shrunk_blocks_y, block_size, shrunk_blocks_x, block_size, c).swapaxes(1, 2)
+        final_blocks = np.zeros((orig_blocks_y, orig_blocks_x, block_size, block_size, c), dtype=frame.dtype)
+        
+        # For each row, place shrunk blocks at non-removed positions
+        for orig_y in range(orig_blocks_y):
+            kept_cols = np.where(~removal_mask[orig_y, :])[0]
+            for shrunk_x, orig_x in enumerate(kept_cols):
+                if shrunk_x < shrunk_blocks_x:
+                    final_blocks[orig_y, orig_x] = shrunk_blocks[orig_y, shrunk_x]
+        
+        stretched = final_blocks.swapaxes(1, 2).reshape(orig_blocks_y * block_size, orig_blocks_x * block_size, c)
         stretched_frames.append(stretched)
     
     return stretched_frames
@@ -1006,6 +968,8 @@ def degrade_frame(frame: np.ndarray, degradation_map: np.ndarray, block_size: in
     h, w = frame.shape[:2]
     blocks_y, blocks_x = h // block_size, w // block_size
     
+    blocks = frame[:blocks_y * block_size, :blocks_x * block_size].reshape(blocks_y, block_size, blocks_x, block_size, 3).swapaxes(1, 2)
+    
     processed_blocks = blocks.copy()
     for by in range(blocks_y):
         for bx in range(blocks_x):
@@ -1020,6 +984,34 @@ def degrade_frame(frame: np.ndarray, degradation_map: np.ndarray, block_size: in
     output = frame.copy()
     output[:blocks_y * block_size, :blocks_x * block_size] = result
     return output
+
+
+def degrade_video_adaptive(frames: List[np.ndarray], importance_scores: List[np.ndarray], block_size: int, max_value: int, method: Callable) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Degrade video frames adaptively based on importance scores.
+    
+    Args:
+        frames: List of input frames
+        importance_scores: List of per-block importance scores
+        block_size: Block size for degradation
+        max_value: Maximum degradation level
+        method: Degradation method (downscale_block or blur_block)
+    
+    Returns:
+        degraded_frames: List of degraded frames
+        degradation_maps: List of per-frame degradation maps
+    """
+    degraded_frames = []
+    degradation_maps = []
+    
+    for frame, importance in zip(frames, importance_scores):
+        degradation_map = generate_degradation_map(importance, max_value)
+        degraded = degrade_frame(frame, degradation_map, block_size, method)
+        degraded_frames.append(degraded)
+        degradation_maps.append(degradation_map)
+    
+    return degraded_frames, degradation_maps
+
+
 
 
 # =============================================================================
@@ -1409,8 +1401,8 @@ if __name__ == "__main__":
 
     # ELVIS: stretch video frames back to original size
     print("Stretching video frames back to original size...")
-    stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size, method=stretch_frame_row_only)
-    stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind, config.block_size, method=stretch_frame_removal_indices)
+    stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size)
+    stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind, config.block_size)
 
     # ELVIS: inpaint removed regions
     print("Inpainting removed regions with OpenCV Telea...")
@@ -1426,10 +1418,10 @@ if __name__ == "__main__":
     # PRESLEY: create ROI files for Kvazaar and SVT-AV1
     print("Creating Kvazaar ROI file...")
     kvazaar_roi_path = experiment_folder / "kvazaar_roi.bin"
-    create_kvazaar_roi_file(importance_scores, str(kvazaar_roi_path), base_qp=config.kvazaar_base_qp, qp_range=config.kvazaar_qp_range)
+    create_kvazaar_roi_file(importance_scores, str(kvazaar_roi_path), base_qp=QUALITY_PRESETS[config.quality]["kvazaar_qp"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"])
     print("Creating SVT-AV1 ROI file...")
     svtav1_roi_path = experiment_folder / "svtav1_roi.txt"
-    create_svtav1_roi_file(importance_scores, str(svtav1_roi_path), base_crf=config.svtav1_base_crf, qp_range=config.svtav1_qp_range, width=video_width, height=video_height)
+    create_svtav1_roi_file(importance_scores, str(svtav1_roi_path), base_crf=QUALITY_PRESETS[config.quality]["svtav1_crf"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"], width=config.width, height=config.height)
 
     # PRESLEY: Initialize restoration models
     device = "cuda" if torch.cuda.is_available() else "cpu"
