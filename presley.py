@@ -858,6 +858,7 @@ def inpaint_with_opencv(frames: np.ndarray, masks: np.ndarray) -> np.ndarray:
     for i in range(num_frames):
         frame = frames[i]
         mask = masks[i].astype(np.uint8) * 255  # Convert boolean to uint8 mask
+        mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) # Resize masks to frame size
         inpainted_frame = cv2.inpaint(frame, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         inpainted.append(inpainted_frame)
     
@@ -876,6 +877,7 @@ def inpaint_with_propainter(frames: np.ndarray, masks: np.ndarray, model: ProPai
         fp16=config.propainter_fp16,
         device=torch.device(device)
     )
+    masks = [cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) for mask in masks] # Resize masks to frame size
     return model.inpaint(frames, masks, config=pp_config)
 
 
@@ -890,6 +892,7 @@ def inpaint_with_e2fgvi(frames: np.ndarray, masks: np.ndarray, model: E2FGVIMode
         mask_dilation=config.e2fgvi_mask_dilation,
         device=torch.device(device)
     )
+    masks = [cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST) for mask in masks] # Resize masks to frame size
     return model.inpaint(frames, masks, config=e2_config)
 
 
