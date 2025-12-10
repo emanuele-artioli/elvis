@@ -1024,8 +1024,6 @@ def degrade_video_adaptive(frames: List[np.ndarray], importance_scores: List[np.
     return degraded_frames, degradation_maps
 
 
-
-
 # =============================================================================
 # PRESLEY: Restoration Models
 # Restore degraded videos using neural super-resolution and image restoration.
@@ -1204,8 +1202,21 @@ def restore_with_opencv_unsharp(frames: List[np.ndarray], degradation_maps: np.n
 
 
 @measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
-def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], degradation_maps: List[np.ndarray], block_size: int = 16, **kwargs) -> List[np.ndarray]:
-    """Wrapper for restoration function that runs it multiple times in parallel, each time with different parameters based on degradation levels, then takes blocks restored at their respective levels and combines them."""
+def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], degradation_maps: List[np.ndarray], block_size: int = 16, model_loader: Callable = None, **kwargs) -> List[np.ndarray]:
+    """Wrapper for restoration function that runs it multiple times with different parameters based on degradation levels.
+    
+    Supports multi-GPU parallelization by creating model instances on different devices.
+    If model_loader is provided, creates separate model instances for parallel execution.
+    Otherwise, runs sequentially with the same model instance.
+    
+    Args:
+        restore_fn: Restoration function to call
+        frames: Input frames
+        degradation_maps: Per-frame degradation maps
+        block_size: Block size for combining results
+        model_loader: Optional function to create new model instances (device) -> model
+        **kwargs: Arguments to pass to restore_fn (must include model param like 'upsampler', 'runtime', etc.)
+    """
     if not frames:
         return []
         
@@ -1223,27 +1234,61 @@ def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], deg
     # Store restored versions per level
     restored_versions: Dict[float, List[np.ndarray]] = {}
     
-    def _restore_for_level(level: float) -> Tuple[float, List[np.ndarray]]:
-        # Modify kwargs to include current degradation level
+    # Determine available devices
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    devices = [f"cuda:{i}" for i in range(num_gpus)] if num_gpus > 0 else ["cpu"]
+    
+    # Function to process a single degradation level
+    def _restore_for_level(level: float, device_id: str) -> Tuple[float, List[np.ndarray]]:
         level_kwargs = kwargs.copy()
         level_kwargs['degradation_level'] = level
+        
+        # If model_loader provided, create new model instance on specified device
+        if model_loader is not None:
+            # Find the model parameter name in kwargs (upsampler, runtime, upscaler, etc.)
+            model_param_name = None
+            for key in ['upsampler', 'runtime', 'upscaler', 'model']:
+                if key in kwargs:
+                    model_param_name = key
+                    break
+            
+            if model_param_name:
+                # Create new model on specified device and replace in kwargs
+                level_kwargs[model_param_name] = model_loader(device_id)
+        
         result = restore_fn(frames=frames, **level_kwargs)
         
         # Handle both decorated (returns tuple) and non-decorated (returns frames) functions
         if isinstance(result, tuple) and len(result) == 2:
-            # Decorated function: (frames, metrics) - extract just the frames
             restored = result[0]
         else:
-            # Non-decorated function: just frames
             restored = result
         
+        # Clean up device-specific model if created
+        if model_loader is not None and model_param_name and model_param_name in level_kwargs:
+            del level_kwargs[model_param_name]
+            if device_id.startswith('cuda'):
+                torch.cuda.empty_cache()
+        
         return (level, restored)
-
-    # Run parallel restoration for each degradation level
-    with ThreadPoolExecutor(max_workers=len(unique_levels)) as executor:
-        futures = [executor.submit(_restore_for_level, level) for level in unique_levels]
-        for future in futures:
-            level, restored = future.result()
+    
+    # Run restoration - parallelize if multiple GPUs and model_loader provided
+    if model_loader is not None and num_gpus > 1:
+        print(f"    Using {num_gpus} GPUs for parallel restoration...")
+        with ThreadPoolExecutor(max_workers=min(len(unique_levels), num_gpus)) as executor:
+            futures = []
+            for i, level in enumerate(unique_levels):
+                device_id = devices[i % len(devices)]
+                futures.append(executor.submit(_restore_for_level, level, device_id))
+            
+            for future in futures:
+                level, restored = future.result()
+                restored_versions[level] = restored
+    else:
+        # Sequential execution (single GPU or no model_loader)
+        device_id = devices[0]
+        for level in unique_levels:
+            level, restored = _restore_for_level(level, device_id)
             restored_versions[level] = restored
 
     # Combine blocks from different restored versions based on degradation maps
@@ -1279,7 +1324,10 @@ def upscale_with_realesrgan(frames: List[np.ndarray], upsampler, **kwargs) -> Li
     """
     # Use degradation_level as outscale if provided
     outscale = int(kwargs.get('degradation_level', 4))
-    outscale = 1 if outscale == 0 else outscale  # Handle 0 level (no degradation) as 1x scale
+    
+    # If no degradation (level 0), return original frames
+    if outscale == 0:
+        return [frame.copy() for frame in frames]
     
     restored = []
     
@@ -1287,8 +1335,9 @@ def upscale_with_realesrgan(frames: List[np.ndarray], upsampler, **kwargs) -> Li
         h, w = frame.shape[:2]
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        # Upscale with adaptive or default scale
-        upscaled, _ = upsampler.enhance(frame_bgr, outscale=outscale)
+        # Upscale with adaptive or default scale - suppress tile progress output
+        with redirect_stdout(io.StringIO()):
+            upscaled, _ = upsampler.enhance(frame_bgr, outscale=outscale)
         result = cv2.resize(upscaled, (w, h), interpolation=cv2.INTER_LANCZOS4)
         result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
         
@@ -1324,6 +1373,10 @@ def restore_with_instantir(frames: List[np.ndarray], runtime, cfg: float = 7.0, 
     if 'degradation_level' in kwargs:
         cfg = float(kwargs['degradation_level'])
     
+    # If no degradation (level 0), return original frames
+    if cfg == 0:
+        return [frame.copy() for frame in frames]
+    
     restored = []
     num_frames = len(frames)
     
@@ -1331,7 +1384,7 @@ def restore_with_instantir(frames: List[np.ndarray], runtime, cfg: float = 7.0, 
         print(f"\r      InstantIR Naive: frame {i+1}/{num_frames}", end="", flush=True)
         
         # Process whole frame - send output to null to suppress logs, errors and warnings
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with redirect_stdout(io.StringIO()):
             result = restore_image(
                 runtime, frame,
                 cfg=cfg, preview_start=preview_start,
@@ -1367,6 +1420,10 @@ def upscale_with_uav(frames: List[np.ndarray], upscaler, noise_level: int = 120,
     if 'degradation_level' in kwargs:
         guidance_scale = float(kwargs['degradation_level'])
     
+    # If no degradation (level 0), return original frames
+    if guidance_scale == 0:
+        return [frame.copy() for frame in frames]
+    
     n_frames = len(frames)
     h, w = frames[0].shape[:2]
     
@@ -1374,12 +1431,14 @@ def upscale_with_uav(frames: List[np.ndarray], upscaler, noise_level: int = 120,
     restored = [None] * n_frames
     
     try:
-        upscaled = upscaler.upscale_frames(
-            frames, noise_level=noise_level,
-            guidance_scale=guidance_scale,
-            inference_steps=inference_steps,
-            output_format="numpy"
-        )
+        # Suppress tile progress output
+        with redirect_stdout(io.StringIO()):
+            upscaled = upscaler.upscale_frames(
+                frames, noise_level=noise_level,
+                guidance_scale=guidance_scale,
+                inference_steps=inference_steps,
+                output_format="numpy"
+            )
         for j, res in enumerate(upscaled):
             result = cv2.resize(res, (w, h), interpolation=cv2.INTER_LANCZOS4)
             restored[j] = result
@@ -1447,12 +1506,6 @@ if __name__ == "__main__":
     svtav1_roi_path = experiment_folder / "svtav1_roi.txt"
     create_svtav1_roi_file(importance_scores, str(svtav1_roi_path), base_crf=QUALITY_PRESETS[config.quality]["svtav1_crf"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"], width=config.width, height=config.height)
 
-    # PRESLEY: Initialize restoration models
-    print("Loading restoration models...")
-    realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
-    instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=device, torch_dtype=torch.float16)
-    uav_upscaler = UpscaleAVideo(device=device).load_models()
-
     # PRESLEY: Degrade video adaptively
     print("Degrading video adaptively...")
     downscaled_frames, downscaled_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=downscale_block)
@@ -1460,28 +1513,69 @@ if __name__ == "__main__":
 
     # PRESLEY: Comparing restoration methods naively and adaptively
     print("Restoring downscaled video adaptively with OpenCV Lanczos...")
-    restored_downscaled_opencv, performance_metrics['restore_opencv_lanczos_adaptive'] = restore_video_adaptively(restore_with_opencv_lanczos, downscaled_frames, downscaled_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    restored_downscaled_opencv, performance_metrics['lanczos_adaptive'] = restore_with_opencv_lanczos(downscaled_frames, downscaled_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
 
     print("Restoring blurred video adaptively with OpenCV Unsharp Masking...")
-    restored_blurred_opencv, performance_metrics['restore_opencv_unsharp_adaptive'] = restore_video_adaptively(restore_with_opencv_unsharp, blurred_frames, blurred_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    restored_blurred_opencv, performance_metrics['unsharp_adaptive'] = restore_with_opencv_unsharp(blurred_frames, blurred_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    
+    # RealESRGAN restoration
+    print("Loading RealESRGAN model...")
+    realesrgan_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(realesrgan_device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
     
     print("Restoring downscaled video naively with RealESRGAN...")
-    restored_downscaled_realesrgan_naive, performance_metrics['restore_realesrgan_naive'] = upscale_with_realesrgan(downscaled_frames, realesrgan_upsampler)
+    restored_downscaled_realesrgan_naive, performance_metrics['realesrgan_naive'] = upscale_with_realesrgan(downscaled_frames, realesrgan_upsampler)
+    
+    # Define model loader for parallel adaptive restoration
+    def load_realesrgan(device_id: str):
+        return create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(device_id), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
     
     print("Restoring downscaled video adaptively with RealESRGAN...")
-    restored_downscaled_realesrgan, performance_metrics['restore_realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, upsampler=realesrgan_upsampler)
+    restored_downscaled_realesrgan, performance_metrics['realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, model_loader=load_realesrgan, upsampler=realesrgan_upsampler)
+    
+    # Clean up RealESRGAN from VRAM
+    print("Cleaning up RealESRGAN from VRAM...")
+    del realesrgan_upsampler
+    torch.cuda.empty_cache()
+    
+    # InstantIR restoration
+    # NOTE: InstantIR uses lazy loading and can't be easily cloned to multiple devices
+    # Use single-GPU sequential execution instead
+    print("Loading InstantIR model...")
+    instantir_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=instantir_device, torch_dtype=torch.float16)
     
     print("Restoring blurred video naively with InstantIR...")
-    restored_blurred_instantir_naive, performance_metrics['restore_instantir_naive'] = restore_with_instantir(blurred_frames, instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_inference_steps)
+    restored_blurred_instantir_naive, performance_metrics['instantir_naive'] = restore_with_instantir(blurred_frames, instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
     
     print("Restoring blurred video adaptively with InstantIR...")
-    restored_blurred_instantir, performance_metrics['restore_instantir_adaptive'] = restore_video_adaptively(restore_with_instantir, blurred_frames, blurred_maps, block_size=config.block_size, runtime=instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_inference_steps)
+    # Don't pass model_loader to use sequential execution (InstantIR doesn't support cloning)
+    restored_blurred_instantir, performance_metrics['instantir_adaptive'] = restore_video_adaptively(restore_with_instantir, blurred_frames, blurred_maps, block_size=config.block_size, runtime=instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
+    
+    # Clean up InstantIR from VRAM
+    print("Cleaning up InstantIR from VRAM...")
+    del instantir_runtime
+    torch.cuda.empty_cache()
+    
+    # Upscale-A-Video restoration
+    print("Loading Upscale-A-Video model...")
+    uav_device = "cuda:2" if torch.cuda.device_count() > 2 else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    uav_upscaler = UpscaleAVideo(device=uav_device).load_models()
     
     print("Restoring downscaled video naively with Upscale-A-Video...")
-    restored_downscaled_uav_naive, performance_metrics['restore_uav_naive'] = upscale_with_uav(downscaled_frames, uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    restored_downscaled_uav_naive, performance_metrics['uav_naive'] = upscale_with_uav(downscaled_frames, uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    
+    # Define model loader for parallel adaptive restoration
+    def load_uav(device_id: str):
+        return UpscaleAVideo(device=device_id).load_models()
     
     print("Restoring downscaled video adaptively with Upscale-A-Video...")
-    restored_downscaled_uav, performance_metrics['restore_uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    restored_downscaled_uav, performance_metrics['uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, model_loader=load_uav, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    
+    # Clean up UAV from VRAM
+    print("Cleaning up Upscale-A-Video from VRAM...")
+    del uav_upscaler
+    torch.cuda.empty_cache()
     
     # Save performance metrics to JSON
     print("\nSaving performance metrics...")
