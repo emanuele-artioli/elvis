@@ -109,6 +109,7 @@ class PresleyConfig:
     uav_inference_steps: int = 10  # Reduced for faster testing
     uav_chunk_size: int = 4  # Reduced from 8 for faster testing
     uav_chunk_overlap: int = 1  # Reduced from 2
+    save_intermediate: bool = True  # Whether to save intermediate frames for analysis
 
 
 #TODO: create class frames, with numpy frames and metadata, so functions can get it in I/O and decorator can check for that instead of assuming list of np.ndarray.
@@ -163,6 +164,14 @@ def calculate_importance_scores(frames: List[np.ndarray], block_size: int, alpha
     return [importance[i] for i in range(len(importance))]
 
 
+def save_frames(frames: List[np.ndarray], output_folder: Path) -> None:
+    """Save frames as PNG images."""
+    output_folder.mkdir(parents=True, exist_ok=True)
+    for i, frame in enumerate(frames):
+        frame_path = output_folder / f"frame_{i:05d}.png"
+        cv2.imwrite(str(frame_path), frame)
+
+
 # Global config instance
 config = PresleyConfig()
 
@@ -200,6 +209,11 @@ evca = analyze_frames(np.array(reference_frames), EVCAConfig(block_size=config.b
 ufo_masks = segment_frames(np.array(reference_frames), device="cuda" if torch.cuda.is_available() else "cpu")
 ufo_masks = np.array([cv2.resize(m.astype(np.float32), (config.width // config.block_size, config.height // config.block_size), interpolation=cv2.INTER_NEAREST) for m in ufo_masks])
 importance_scores = calculate_importance_scores(reference_frames, config.block_size, config.alpha, config.beta, evca, ufo_masks)
+if config.save_intermediate:
+    save_frames(evca.SC.astype(np.uint8), experiment_folder / "spatial_complexity")
+    save_frames(evca.TC.astype(np.uint8), experiment_folder / "temporal_complexity")
+    save_frames((ufo_masks * 255).astype(np.uint8), experiment_folder / "ufo_masks")
+    save_frames((np.array(importance_scores) * 255).astype(np.uint8), experiment_folder / "importance_scores")
 
 
 # =============================================================================
@@ -420,14 +434,6 @@ def load_frames(video_path: str, width: int, height: int) -> List[np.ndarray]:
     process.stdout.close()
     process.wait()
     return frames
-
-
-def save_frames(frames: List[np.ndarray], output_folder: Path) -> None:
-    """Save frames as PNG images."""
-    output_folder.mkdir(parents=True, exist_ok=True)
-    for i, frame in enumerate(frames):
-        frame_path = output_folder / f"frame_{i:05d}.png"
-        cv2.imwrite(str(frame_path), frame)
 
 
 def encode_video(frames: List[np.ndarray], output_path: str, quality: str = "medium", qp_range: int = None, importance_scores: Optional[List[np.ndarray]] = None, encoder: str = "kvazaar") -> None:
@@ -1202,19 +1208,14 @@ def restore_with_opencv_unsharp(frames: List[np.ndarray], degradation_maps: np.n
 
 
 @measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
-def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], degradation_maps: List[np.ndarray], block_size: int = 16, model_loader: Callable = None, **kwargs) -> List[np.ndarray]:
-    """Wrapper for restoration function that runs it multiple times with different parameters based on degradation levels.
-    
-    Supports multi-GPU parallelization by creating model instances on different devices.
-    If model_loader is provided, creates separate model instances for parallel execution.
-    Otherwise, runs sequentially with the same model instance.
+def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], degradation_maps: List[np.ndarray], block_size: int = 16, **kwargs) -> List[np.ndarray]:
+    """Sequential restoration that processes each degradation level one at a time.
     
     Args:
         restore_fn: Restoration function to call
         frames: Input frames
         degradation_maps: Per-frame degradation maps
         block_size: Block size for combining results
-        model_loader: Optional function to create new model instances (device) -> model
         **kwargs: Arguments to pass to restore_fn (must include model param like 'upsampler', 'runtime', etc.)
     """
     if not frames:
@@ -1234,27 +1235,10 @@ def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], deg
     # Store restored versions per level
     restored_versions: Dict[float, List[np.ndarray]] = {}
     
-    # Determine available devices
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    devices = [f"cuda:{i}" for i in range(num_gpus)] if num_gpus > 0 else ["cpu"]
-    
-    # Function to process a single degradation level
-    def _restore_for_level(level: float, device_id: str) -> Tuple[float, List[np.ndarray]]:
+    # Process each degradation level sequentially
+    for level in unique_levels:
         level_kwargs = kwargs.copy()
         level_kwargs['degradation_level'] = level
-        
-        # If model_loader provided, create new model instance on specified device
-        if model_loader is not None:
-            # Find the model parameter name in kwargs (upsampler, runtime, upscaler, etc.)
-            model_param_name = None
-            for key in ['upsampler', 'runtime', 'upscaler', 'model']:
-                if key in kwargs:
-                    model_param_name = key
-                    break
-            
-            if model_param_name:
-                # Create new model on specified device and replace in kwargs
-                level_kwargs[model_param_name] = model_loader(device_id)
         
         result = restore_fn(frames=frames, **level_kwargs)
         
@@ -1264,32 +1248,7 @@ def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], deg
         else:
             restored = result
         
-        # Clean up device-specific model if created
-        if model_loader is not None and model_param_name and model_param_name in level_kwargs:
-            del level_kwargs[model_param_name]
-            if device_id.startswith('cuda'):
-                torch.cuda.empty_cache()
-        
-        return (level, restored)
-    
-    # Run restoration - parallelize if multiple GPUs and model_loader provided
-    if model_loader is not None and num_gpus > 1:
-        print(f"    Using {num_gpus} GPUs for parallel restoration...")
-        with ThreadPoolExecutor(max_workers=min(len(unique_levels), num_gpus)) as executor:
-            futures = []
-            for i, level in enumerate(unique_levels):
-                device_id = devices[i % len(devices)]
-                futures.append(executor.submit(_restore_for_level, level, device_id))
-            
-            for future in futures:
-                level, restored = future.result()
-                restored_versions[level] = restored
-    else:
-        # Sequential execution (single GPU or no model_loader)
-        device_id = devices[0]
-        for level in unique_levels:
-            level, restored = _restore_for_level(level, device_id)
-            restored_versions[level] = restored
+        restored_versions[level] = restored
 
     # Combine blocks from different restored versions based on degradation maps
     final_frames = []
@@ -1460,26 +1419,36 @@ if __name__ == "__main__":
     # Dictionary to store all performance metrics
     performance_metrics = {}
 
-    # Encode baseline videos
+    # Encode baseline videos and measure performance
     print("Encoding baseline videos...")
     encode_video(reference_frames, f"{experiment_folder}/kvazaar.mp4", config.quality, config.qp_range, encoder="kvazaar")
     encode_video(reference_frames, f"{experiment_folder}/svtav1.mp4", config.quality, config.qp_range, encoder="svtav1")
+    baseline_frames_kvazaar, performance_metrics['kvazaar_baseline'] = load_frames(f"{experiment_folder}/kvazaar.mp4", config.width, config.height)
+    baseline_frames_svtav1, performance_metrics['svtav1_baseline'] = load_frames(f"{experiment_folder}/svtav1.mp4", config.width, config.height)
 
     # ELVIS: shrink video frames
     print("Shrinking video frames...")
     shrunk_frames_row_only, masks_row_only = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_row_only)
     shrunk_frames_rem_ind, masks_rem_ind = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_removal_indices)
+    if config.save_intermediate:
+        encode_video(shrunk_frames_row_only, experiment_folder / "shrunk_row_only.mp4", "lossless", encoder="svtav1")
+        encode_video(shrunk_frames_rem_ind, experiment_folder / "shrunk_removal_indices.mp4", "lossless", encoder="svtav1")
 
     # Convert removal_indices to boolean masks (masks_row_only are already boolean)
     print("Converting removal indices to masks...")
     orig_blocks_y = config.height // config.block_size
     orig_blocks_x = config.width // config.block_size
     masks_rem_ind_bool = [_removal_indices_to_mask(rm, orig_blocks_y, orig_blocks_x) for rm in masks_rem_ind]
+    if config.save_intermediate:
+        save_frames([(m * 255).astype(np.uint8) for m in masks_rem_ind_bool], experiment_folder / "masks_removal_indices")
 
     # ELVIS: stretch video frames back to original size
     print("Stretching video frames back to original size...")
     stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size)
     stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind_bool, config.block_size)
+    if config.save_intermediate:
+        encode_video(stretched_frames_row_only, experiment_folder / "stretched_row_only.mp4", "lossless", encoder="svtav1")
+        encode_video(stretched_frames_rem_ind, experiment_folder / "stretched_removal_indices.mp4", "lossless", encoder="svtav1")
 
     # Initialize inpainting models
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1497,41 +1466,52 @@ if __name__ == "__main__":
     print("Inpainting removed regions with E2FGVI...")
     inpainted_frames_row_only_e2fgvi, performance_metrics['inpaint_row_only_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_row_only), np.array(masks_row_only), model=e2fgvi_model, device=device)
     inpainted_frames_rem_ind_e2fgvi, performance_metrics['inpaint_rem_ind_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool), model=e2fgvi_model, device=device)
+    if config.save_intermediate:
+        encode_video(inpainted_frames_row_only_telea, experiment_folder / "inpainted_row_only_telea.mp4", "lossless", encoder="svtav1")
+        encode_video(inpainted_frames_rem_ind_telea, experiment_folder / "inpainted_rem_ind_telea.mp4", "lossless", encoder="svtav1")
+        encode_video(inpainted_frames_row_only_propainter, experiment_folder / "inpainted_row_only_propainter.mp4", "lossless", encoder="svtav1")
+        encode_video(inpainted_frames_rem_ind_propainter, experiment_folder / "inpainted_rem_ind_propainter.mp4", "lossless", encoder="svtav1")
+        encode_video(inpainted_frames_row_only_e2fgvi, experiment_folder / "inpainted_row_only_e2fgvi.mp4", "lossless", encoder="svtav1")
+        encode_video(inpainted_frames_rem_ind_e2fgvi, experiment_folder / "inpainted_rem_ind_e2fgvi.mp4", "lossless", encoder="svtav1")
 
-    # PRESLEY: create ROI files for Kvazaar and SVT-AV1
-    print("Creating Kvazaar ROI file...")
-    kvazaar_roi_path = experiment_folder / "kvazaar_roi.bin"
-    create_kvazaar_roi_file(importance_scores, str(kvazaar_roi_path), base_qp=QUALITY_PRESETS[config.quality]["kvazaar_qp"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"])
-    print("Creating SVT-AV1 ROI file...")
-    svtav1_roi_path = experiment_folder / "svtav1_roi.txt"
-    create_svtav1_roi_file(importance_scores, str(svtav1_roi_path), base_crf=QUALITY_PRESETS[config.quality]["svtav1_crf"], qp_range=config.qp_range or QUALITY_PRESETS[config.quality]["qp_range"], width=config.width, height=config.height)
+    # PRESLEY: Encode videos with ROI-based quality control
+    print("Encoding video with Kvazaar ROI...")
+    encode_video(reference_frames, f"{experiment_folder}/kvazaar_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="kvazaar")
+    roi_frames_kvazaar, performance_metrics['kvazaar_roi'] = load_frames(f"{experiment_folder}/kvazaar_roi.mp4", config.width, config.height)
+    print("Encoding video with SVT-AV1 ROI...")
+    encode_video(reference_frames, f"{experiment_folder}/svtav1_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="svtav1")
+    roi_frames_svtav1, performance_metrics['svtav1_roi'] = load_frames(f"{experiment_folder}/svtav1_roi.mp4", config.width, config.height)
 
     # PRESLEY: Degrade video adaptively
     print("Degrading video adaptively...")
     downscaled_frames, downscaled_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=downscale_block)
     blurred_frames, blurred_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=blur_block)
+    if config.save_intermediate:
+        encode_video(downscaled_frames, experiment_folder / "downscaled_adaptive.mp4", "lossless", encoder="svtav1")
+        encode_video(blurred_frames, experiment_folder / "blurred_adaptive.mp4", "lossless", encoder="svtav1")
+        save_frames(downscaled_maps, experiment_folder / "downscaled_maps")
+        save_frames(blurred_maps, experiment_folder / "blurred_maps")
 
     # PRESLEY: Comparing restoration methods naively and adaptively
     print("Restoring downscaled video adaptively with OpenCV Lanczos...")
     restored_downscaled_opencv, performance_metrics['lanczos_adaptive'] = restore_with_opencv_lanczos(downscaled_frames, downscaled_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
-
     print("Restoring blurred video adaptively with OpenCV Unsharp Masking...")
     restored_blurred_opencv, performance_metrics['unsharp_adaptive'] = restore_with_opencv_unsharp(blurred_frames, blurred_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    if config.save_intermediate:
+        encode_video(restored_downscaled_opencv, experiment_folder / "restored_downscaled_opencv.mp4", "lossless", encoder="svtav1")
+        encode_video(restored_blurred_opencv, experiment_folder / "restored_blurred_opencv.mp4", "lossless", encoder="svtav1")
     
     # RealESRGAN restoration
     print("Loading RealESRGAN model...")
     realesrgan_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(realesrgan_device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
-    
     print("Restoring downscaled video naively with RealESRGAN...")
     restored_downscaled_realesrgan_naive, performance_metrics['realesrgan_naive'] = upscale_with_realesrgan(downscaled_frames, realesrgan_upsampler)
-    
-    # Define model loader for parallel adaptive restoration
-    def load_realesrgan(device_id: str):
-        return create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(device_id), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
-    
     print("Restoring downscaled video adaptively with RealESRGAN...")
-    restored_downscaled_realesrgan, performance_metrics['realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, model_loader=load_realesrgan, upsampler=realesrgan_upsampler)
+    restored_downscaled_realesrgan, performance_metrics['realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, upsampler=realesrgan_upsampler)
+    if config.save_intermediate:
+        encode_video(restored_downscaled_realesrgan_naive, experiment_folder / "restored_downscaled_realesrgan_naive.mp4", "lossless", encoder="svtav1")
+        encode_video(restored_downscaled_realesrgan, experiment_folder / "restored_downscaled_realesrgan_adaptive.mp4", "lossless", encoder="svtav1")
     
     # Clean up RealESRGAN from VRAM
     print("Cleaning up RealESRGAN from VRAM...")
@@ -1539,18 +1519,16 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     
     # InstantIR restoration
-    # NOTE: InstantIR uses lazy loading and can't be easily cloned to multiple devices
-    # Use single-GPU sequential execution instead
     print("Loading InstantIR model...")
     instantir_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if torch.cuda.is_available() else "cpu")
     instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=instantir_device, torch_dtype=torch.float16)
-    
     print("Restoring blurred video naively with InstantIR...")
     restored_blurred_instantir_naive, performance_metrics['instantir_naive'] = restore_with_instantir(blurred_frames, instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
-    
     print("Restoring blurred video adaptively with InstantIR...")
-    # Don't pass model_loader to use sequential execution (InstantIR doesn't support cloning)
     restored_blurred_instantir, performance_metrics['instantir_adaptive'] = restore_video_adaptively(restore_with_instantir, blurred_frames, blurred_maps, block_size=config.block_size, runtime=instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
+    if config.save_intermediate:
+        encode_video(restored_blurred_instantir_naive, experiment_folder / "restored_blurred_instantir_naive.mp4", "lossless", encoder="svtav1")
+        encode_video(restored_blurred_instantir, experiment_folder / "restored_blurred_instantir_adaptive.mp4", "lossless", encoder="svtav1")
     
     # Clean up InstantIR from VRAM
     print("Cleaning up InstantIR from VRAM...")
@@ -1560,22 +1538,31 @@ if __name__ == "__main__":
     # Upscale-A-Video restoration
     print("Loading Upscale-A-Video model...")
     uav_device = "cuda:2" if torch.cuda.device_count() > 2 else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    uav_upscaler = UpscaleAVideo(device=uav_device).load_models()
-    
+    uav_upscaler = UpscaleAVideo(device=uav_device)
+    uav_upscaler.load_models()
     print("Restoring downscaled video naively with Upscale-A-Video...")
     restored_downscaled_uav_naive, performance_metrics['uav_naive'] = upscale_with_uav(downscaled_frames, uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
-    
-    # Define model loader for parallel adaptive restoration
-    def load_uav(device_id: str):
-        return UpscaleAVideo(device=device_id).load_models()
-    
     print("Restoring downscaled video adaptively with Upscale-A-Video...")
-    restored_downscaled_uav, performance_metrics['uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, model_loader=load_uav, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    restored_downscaled_uav, performance_metrics['uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    if config.save_intermediate:
+        encode_video(restored_downscaled_uav_naive, experiment_folder / "restored_downscaled_uav_naive.mp4", "lossless", encoder="svtav1")
+        encode_video(restored_downscaled_uav, experiment_folder / "restored_downscaled_uav_adaptive.mp4", "lossless", encoder="svtav1")
     
     # Clean up UAV from VRAM
     print("Cleaning up Upscale-A-Video from VRAM...")
     del uav_upscaler
     torch.cuda.empty_cache()
+
+    # Final reporting
+    print("\nExperiment completed. Performance metrics:")
+    for method, metrics in performance_metrics.items():
+        print(f"  {method}:")
+        print(f"    Execution Speed: {metrics['execution_speed']:.2f} FPS")
+        print(f"    Overall SSIM: {metrics['overall_ssim']:.4f}")
+        print(f"    Foreground SSIM: {metrics['foreground_ssim']:.4f}")
+        print(f"    Background SSIM: {metrics['background_ssim']:.4f}")
+        if metrics['status'] != "success":
+            print(f"    Status: {metrics['status']} - Error: {metrics['error']}")
     
     # Save performance metrics to JSON
     print("\nSaving performance metrics...")
