@@ -16,8 +16,6 @@ import torch
 from evca import analyze_frames, EVCAConfig
 from ufo import segment_frames
 
-# from utils import *
-
 from propainter import ProPainterModel, InpaintingConfig as ProPainterConfig
 from e2fgvi import E2FGVIModel, InpaintingConfig as E2FGVIConfig
 from realesrgan import create_upsampler
@@ -32,6 +30,7 @@ import json
 import io
 import warnings
 import logging
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple, Callable, Dict, Any
 from dataclasses import dataclass
@@ -44,6 +43,11 @@ import numpy as np
 import cv2
 import torch
 import pytorch_msssim
+import lpips
+from fvmd.datasets.video_datasets import VideoDataset
+from fvmd.keypoint_tracking import track_keypoints
+from fvmd.extract_motion_features import calc_hist
+from fvmd.frechet_distance import calculate_fd_given_vectors
 
 
 # =============================================================================
@@ -65,7 +69,7 @@ class PresleyConfig:
     reference_video: str = "/home/itec/emanuele/Datasets/DAVIS/avc_encoded/bear.mp4"
     width: int = 1280  # Reduced for faster testing (was 1280)
     height: int = 720  # Reduced for faster testing (was 720)
-    max_frames: int = 5  # Limit frames for testing (None = all frames)
+    max_frames: int = 10  # Limit frames for testing (None = all frames)
     framerate: float = None  # Auto-detected from reference video
     quality: str = "low"  # Quality preset (see QUALITY_PRESETS) - best efficiency
     qp_range: int = None  # Auto-set from quality preset, or override manually
@@ -220,123 +224,245 @@ if config.save_intermediate:
 # Performance Functions 
 # =============================================================================
 
-def calculate_block_ssim(frames1: List[np.ndarray], frames2: List[np.ndarray], block_size: int, device: str = "cuda" if torch.cuda.is_available() else "cpu") -> List[np.ndarray]:
-    """Calculate per-block SSIM between two frame sequences using GPU."""
-    ssim_maps = []
-    
-    for f1, f2 in zip(frames1, frames2):
-        h, w = f1.shape[:2]
-        blocks_y, blocks_x = h // block_size, w // block_size
-        
-        # Crop to block boundaries and convert to tensors
-        f1_crop = f1[:blocks_y * block_size, :blocks_x * block_size]
-        f2_crop = f2[:blocks_y * block_size, :blocks_x * block_size]
-        
-        t1 = torch.from_numpy(f1_crop.copy()).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
-        t2 = torch.from_numpy(f2_crop.copy()).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
-        
-        # Extract blocks using unfold
-        patches1 = t1.unfold(2, block_size, block_size).unfold(3, block_size, block_size)
-        patches2 = t2.unfold(2, block_size, block_size).unfold(3, block_size, block_size)
-        
-        c = patches1.shape[1]
-        patches1 = patches1.permute(0, 2, 3, 1, 4, 5).reshape(-1, c, block_size, block_size)
-        patches2 = patches2.permute(0, 2, 3, 1, 4, 5).reshape(-1, c, block_size, block_size)
-        
-        # Compute SSIM per block in batches
-        num_blocks = patches1.shape[0]
-        ssim_values = torch.zeros(num_blocks, device=device)
-        batch_size = min(256, num_blocks)
-        
-        for i in range(0, num_blocks, batch_size):
-            end = min(i + batch_size, num_blocks)
-            ssim_values[i:end] = pytorch_msssim.ssim(patches1[i:end], patches2[i:end], data_range=1.0, size_average=False)
-        ssim_maps.append(ssim_values.reshape(blocks_y, blocks_x).cpu().numpy())
-    
-    return ssim_maps
+def convert_frames_to_yuv420p(frames: List[np.ndarray]) -> bytes:
+    """Convert a list of RGB frames to YUV420p byte format."""
+    yuv_bytes = io.BytesIO()
+    for frame in frames:
+        yuv_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2YUV_I420)
+        yuv_bytes.write(yuv_frame.tobytes())
+    return yuv_bytes.getvalue()
 
 
-def compute_fg_bg_ssim(ssim_maps: List[np.ndarray], foreground_masks: np.ndarray, fg_threshold: float = 0.5) -> Tuple[float, float, float]:
-    """Compute foreground/background SSIM from pre-calculated block SSIM maps.
+def calculate_frame_mse(reference_frames: List[np.ndarray], distorted_frames: List[np.ndarray]) -> List[float]:
+    """Calculate per-frame MSE between two frame sequences."""
+    mse_values = []
+    for f1, f2 in zip(reference_frames, distorted_frames):
+        mse = np.mean((f1.astype(np.float32) - f2.astype(np.float32)) ** 2)
+        mse_values.append(mse)
+    return mse_values
+
+
+def calculate_frame_psnr(reference_frames: List[np.ndarray], distorted_frames: List[np.ndarray], data_range: float = 255.0) -> List[float]:
+    """Calculate per-frame PSNR between two frame sequences."""
+    psnr_values = []
+    for f1, f2 in zip(reference_frames, distorted_frames):
+        mse = np.mean((f1.astype(np.float32) - f2.astype(np.float32)) ** 2)
+        if mse == 0:
+            psnr = float('inf')
+        else:
+            psnr = 10 * np.log10((data_range ** 2) / mse)
+        psnr_values.append(psnr)
+    return psnr_values
+
+
+def calculate_frame_ssim(reference_frames: List[np.ndarray], distorted_frames: List[np.ndarray], data_range: float = 255.0) -> List[float]:
+    """Calculate per-frame SSIM between two frame sequences."""
+    ssim_values = []
+    for f1, f2 in zip(reference_frames, distorted_frames):
+        ssim = pytorch_msssim.ssim(
+            torch.from_numpy(f1.copy()).permute(2, 0, 1).unsqueeze(0).float() / data_range,
+            torch.from_numpy(f2.copy()).permute(2, 0, 1).unsqueeze(0).float() / data_range,
+            data_range=1.0,
+            size_average=True
+        ).item()
+        ssim_values.append(ssim)
+    return ssim_values
+
+
+def calculate_frame_vmaf(reference_frames: List[np.ndarray], distorted_frames: List[np.ndarray], model_path: Optional[str] = None) -> List[float]:
+    """
+    Calculate VMAF (Video Multimethod Assessment Fusion) using the standalone vmaf command-line tool.
+    Args:
+        reference_frames: List of reference frames (numpy arrays)
+        distorted_frames: List of distorted frames (numpy arrays)
+        model_path: Optional path to VMAF model file
+    Returns:
+        List of VMAF scores per frame
+    """
+
+    height, width = reference_frames[0].shape[:2]
     
-    Uses output from calculate_block_ssim (GPU-accelerated) to efficiently
-    compute separate metrics for foreground and background regions.
+    # Save frames data to temporary YUV files
+    temp_ref_yuv = None
+    temp_dist_yuv = None
+
+    with tempfile.NamedTemporaryFile(mode='wb+', suffix='.yuv', delete=False) as temp_ref:
+        temp_ref.write(convert_frames_to_yuv420p(reference_frames))
+        temp_ref_yuv = temp_ref.name
+
+    with tempfile.NamedTemporaryFile(mode='wb+', suffix='.yuv', delete=False) as temp_dist:
+        temp_dist.write(convert_frames_to_yuv420p(distorted_frames))
+        temp_dist_yuv = temp_dist.name
+
+    # Create a temporary file for the JSON output
+    with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as temp_file:
+        output_json = temp_file.name
     
-    ELVIS/PRESLEY's goal is to preserve foreground quality while degrading background
-    to save bitrate, then restore background on the client. This metric helps evaluate
-    how well this strategy works.
+    # Build the vmaf command
+    vmaf_cmd = [
+        '/opt/local/bin/vmaf',
+        '-r', temp_ref_yuv,
+        '-d', temp_dist_yuv,
+        '-w', str(width),
+        '-h', str(height),
+        '-p', '420',
+        '-b', '8',
+        '--json',
+        '-o', output_json
+    ]
+        
+    # Add model path if provided
+    if model_path:
+        vmaf_cmd.extend(['--model', model_path])
+        
+    # Run the vmaf command
+    result = subprocess.run(vmaf_cmd, capture_output=True, text=True, check=True)
+        
+    # Read and parse the JSON output
+    with open(output_json, 'r') as f:
+        vmaf_data = json.load(f)
+        
+    # Cleanup temporary files
+    os.unlink(temp_ref_yuv)
+    os.unlink(temp_dist_yuv)
+    os.unlink(output_json)
+
+    # Extract VMAF scores
+    vmaf_scores = []
+    for frame_data in vmaf_data['frames']:
+        score = frame_data['metrics']['vmaf']
+        vmaf_scores.append(score)
+    
+    return vmaf_scores
+
+
+def calculate_frame_lpips(reference_frames: List[np.ndarray], decoded_frames: List[np.ndarray], model: lpips.LPIPS) -> List[float]:
+    """Calculate LPIPS over an aligned list of frame pairs."""
+
+    if len(reference_frames) == 0 or len(decoded_frames) == 0:
+        return []
+
+    lpips_model = model
+    model_device = next(model.parameters()).device
+
+    lpips_scores: List[float] = []
+
+    with torch.no_grad():
+        for ref_frame, dec_frame in zip(reference_frames, decoded_frames):
+            if ref_frame is None or dec_frame is None:
+                continue
+
+            ref_rgb = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2RGB)
+            dec_rgb = cv2.cvtColor(dec_frame, cv2.COLOR_BGR2RGB)
+
+            ref_tensor = torch.from_numpy(np.ascontiguousarray(ref_rgb)).permute(2, 0, 1).unsqueeze(0).float()
+            dec_tensor = torch.from_numpy(np.ascontiguousarray(dec_rgb)).permute(2, 0, 1).unsqueeze(0).float()
+
+            ref_tensor = ref_tensor.to(model_device) / 127.5 - 1.0
+            dec_tensor = dec_tensor.to(model_device) / 127.5 - 1.0
+
+            lpips_score = lpips_model(ref_tensor, dec_tensor).item()
+            lpips_scores.append(lpips_score)
+
+    return lpips_scores
+
+
+def calculate_fvmd(reference_frames: List[np.ndarray], distorted_frames: List[np.ndarray], stride: int = 1, max_frames: Optional[int] = None, device: Optional[int] = None, verbose: bool = False ) -> Tuple[float, float]:
+    """Calculate FVMD (Fréchet Video Motion Distance) score.
     
     Args:
-        ssim_maps: Per-block SSIM maps from calculate_block_ssim (list of 2D arrays)
-        foreground_masks: Per-block foreground masks, shape (num_frames, blocks_y, blocks_x)
-                         Values in [0, 1] where 1=foreground, 0=background
-        fg_threshold: Threshold to classify blocks as foreground (default 0.5)
+        reference_frames: Reference frames (RGB)
+        distorted_frames: Distorted frames (RGB)
+        stride: Frame sampling stride
+        max_frames: Maximum number of frames to use
+        device: GPU device ID
+        verbose: Print verbose output
     
     Returns:
-        Tuple of (overall_ssim, foreground_ssim, background_ssim)
+        Tuple of (fvmd_mean, fvmd_std)
     """
-    all_ssim = []
-    fg_ssim = []
-    bg_ssim = []
-    
-    for i, ssim_map in enumerate(ssim_maps):
-        fg_mask = foreground_masks[i] if i < len(foreground_masks) else foreground_masks[0]
+    try:
+        # Sample frames
+        num_frames = min(len(reference_frames), len(distorted_frames))
+        frame_indices = list(range(0, num_frames, stride))
+        if max_frames is not None and len(frame_indices) > max_frames:
+            frame_indices = frame_indices[:max_frames]
         
-        # Resize mask to match SSIM map if shapes don't match
-        if fg_mask.shape != ssim_map.shape:
-            fg_mask = cv2.resize(fg_mask.astype(np.float32), (ssim_map.shape[1], ssim_map.shape[0]), interpolation=cv2.INTER_NEAREST)
+        if len(frame_indices) < 10:
+            if verbose:
+                print("FVMD requires at least 10 frames")
+            return 0.0, 0.0
         
-        # Classify blocks as foreground or background
-        is_foreground = fg_mask >= fg_threshold
-        is_background = ~is_foreground
-        
-        # Collect SSIM values by region
-        all_ssim.extend(ssim_map.flatten())
-        if is_foreground.any():
-            fg_ssim.extend(ssim_map[is_foreground])
-        if is_background.any():
-            bg_ssim.extend(ssim_map[is_background])
+        # Create temporary directories for frames
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gt_root = tmp_path / "gt"
+            gen_root = tmp_path / "gen"
+            clip_name = "clip_0001"
+            gt_clip = gt_root / clip_name
+            gen_clip = gen_root / clip_name
+            gt_clip.mkdir(parents=True, exist_ok=True)
+            gen_clip.mkdir(parents=True, exist_ok=True)
+            
+            # Write frames
+            for idx, frame_idx in enumerate(frame_indices, start=1):
+                ref_frame = reference_frames[frame_idx]
+                dist_frame = distorted_frames[frame_idx]
+                
+                # Convert RGB to BGR for cv2.imwrite
+                ref_bgr = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2BGR)
+                dist_bgr = cv2.cvtColor(dist_frame, cv2.COLOR_RGB2BGR)
+                
+                cv2.imwrite(str(gt_clip / f"{idx:05d}.png"), ref_bgr)
+                cv2.imwrite(str(gen_clip / f"{idx:05d}.png"), dist_bgr)
+            
+            # Calculate FVMD
+            logs_root_path = tmp_path / "fvmd_logs"
+            logs_root_path.mkdir(parents=True, exist_ok=True)
+            run_log_dir = logs_root_path / f"run_{uuid.uuid4().hex}"
+            run_log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Track keypoints and extract motion features
+            gt_dataset = VideoDataset(str(gt_root))
+            gen_dataset = VideoDataset(str(gen_root))
+            
+            # track_keypoints signature: (log_dir, gen_dataset, gt_dataset, ...)
+            # Returns: (all_velo_gen, all_velo_gt, all_acc_gen, all_acc_gt)
+            device_ids = [device] if device is not None else [0]
+            all_velo_gen, all_velo_gt, all_acc_gen, all_acc_gt = track_keypoints(str(run_log_dir), gen_dataset, gt_dataset, device_ids=device_ids)
+            
+            # calc_hist expects velocity and acceleration arrays
+            gt_features = calc_hist(all_velo_gt)
+            gen_features = calc_hist(all_velo_gen)
+            
+            # Calculate Fréchet distance (returns single value, not tuple)
+            fvmd_value = calculate_fd_given_vectors(gt_features, gen_features)
+            
+            return float(fvmd_value), 0.0
     
-    overall = float(np.mean(all_ssim)) if all_ssim else 0.0
-    fg = float(np.mean(fg_ssim)) if fg_ssim else overall  # Default to overall if no FG
-    bg = float(np.mean(bg_ssim)) if bg_ssim else overall  # Default to overall if no BG
-    
-    return overall, fg, bg
+    except Exception as e:
+        if verbose:
+            print(f"Error calculating FVMD: {e}")
+        return 0.0, 0.0
 
 
-def measure_performance(reference_frames: List[np.ndarray], foreground_masks: Optional[np.ndarray] = None, block_size: int = 16) -> Callable:
+def calculate_frame_fvmd(reference_frames: List[np.ndarray], decoded_frames: List[np.ndarray], device: Optional[int] = None, verbose: bool = False) -> float:
+    """Calculate FVMD between two frame sequences."""
+    fvmd_value, _ = calculate_fvmd(
+        reference_frames,
+        decoded_frames,
+        device=device,
+        verbose=verbose,
+    )
+    return fvmd_value
+
+
+def measure_performance(reference_frames: List[np.ndarray], foreground_masks: Optional[np.ndarray] = None, metrics_to_exclude: List[Callable] = None) -> Callable:
     """Decorator to measure performance of functions that return frames.
     
-    Measures execution speed (in fps) and computes SSIM metrics by comparing output frames
-    with reference frames. The decorated function returns a tuple of
-    (original_result, performance_metrics).
-    
-    Args:
-        reference_frames: Ground truth frames for comparison
-        foreground_masks: Optional per-block foreground masks for FG/BG SSIM
-                         Shape: (num_frames, blocks_y, blocks_x)
-        block_size: Block size for SSIM calculation
-    
-    Returns:
-        Decorator that wraps the function to return (result, metrics) tuple
-        where metrics contains:
-            - execution_speed: Execution speed in frames per second (fps)
-            - result_frames: Output frames from the function
-            - block_ssim_maps: Per-block SSIM maps
-            - overall_ssim: Mean SSIM across all blocks
-            - foreground_ssim: Mean SSIM for foreground blocks
-            - background_ssim: Mean SSIM for background blocks
-            - status: "success" or "error"
-            - error: Error message if failed
-    
-    Example:
-        @measure_performance(reference_frames, ufo_masks, block_size=16)
-        def restore_frames(frames, **kwargs):
-            return restored_frames
-        
-        result, metrics = restore_frames(degraded_frames, param=value)
-        print(f"Speed: {metrics['execution_speed']:.2f} fps, SSIM: {metrics['overall_ssim']:.4f}")
-    """
+    Measures execution speed (in fps) and computes various metrics (MSE, PSNR, SSIM, VMAF, LPIPS, FVMD)
+    by comparing output frames with reference frames. The decorated function returns a tuple of
+    (original_result, performance_metrics)."""
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Tuple[Any, Dict[str, Any]]:
@@ -354,10 +480,12 @@ def measure_performance(reference_frames: List[np.ndarray], foreground_masks: Op
                 metrics = {
                     "execution_speed": frame_count / elapsed_time if elapsed_time > 0 else 0.0,
                     "result_frames": None,
-                    "block_ssim_maps": None,
-                    "overall_ssim": 0.0,
-                    "foreground_ssim": 0.0,
-                    "background_ssim": 0.0,
+                    "mse": None,
+                    "psnr": None,
+                    "ssim": None,
+                    "vmaf": None,
+                    "lpips": None,
+                    "fvmd": None,
                     "status": status,
                     "error": error_msg
                 }
@@ -375,33 +503,29 @@ def measure_performance(reference_frames: List[np.ndarray], foreground_masks: Op
             else:
                 result_frames = result
             
-            # Compute block-wise SSIM
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            block_ssim_maps = calculate_block_ssim(reference_frames, result_frames, block_size, device=device)
-            
-            # Compute overall and FG/BG SSIM
-            if foreground_masks is not None:
-                overall_ssim, fg_ssim, bg_ssim = compute_fg_bg_ssim(block_ssim_maps, foreground_masks)
-            else:
-                # Compute only overall SSIM
-                all_ssim = [ssim_map.flatten() for ssim_map in block_ssim_maps]
-                overall_ssim = float(np.mean(np.concatenate(all_ssim)))
-                fg_ssim = overall_ssim
-                bg_ssim = overall_ssim
-            
+            # Compute metrics
             metrics = {
                 "execution_speed": frame_count / elapsed_time if elapsed_time > 0 else 0.0,
                 "result_frames": result_frames,
-                "block_ssim_maps": block_ssim_maps,
-                "overall_ssim": overall_ssim,
-                "foreground_ssim": fg_ssim,
-                "background_ssim": bg_ssim,
                 "status": status,
                 "error": error_msg
             }
             
+            if metrics_to_exclude is None or calculate_frame_mse not in metrics_to_exclude:
+                metrics["mse"] = calculate_frame_mse(reference_frames, result_frames)
+            if metrics_to_exclude is None or calculate_frame_psnr not in metrics_to_exclude:
+                metrics["psnr"] = calculate_frame_psnr(reference_frames, result_frames)
+            if metrics_to_exclude is None or calculate_frame_ssim not in metrics_to_exclude:
+                metrics["ssim"] = calculate_frame_ssim(reference_frames, result_frames)
+            if metrics_to_exclude is None or calculate_frame_vmaf not in metrics_to_exclude:
+                metrics["vmaf"] = calculate_frame_vmaf(reference_frames, result_frames)
+            if metrics_to_exclude is None or calculate_frame_lpips not in metrics_to_exclude:
+                lpips_model = lpips.LPIPS(net='alex').to('cuda' if torch.cuda.is_available() else 'cpu')
+                metrics["lpips"] = calculate_frame_lpips(reference_frames, result_frames, lpips_model)
+            if metrics_to_exclude is None or calculate_frame_fvmd not in metrics_to_exclude:
+                device = 0 if torch.cuda.is_available() else None
+                metrics["fvmd"] = calculate_frame_fvmd(reference_frames, result_frames, device=device, verbose=False)
             return result, metrics
-        
         return wrapper
     return decorator
 
@@ -410,7 +534,7 @@ def measure_performance(reference_frames: List[np.ndarray], foreground_masks: Op
 # Video I/O Functions
 # =============================================================================
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def load_frames(video_path: str, width: int, height: int) -> List[np.ndarray]:
     """Load video frames as RGB numpy arrays, scaled to target resolution."""
     command = [
@@ -624,129 +748,6 @@ def shrink_frame_row_only(frame: np.ndarray, importance: np.ndarray, block_size:
     shrunken = blocked[:blocks_y, :, :blocks_x].reshape(blocks_y * block_size, blocks_x * block_size, 3)
     return shrunken, removal_mask
 
-# Shrinking Method 2: Row+Col removal with removal_indices list
-
-def shrink_frame_removal_indices(frame: np.ndarray, importance: np.ndarray, block_size: int, shrink_amount: float) -> Tuple[np.ndarray, list]:
-    """Remove blocks from both rows and columns, tracking removed indices per pass.
-    
-    Returns:
-        shrunken: The shrunken frame with reduced dimensions
-        removal_indices: List of arrays - alternating row-pass and col-pass removals.
-                        Element 0: indices removed from each row (length = orig_blocks_y)
-                        Element 1: indices removed from each col (length = orig_blocks_x - 1)
-                        Element 2: indices removed from each row (length = orig_blocks_y - 1)
-                        etc.
-    """
-    frame = frame.copy()
-    importance = importance.copy()
-    
-    height, width = frame.shape[:2]
-    blocks_y = height // block_size
-    blocks_x = width // block_size
-    orig_blocks_y, orig_blocks_x = blocks_y, blocks_x
-    
-    blocked = frame[:blocks_y * block_size, :blocks_x * block_size].reshape(
-        blocks_y, block_size, blocks_x, block_size, 3)
-    
-    removal_indices = []  # List of arrays tracking removed indices per pass
-    target_removals = int(orig_blocks_y * orig_blocks_x * shrink_amount)
-    removed = 0
-    
-    while removed < target_removals:
-        # Row pass: remove one block from each row
-        row_indices = []
-        row_pass_complete = True
-        for by in range(blocks_y):
-            if removed >= target_removals:
-                row_pass_complete = False
-                break
-            least_idx = np.argmin(importance[by, :blocks_x])
-            row_indices.append(least_idx)
-            
-            blocked[by, :, least_idx:blocks_x-1] = blocked[by, :, least_idx+1:blocks_x].copy()
-            importance[by, least_idx:blocks_x-1] = importance[by, least_idx+1:blocks_x]
-            removed += 1
-        
-        if row_indices:
-            removal_indices.append(np.array(row_indices, dtype=np.int32))
-        
-        if row_pass_complete:
-            blocks_x -= 1
-            importance = importance[:, :blocks_x]
-        
-        if removed >= target_removals:
-            break
-        
-        # Column pass: remove one block from each column
-        col_indices = []
-        col_pass_complete = True
-        for bx in range(blocks_x):
-            if removed >= target_removals:
-                col_pass_complete = False
-                break
-            least_idx = np.argmin(importance[:blocks_y, bx])
-            col_indices.append(least_idx)
-            
-            blocked[least_idx:blocks_y-1, :, bx] = blocked[least_idx+1:blocks_y, :, bx].copy()
-            importance[least_idx:blocks_y-1, bx] = importance[least_idx+1:blocks_y, bx]
-            removed += 1
-        
-        if col_indices:
-            removal_indices.append(np.array(col_indices, dtype=np.int32))
-        
-        if col_pass_complete:
-            blocks_y -= 1
-            importance = importance[:blocks_y, :]
-    
-    shrunken = blocked[:blocks_y, :, :blocks_x].reshape(blocks_y * block_size, blocks_x * block_size, 3)
-    return shrunken, removal_indices
-
-
-def _removal_indices_to_mask(removal_indices: list, orig_blocks_y: int, orig_blocks_x: int) -> np.ndarray:
-    """Convert removal indices to boolean mask.
-    
-    Args:
-        removal_indices: List of arrays tracking removed indices per pass
-        orig_blocks_y: Original number of blocks vertically
-        orig_blocks_x: Original number of blocks horizontally
-    
-    Returns:
-        Boolean mask where True = removed block
-    """
-    mask = np.zeros((orig_blocks_y, orig_blocks_x), dtype=bool)
-    
-    # Track current grid dimensions as we replay the removal process
-    blocks_y, blocks_x = orig_blocks_y, orig_blocks_x
-    
-    # Process removal_indices forward to mark removed positions
-    for pass_idx, indices in enumerate(removal_indices):
-        is_row_pass = (pass_idx % 2 == 0)  # Even indices are row passes
-        
-        if is_row_pass:
-            # Row pass: removed blocks from each row
-            for by in range(min(len(indices), blocks_y)):
-                remove_idx = indices[by]
-                if remove_idx < blocks_x:
-                    # Find the actual column position in original grid
-                    # Count how many non-removed positions come before this one
-                    remaining_cols = np.where(~mask[by, :])[0]
-                    if remove_idx < len(remaining_cols):
-                        mask[by, remaining_cols[remove_idx]] = True
-            blocks_x -= 1
-        else:
-            # Column pass: removed blocks from each column
-            for bx in range(min(len(indices), blocks_x)):
-                remove_idx = indices[bx]
-                if remove_idx < blocks_y:
-                    # Find the actual row position in original grid
-                    # Count how many non-removed positions come before this one
-                    remaining_rows = np.where(~mask[:, bx])[0]
-                    if remove_idx < len(remaining_rows):
-                        mask[remaining_rows[remove_idx], bx] = True
-            blocks_y -= 1
-    
-    return mask
-
 # Wrapper functions
 
 def shrink_video_frames(frames: List[np.ndarray], importance_scores: List[np.ndarray], block_size: int, shrink_amount: float, method: Callable) -> Tuple[List[np.ndarray], List[Any]]:
@@ -825,7 +826,7 @@ def stretch_video_frames(shrunken_frames: List[np.ndarray], removal_masks: List[
 # =============================================================================
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def inpaint_with_opencv(frames: np.ndarray, masks: np.ndarray) -> np.ndarray:
     """Inpaint frames using OpenCV's Telea method."""
     inpainted = []
@@ -841,7 +842,7 @@ def inpaint_with_opencv(frames: np.ndarray, masks: np.ndarray) -> np.ndarray:
     return np.array(inpainted)
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def inpaint_with_propainter(frames: np.ndarray, masks: np.ndarray, model: ProPainterModel, device: str = "cuda") -> np.ndarray:
     """Inpaint frames using ProPainter."""
     pp_config = ProPainterConfig(
@@ -859,7 +860,7 @@ def inpaint_with_propainter(frames: np.ndarray, masks: np.ndarray, model: ProPai
     return model.inpaint(frames, masks_resized, config=pp_config)
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def inpaint_with_e2fgvi(frames: np.ndarray, masks: np.ndarray, model: E2FGVIModel, device: str = "cuda") -> np.ndarray:
     """Inpaint frames using E2FGVI."""
     e2_config = E2FGVIConfig(
@@ -1063,7 +1064,7 @@ def _extract_tile_with_halo(frame: np.ndarray, y: int, x: int, tile_h: int, tile
     return tile, (crop_top, crop_left, crop_bottom, crop_right)
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def restore_with_opencv_lanczos(frames: List[np.ndarray], degradation_maps: np.ndarray, block_size: int, halo: int = 0, temporal_blend: float = 0.0) -> List[np.ndarray]:
     """Restore downsampled frames using OpenCV sharpening (per-block).
     
@@ -1128,7 +1129,7 @@ def restore_with_opencv_lanczos(frames: List[np.ndarray], degradation_maps: np.n
     return restored
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def restore_with_opencv_unsharp(frames: List[np.ndarray], degradation_maps: np.ndarray, block_size: int, halo: int = 0, temporal_blend: float = 0.0) -> List[np.ndarray]:
     """Restore blurred frames using OpenCV unsharp masking (per-block).
     
@@ -1207,7 +1208,7 @@ def restore_with_opencv_unsharp(frames: List[np.ndarray], degradation_maps: np.n
     return restored
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], degradation_maps: List[np.ndarray], block_size: int = 16, **kwargs) -> List[np.ndarray]:
     """Sequential restoration that processes each degradation level one at a time.
     
@@ -1266,7 +1267,7 @@ def restore_video_adaptively(restore_fn: Callable, frames: List[np.ndarray], deg
     return final_frames
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def upscale_with_realesrgan(frames: List[np.ndarray], upsampler, **kwargs) -> List[np.ndarray]:
     """Restore frames using RealESRGAN with naive whole-frame upscaling.
     
@@ -1305,7 +1306,7 @@ def upscale_with_realesrgan(frames: List[np.ndarray], upsampler, **kwargs) -> Li
     return restored
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def restore_with_instantir(frames: List[np.ndarray], runtime, cfg: float = 7.0, creative_start: float = 1.0, preview_start: float = 0.0, seed: int = 42, num_inference_steps: int = 30, **kwargs) -> List[np.ndarray]:
     """Restore frames using InstantIR with naive whole-frame processing.
     
@@ -1358,7 +1359,7 @@ def restore_with_instantir(frames: List[np.ndarray], runtime, cfg: float = 7.0, 
     return restored
 
 
-@measure_performance(reference_frames, foreground_masks=ufo_masks, block_size=config.block_size)
+@measure_performance(reference_frames, foreground_masks=ufo_masks)
 def upscale_with_uav(frames: List[np.ndarray], upscaler, noise_level: int = 120, guidance_scale: float = 6.0, inference_steps: int = 30, **kwargs) -> List[np.ndarray]:
     """Restore frames using Upscale-A-Video with naive whole-frame processing.
     
@@ -1429,140 +1430,138 @@ if __name__ == "__main__":
     # ELVIS: shrink video frames
     print("Shrinking video frames...")
     shrunk_frames_row_only, masks_row_only = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_row_only)
-    shrunk_frames_rem_ind, masks_rem_ind = shrink_video_frames(reference_frames, importance_scores, config.block_size, config.shrink_amount, method=shrink_frame_removal_indices)
     if config.save_intermediate:
         encode_video(shrunk_frames_row_only, experiment_folder / "shrunk_row_only.mp4", "lossless", encoder="svtav1")
-        encode_video(shrunk_frames_rem_ind, experiment_folder / "shrunk_removal_indices.mp4", "lossless", encoder="svtav1")
-
-    # Convert removal_indices to boolean masks (masks_row_only are already boolean)
-    print("Converting removal indices to masks...")
-    orig_blocks_y = config.height // config.block_size
-    orig_blocks_x = config.width // config.block_size
-    masks_rem_ind_bool = [_removal_indices_to_mask(rm, orig_blocks_y, orig_blocks_x) for rm in masks_rem_ind]
-    if config.save_intermediate:
-        save_frames([(m * 255).astype(np.uint8) for m in masks_rem_ind_bool], experiment_folder / "masks_removal_indices")
 
     # ELVIS: stretch video frames back to original size
     print("Stretching video frames back to original size...")
     stretched_frames_row_only = stretch_video_frames(shrunk_frames_row_only, masks_row_only, config.block_size)
-    stretched_frames_rem_ind = stretch_video_frames(shrunk_frames_rem_ind, masks_rem_ind_bool, config.block_size)
     if config.save_intermediate:
         encode_video(stretched_frames_row_only, experiment_folder / "stretched_row_only.mp4", "lossless", encoder="svtav1")
-        encode_video(stretched_frames_rem_ind, experiment_folder / "stretched_removal_indices.mp4", "lossless", encoder="svtav1")
 
-    # Initialize inpainting models
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Loading inpainting models...")
-    propainter_model = ProPainterModel(device=torch.device(device), fp16=config.propainter_fp16)
-    e2fgvi_model = E2FGVIModel(model="e2fgvi_hq", device=torch.device(device))
+    # # Initialize inpainting models
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # print("Loading inpainting models...")
+    # propainter_model = ProPainterModel(device=torch.device(device), fp16=config.propainter_fp16)
+    # e2fgvi_model = E2FGVIModel(model="e2fgvi_hq", device=torch.device(device))
 
     # ELVIS: inpaint removed regions
     print("Inpainting removed regions with OpenCV Telea...")
     inpainted_frames_row_only_telea, performance_metrics['inpaint_row_only_telea'] = inpaint_with_opencv(np.array(stretched_frames_row_only), np.array(masks_row_only))
-    inpainted_frames_rem_ind_telea, performance_metrics['inpaint_rem_ind_telea'] = inpaint_with_opencv(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool))
-    print("Inpainting removed regions with ProPainter...")
-    inpainted_frames_row_only_propainter, performance_metrics['inpaint_row_only_propainter'] = inpaint_with_propainter(np.array(stretched_frames_row_only), np.array(masks_row_only), model=propainter_model, device=device)
-    inpainted_frames_rem_ind_propainter, performance_metrics['inpaint_rem_ind_propainter'] = inpaint_with_propainter(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool), model=propainter_model, device=device)
-    print("Inpainting removed regions with E2FGVI...")
-    inpainted_frames_row_only_e2fgvi, performance_metrics['inpaint_row_only_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_row_only), np.array(masks_row_only), model=e2fgvi_model, device=device)
-    inpainted_frames_rem_ind_e2fgvi, performance_metrics['inpaint_rem_ind_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_rem_ind), np.array(masks_rem_ind_bool), model=e2fgvi_model, device=device)
+    # print("Inpainting removed regions with ProPainter...")
+    # inpainted_frames_row_only_propainter, performance_metrics['inpaint_row_only_propainter'] = inpaint_with_propainter(np.array(stretched_frames_row_only), np.array(masks_row_only), model=propainter_model, device=device)
+    # print("Inpainting removed regions with E2FGVI...")
+    # inpainted_frames_row_only_e2fgvi, performance_metrics['inpaint_row_only_e2fgvi'] = inpaint_with_e2fgvi(np.array(stretched_frames_row_only), np.array(masks_row_only), model=e2fgvi_model, device=device)
     if config.save_intermediate:
         encode_video(inpainted_frames_row_only_telea, experiment_folder / "inpainted_row_only_telea.mp4", "lossless", encoder="svtav1")
-        encode_video(inpainted_frames_rem_ind_telea, experiment_folder / "inpainted_rem_ind_telea.mp4", "lossless", encoder="svtav1")
-        encode_video(inpainted_frames_row_only_propainter, experiment_folder / "inpainted_row_only_propainter.mp4", "lossless", encoder="svtav1")
-        encode_video(inpainted_frames_rem_ind_propainter, experiment_folder / "inpainted_rem_ind_propainter.mp4", "lossless", encoder="svtav1")
-        encode_video(inpainted_frames_row_only_e2fgvi, experiment_folder / "inpainted_row_only_e2fgvi.mp4", "lossless", encoder="svtav1")
-        encode_video(inpainted_frames_rem_ind_e2fgvi, experiment_folder / "inpainted_rem_ind_e2fgvi.mp4", "lossless", encoder="svtav1")
+        # encode_video(inpainted_frames_row_only_propainter, experiment_folder / "inpainted_row_only_propainter.mp4", "lossless", encoder="svtav1")
+        # encode_video(inpainted_frames_row_only_e2fgvi, experiment_folder / "inpainted_row_only_e2fgvi.mp4", "lossless", encoder="svtav1")
 
-    # PRESLEY: Encode videos with ROI-based quality control
-    print("Encoding video with Kvazaar ROI...")
-    encode_video(reference_frames, f"{experiment_folder}/kvazaar_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="kvazaar")
-    roi_frames_kvazaar, performance_metrics['kvazaar_roi'] = load_frames(f"{experiment_folder}/kvazaar_roi.mp4", config.width, config.height)
-    print("Encoding video with SVT-AV1 ROI...")
-    encode_video(reference_frames, f"{experiment_folder}/svtav1_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="svtav1")
-    roi_frames_svtav1, performance_metrics['svtav1_roi'] = load_frames(f"{experiment_folder}/svtav1_roi.mp4", config.width, config.height)
+    # # PRESLEY: Encode videos with ROI-based quality control
+    # print("Encoding video with Kvazaar ROI...")
+    # encode_video(reference_frames, f"{experiment_folder}/kvazaar_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="kvazaar")
+    # roi_frames_kvazaar, performance_metrics['kvazaar_roi'] = load_frames(f"{experiment_folder}/kvazaar_roi.mp4", config.width, config.height)
+    # print("Encoding video with SVT-AV1 ROI...")
+    # encode_video(reference_frames, f"{experiment_folder}/svtav1_roi.mp4", config.quality, config.qp_range, importance_scores=importance_scores, encoder="svtav1")
+    # roi_frames_svtav1, performance_metrics['svtav1_roi'] = load_frames(f"{experiment_folder}/svtav1_roi.mp4", config.width, config.height)
 
-    # PRESLEY: Degrade video adaptively
-    print("Degrading video adaptively...")
-    downscaled_frames, downscaled_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=downscale_block)
-    blurred_frames, blurred_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=blur_block)
-    if config.save_intermediate:
-        encode_video(downscaled_frames, experiment_folder / "downscaled_adaptive.mp4", "lossless", encoder="svtav1")
-        encode_video(blurred_frames, experiment_folder / "blurred_adaptive.mp4", "lossless", encoder="svtav1")
-        save_frames(downscaled_maps, experiment_folder / "downscaled_maps")
-        save_frames(blurred_maps, experiment_folder / "blurred_maps")
+    # # PRESLEY: Degrade video adaptively
+    # print("Degrading video adaptively...")
+    # downscaled_frames, downscaled_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=downscale_block)
+    # blurred_frames, blurred_maps = degrade_video_adaptive(reference_frames, importance_scores, config.block_size, max_value=4, method=blur_block)
+    # if config.save_intermediate:
+    #     encode_video(downscaled_frames, experiment_folder / "downscaled_adaptive.mp4", "lossless", encoder="svtav1")
+    #     encode_video(blurred_frames, experiment_folder / "blurred_adaptive.mp4", "lossless", encoder="svtav1")
+    #     save_frames(downscaled_maps, experiment_folder / "downscaled_maps")
+    #     save_frames(blurred_maps, experiment_folder / "blurred_maps")
 
-    # PRESLEY: Comparing restoration methods naively and adaptively
-    print("Restoring downscaled video adaptively with OpenCV Lanczos...")
-    restored_downscaled_opencv, performance_metrics['lanczos_adaptive'] = restore_with_opencv_lanczos(downscaled_frames, downscaled_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
-    print("Restoring blurred video adaptively with OpenCV Unsharp Masking...")
-    restored_blurred_opencv, performance_metrics['unsharp_adaptive'] = restore_with_opencv_unsharp(blurred_frames, blurred_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
-    if config.save_intermediate:
-        encode_video(restored_downscaled_opencv, experiment_folder / "restored_downscaled_opencv.mp4", "lossless", encoder="svtav1")
-        encode_video(restored_blurred_opencv, experiment_folder / "restored_blurred_opencv.mp4", "lossless", encoder="svtav1")
+    # # PRESLEY: Comparing restoration methods naively and adaptively
+    # print("Restoring downscaled video adaptively with OpenCV Lanczos...")
+    # restored_downscaled_opencv, performance_metrics['lanczos_adaptive'] = restore_with_opencv_lanczos(downscaled_frames, downscaled_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    # print("Restoring blurred video adaptively with OpenCV Unsharp Masking...")
+    # restored_blurred_opencv, performance_metrics['unsharp_adaptive'] = restore_with_opencv_unsharp(blurred_frames, blurred_maps, block_size=config.block_size, halo=config.context_halo, temporal_blend=config.temporal_blend)
+    # if config.save_intermediate:
+    #     encode_video(restored_downscaled_opencv, experiment_folder / "restored_downscaled_opencv.mp4", "lossless", encoder="svtav1")
+    #     encode_video(restored_blurred_opencv, experiment_folder / "restored_blurred_opencv.mp4", "lossless", encoder="svtav1")
     
-    # RealESRGAN restoration
-    print("Loading RealESRGAN model...")
-    realesrgan_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(realesrgan_device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
-    print("Restoring downscaled video naively with RealESRGAN...")
-    restored_downscaled_realesrgan_naive, performance_metrics['realesrgan_naive'] = upscale_with_realesrgan(downscaled_frames, realesrgan_upsampler)
-    print("Restoring downscaled video adaptively with RealESRGAN...")
-    restored_downscaled_realesrgan, performance_metrics['realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, upsampler=realesrgan_upsampler)
-    if config.save_intermediate:
-        encode_video(restored_downscaled_realesrgan_naive, experiment_folder / "restored_downscaled_realesrgan_naive.mp4", "lossless", encoder="svtav1")
-        encode_video(restored_downscaled_realesrgan, experiment_folder / "restored_downscaled_realesrgan_adaptive.mp4", "lossless", encoder="svtav1")
+    # # RealESRGAN restoration
+    # print("Loading RealESRGAN model...")
+    # realesrgan_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # realesrgan_upsampler = create_upsampler(model_name=config.realesrgan_model_name if hasattr(config, 'realesrgan_model_name') else "RealESRGAN_x4plus", device=torch.device(realesrgan_device), tile=config.neural_tile_size, tile_pad=config.context_halo, pre_pad=config.realesrgan_pre_pad, half=not config.realesrgan_fp32, denoise_strength=config.realesrgan_denoise_strength)
+    # print("Restoring downscaled video naively with RealESRGAN...")
+    # restored_downscaled_realesrgan_naive, performance_metrics['realesrgan_naive'] = upscale_with_realesrgan(downscaled_frames, realesrgan_upsampler)
+    # print("Restoring downscaled video adaptively with RealESRGAN...")
+    # restored_downscaled_realesrgan, performance_metrics['realesrgan_adaptive'] = restore_video_adaptively(upscale_with_realesrgan, downscaled_frames, downscaled_maps, block_size=config.block_size, upsampler=realesrgan_upsampler)
+    # if config.save_intermediate:
+    #     encode_video(restored_downscaled_realesrgan_naive, experiment_folder / "restored_downscaled_realesrgan_naive.mp4", "lossless", encoder="svtav1")
+    #     encode_video(restored_downscaled_realesrgan, experiment_folder / "restored_downscaled_realesrgan_adaptive.mp4", "lossless", encoder="svtav1")
     
-    # Clean up RealESRGAN from VRAM
-    print("Cleaning up RealESRGAN from VRAM...")
-    del realesrgan_upsampler
-    torch.cuda.empty_cache()
+    # # Clean up RealESRGAN from VRAM
+    # print("Cleaning up RealESRGAN from VRAM...")
+    # del realesrgan_upsampler
+    # torch.cuda.empty_cache()
     
-    # InstantIR restoration
-    print("Loading InstantIR model...")
-    instantir_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=instantir_device, torch_dtype=torch.float16)
-    print("Restoring blurred video naively with InstantIR...")
-    restored_blurred_instantir_naive, performance_metrics['instantir_naive'] = restore_with_instantir(blurred_frames, instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
-    print("Restoring blurred video adaptively with InstantIR...")
-    restored_blurred_instantir, performance_metrics['instantir_adaptive'] = restore_video_adaptively(restore_with_instantir, blurred_frames, blurred_maps, block_size=config.block_size, runtime=instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
-    if config.save_intermediate:
-        encode_video(restored_blurred_instantir_naive, experiment_folder / "restored_blurred_instantir_naive.mp4", "lossless", encoder="svtav1")
-        encode_video(restored_blurred_instantir, experiment_folder / "restored_blurred_instantir_adaptive.mp4", "lossless", encoder="svtav1")
+    # # InstantIR restoration
+    # print("Loading InstantIR model...")
+    # instantir_device = "cuda:1" if torch.cuda.device_count() > 1 else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    # instantir_runtime = load_runtime(instantir_path=Path("~/.cache/instantir").expanduser(), device=instantir_device, torch_dtype=torch.float16)
+    # print("Restoring blurred video naively with InstantIR...")
+    # restored_blurred_instantir_naive, performance_metrics['instantir_naive'] = restore_with_instantir(blurred_frames, instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
+    # print("Restoring blurred video adaptively with InstantIR...")
+    # restored_blurred_instantir, performance_metrics['instantir_adaptive'] = restore_video_adaptively(restore_with_instantir, blurred_frames, blurred_maps, block_size=config.block_size, runtime=instantir_runtime, cfg=config.instantir_cfg, creative_start=config.instantir_creative_start, preview_start=config.instantir_preview_start, seed=config.instantir_seed, num_inference_steps=config.instantir_steps)
+    # if config.save_intermediate:
+    #     encode_video(restored_blurred_instantir_naive, experiment_folder / "restored_blurred_instantir_naive.mp4", "lossless", encoder="svtav1")
+    #     encode_video(restored_blurred_instantir, experiment_folder / "restored_blurred_instantir_adaptive.mp4", "lossless", encoder="svtav1")
     
-    # Clean up InstantIR from VRAM
-    print("Cleaning up InstantIR from VRAM...")
-    del instantir_runtime
-    torch.cuda.empty_cache()
+    # # Clean up InstantIR from VRAM
+    # print("Cleaning up InstantIR from VRAM...")
+    # del instantir_runtime
+    # torch.cuda.empty_cache()
     
-    # Upscale-A-Video restoration
-    print("Loading Upscale-A-Video model...")
-    uav_device = "cuda:2" if torch.cuda.device_count() > 2 else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    uav_upscaler = UpscaleAVideo(device=uav_device)
-    uav_upscaler.load_models()
-    print("Restoring downscaled video naively with Upscale-A-Video...")
-    restored_downscaled_uav_naive, performance_metrics['uav_naive'] = upscale_with_uav(downscaled_frames, uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
-    print("Restoring downscaled video adaptively with Upscale-A-Video...")
-    restored_downscaled_uav, performance_metrics['uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
-    if config.save_intermediate:
-        encode_video(restored_downscaled_uav_naive, experiment_folder / "restored_downscaled_uav_naive.mp4", "lossless", encoder="svtav1")
-        encode_video(restored_downscaled_uav, experiment_folder / "restored_downscaled_uav_adaptive.mp4", "lossless", encoder="svtav1")
+    # # Upscale-A-Video restoration
+    # print("Loading Upscale-A-Video model...")
+    # uav_device = "cuda:2" if torch.cuda.device_count() > 2 else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    # uav_upscaler = UpscaleAVideo(device=uav_device)
+    # uav_upscaler.load_models()
+    # print("Restoring downscaled video naively with Upscale-A-Video...")
+    # restored_downscaled_uav_naive, performance_metrics['uav_naive'] = upscale_with_uav(downscaled_frames, uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    # print("Restoring downscaled video adaptively with Upscale-A-Video...")
+    # restored_downscaled_uav, performance_metrics['uav_adaptive'] = restore_video_adaptively(upscale_with_uav, downscaled_frames, downscaled_maps, block_size=config.block_size, upscaler=uav_upscaler, noise_level=config.uav_noise_level, guidance_scale=config.uav_guidance_scale, inference_steps=config.uav_inference_steps)
+    # if config.save_intermediate:
+    #     encode_video(restored_downscaled_uav_naive, experiment_folder / "restored_downscaled_uav_naive.mp4", "lossless", encoder="svtav1")
+    #     encode_video(restored_downscaled_uav, experiment_folder / "restored_downscaled_uav_adaptive.mp4", "lossless", encoder="svtav1")
     
-    # Clean up UAV from VRAM
-    print("Cleaning up Upscale-A-Video from VRAM...")
-    del uav_upscaler
-    torch.cuda.empty_cache()
+    # # Clean up UAV from VRAM
+    # print("Cleaning up Upscale-A-Video from VRAM...")
+    # del uav_upscaler
+    # torch.cuda.empty_cache()
 
     # Final reporting
     print("\nExperiment completed. Performance metrics:")
     for method, metrics in performance_metrics.items():
         print(f"  {method}:")
         print(f"    Execution Speed: {metrics['execution_speed']:.2f} FPS")
-        print(f"    Overall SSIM: {metrics['overall_ssim']:.4f}")
-        print(f"    Foreground SSIM: {metrics['foreground_ssim']:.4f}")
-        print(f"    Background SSIM: {metrics['background_ssim']:.4f}")
         if metrics['status'] != "success":
             print(f"    Status: {metrics['status']} - Error: {metrics['error']}")
+        else:
+            # Print all calculated metrics
+            if 'mse' in metrics and metrics['mse']:
+                avg_mse = np.mean(metrics['mse'])
+                print(f"    Avg MSE: {avg_mse:.2f}")
+            if 'psnr' in metrics and metrics['psnr']:
+                avg_psnr = np.mean(metrics['psnr'])
+                print(f"    Avg PSNR: {avg_psnr:.2f} dB")
+            if 'ssim' in metrics and metrics['ssim']:
+                avg_ssim = np.mean(metrics['ssim'])
+                print(f"    Avg SSIM: {avg_ssim:.4f}")
+            if 'vmaf' in metrics and metrics['vmaf']:
+                avg_vmaf = np.mean(metrics['vmaf'])
+                print(f"    Avg VMAF: {avg_vmaf:.2f}")
+            if 'lpips' in metrics and metrics['lpips']:
+                avg_lpips = np.mean(metrics['lpips'])
+                print(f"    Avg LPIPS: {avg_lpips:.4f}")
+            if 'fvmd' in metrics and metrics['fvmd'] is not None:
+                print(f"    FVMD: {metrics['fvmd']:.4f}")
     
     # Save performance metrics to JSON
     print("\nSaving performance metrics...")
@@ -1573,11 +1572,15 @@ if __name__ == "__main__":
         for key, metrics in performance_metrics.items():
             serializable_metrics[key] = {
                 'execution_speed': metrics['execution_speed'],
-                'overall_ssim': metrics['overall_ssim'],
-                'foreground_ssim': metrics['foreground_ssim'],
-                'background_ssim': metrics['background_ssim'],
                 'status': metrics['status'],
                 'error': metrics['error']
             }
+            # Add metric arrays as lists
+            for metric_name in ['mse', 'psnr', 'ssim', 'vmaf', 'lpips']:
+                if metric_name in metrics and metrics[metric_name] is not None:
+                    serializable_metrics[key][metric_name] = [float(x) for x in metrics[metric_name]] if isinstance(metrics[metric_name], list) else float(metrics[metric_name])
+            # FVMD is a float (mean value)
+            if 'fvmd' in metrics and metrics['fvmd'] is not None:
+                serializable_metrics[key]['fvmd'] = float(metrics['fvmd'])
         json.dump(serializable_metrics, f, indent=2)
     print(f"Performance metrics saved to {metrics_path}")
