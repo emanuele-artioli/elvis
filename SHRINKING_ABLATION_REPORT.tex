@@ -1,0 +1,457 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\geometry{margin=1in}
+
+\title{Ablation Study: Block Shrinking Methods for\\Importance-Based Video Compression}
+\author{PRESLEY: Extended ELVIS Technical Report}
+\date{December 2025}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This technical report presents an ablation study comparing three different block shrinking methods for importance-based video compression in the PRESLEY system. Each method removes low-importance blocks from video frames to achieve compression, but differs in how position information is tracked for reconstruction. We compare: (1) row-only removal with implicit position tracking, (2) row+column removal with explicit position maps, and (3) row+column removal with removal index lists. Results show that all three methods achieve comparable reconstruction quality (SSIM $\approx 0.79$), validating that the removal indices approach provides equivalent quality with potentially lower storage overhead for the reconstruction metadata.
+\end{abstract}
+
+\section{Introduction}
+
+The ELVIS (Encoding with Learned Video Importance for Streaming) approach to video compression removes low-importance blocks from frames, encodes the smaller frames, and reconstructs the original resolution using video inpainting. A critical component of this pipeline is tracking \emph{which} blocks were removed and \emph{where} to place the remaining blocks during reconstruction.
+
+This ablation study investigates three different approaches to the shrink-stretch cycle:
+
+\begin{enumerate}
+    \item \textbf{Row-Only Removal}: Removes blocks only from rows, maintaining uniform height. Reconstruction uses the per-row removal mask directly.
+    \item \textbf{Position Map}: Removes blocks from both rows and columns alternately, tracking an explicit 2D map of $(shrunk\_y, shrunk\_x) \rightarrow (orig\_y, orig\_x)$.
+    \item \textbf{Removal Indices}: Removes blocks from both rows and columns alternately, tracking only the column/row index removed at each position per pass.
+\end{enumerate}
+
+\section{Problem Formulation}
+
+Let $F \in \mathbb{R}^{H \times W \times 3}$ be a video frame and $I \in [0,1]^{B_y \times B_x}$ be the corresponding importance map, where $B_y = H/b$ and $B_x = W/b$ for block size $b$ (typically 16 pixels).
+
+Given a shrink amount $\alpha \in (0,1)$, we aim to remove $\lfloor \alpha \cdot B_y \cdot B_x \rfloor$ blocks with the \emph{lowest} importance scores, producing a smaller frame $F' \in \mathbb{R}^{H' \times W' \times 3}$ where $H' \leq H$ and $W' \leq W$.
+
+The challenge is to track sufficient information during shrinking to enable correct reconstruction:
+\begin{equation}
+    F_{reconstructed} = \text{Stretch}(\text{Shrink}(F, I, \alpha))
+\end{equation}
+
+\section{Method 1: Row-Only Removal}
+
+\subsection{Description}
+This method removes blocks only from the horizontal dimension, iterating through each row and removing the least important block. The frame width shrinks uniformly while height remains constant.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[H]
+\caption{Shrink Frame (Row-Only)}
+\begin{algorithmic}[1]
+\Require Frame $F$, Importance map $I$, Block size $b$, Shrink amount $\alpha$
+\Ensure Shrunken frame $F'$, Removal mask $M$
+\State $B_y \gets H/b$, $B_x \gets W/b$
+\State $target \gets \lfloor \alpha \cdot B_y \cdot B_x \rfloor$
+\State $M \gets \mathbf{0}^{B_y \times B_x}$ \Comment{Boolean removal mask}
+\State $removed \gets 0$
+\While{$removed < target$ \textbf{and} $B_x > 1$}
+    \For{$row = 0$ \textbf{to} $B_y - 1$}
+        \If{$removed \geq target$}
+            \textbf{break}
+        \EndIf
+        \State $j^* \gets \arg\min_j I[row, j]$ for $j \in \{0, \ldots, B_x-1\}$
+        \State $orig\_col \gets$ find $j^*$-th remaining column in row
+        \State $M[row, orig\_col] \gets \texttt{True}$
+        \State Shift blocks left: $blocks[row, j^*:B_x-1] \gets blocks[row, j^*+1:B_x]$
+        \State $removed \gets removed + 1$
+    \EndFor
+    \State $B_x \gets B_x - 1$
+\EndWhile
+\State $F' \gets$ reshape blocks to $(B_y \cdot b) \times (B_x \cdot b) \times 3$
+\State \Return $F'$, $M$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Stretch Frame (Row-Only)}
+\begin{algorithmic}[1]
+\Require Shrunken frame $F'$, Removal mask $M$, Block size $b$
+\Ensure Reconstructed frame $F_{out}$
+\State $F_{out} \gets \mathbf{0}^{B_y \cdot b \times B_x \cdot b \times 3}$
+\For{$row = 0$ \textbf{to} $B_y - 1$}
+    \State $kept\_cols \gets \{j : M[row, j] = \texttt{False}\}$
+    \For{$i = 0$ \textbf{to} $|kept\_cols| - 1$}
+        \State Place block $F'[row, i]$ at position $(row, kept\_cols[i])$ in $F_{out}$
+    \EndFor
+\EndFor
+\State \Return $F_{out}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties}
+\begin{itemize}
+    \item \textbf{Output dimensions}: $H' = H$, $W' < W$
+    \item \textbf{Metadata}: Removal mask $M \in \{0,1\}^{B_y \times B_x}$
+    \item \textbf{Storage}: $B_y \times B_x$ bits
+    \item \textbf{Reconstruction}: Trivial per-row mapping from mask
+\end{itemize}
+
+\section{Method 2: Row+Column with Position Map}
+
+\subsection{Description}
+This method alternates between removing one block from each row (row pass) and one block from each column (column pass). Both dimensions shrink. An explicit position map tracks where each block in the shrunken frame originated.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[H]
+\caption{Shrink Frame (Position Map)}
+\begin{algorithmic}[1]
+\Require Frame $F$, Importance map $I$, Block size $b$, Shrink amount $\alpha$
+\Ensure Shrunken frame $F'$, Removal mask $M$, Position map $P$
+\State Initialize $P[y,x] \gets (y, x)$ for all positions
+\State $M \gets \mathbf{0}^{B_y \times B_x}$, $removed \gets 0$
+\While{$removed < target$}
+    \State \textcolor{blue}{\textbf{// Row Pass}}
+    \For{$row = 0$ \textbf{to} $current\_B_y - 1$}
+        \If{$removed \geq target$} \textbf{break} \EndIf
+        \State $j^* \gets \arg\min_j I[row, j]$
+        \State $(orig\_y, orig\_x) \gets P[row, j^*]$
+        \State $M[orig\_y, orig\_x] \gets \texttt{True}$
+        \State Shift blocks and position map left
+        \State $removed \gets removed + 1$
+    \EndFor
+    \If{row pass complete} $current\_B_x \gets current\_B_x - 1$ \EndIf
+    \If{$removed \geq target$} \textbf{break} \EndIf
+    \State \textcolor{blue}{\textbf{// Column Pass}}
+    \For{$col = 0$ \textbf{to} $current\_B_x - 1$}
+        \If{$removed \geq target$} \textbf{break} \EndIf
+        \State $i^* \gets \arg\min_i I[i, col]$
+        \State $(orig\_y, orig\_x) \gets P[i^*, col]$
+        \State $M[orig\_y, orig\_x] \gets \texttt{True}$
+        \State Shift blocks and position map up
+        \State $removed \gets removed + 1$
+    \EndFor
+    \If{column pass complete} $current\_B_y \gets current\_B_y - 1$ \EndIf
+\EndWhile
+\State \Return $F'$, $M$, $P[:current\_B_y, :current\_B_x]$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Stretch Frame (Position Map)}
+\begin{algorithmic}[1]
+\Require Shrunken frame $F'$, Removal mask $M$, Position map $P$, Block size $b$
+\Ensure Reconstructed frame $F_{out}$
+\State $F_{out} \gets \mathbf{0}^{B_y \cdot b \times B_x \cdot b \times 3}$
+\For{$y = 0$ \textbf{to} $shrunk\_B_y - 1$}
+    \For{$x = 0$ \textbf{to} $shrunk\_B_x - 1$}
+        \State $(orig\_y, orig\_x) \gets P[y, x]$
+        \State Place block $F'[y, x]$ at position $(orig\_y, orig\_x)$ in $F_{out}$
+    \EndFor
+\EndFor
+\State \Return $F_{out}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties}
+\begin{itemize}
+    \item \textbf{Output dimensions}: $H' < H$, $W' < W$
+    \item \textbf{Metadata}: Removal mask $M$ + Position map $P \in \mathbb{Z}^{B'_y \times B'_x \times 2}$
+    \item \textbf{Storage}: $B_y \times B_x$ bits + $2 \times B'_y \times B'_x \times \lceil\log_2(\max(B_y, B_x))\rceil$ bits
+    \item \textbf{Reconstruction}: Direct lookup in position map
+\end{itemize}
+
+\section{Method 3: Row+Column with Removal Indices}
+
+\subsection{Description}
+This method also alternates row and column passes, but instead of tracking a full position map, it records only the \emph{index} of the removed block at each position within each pass. Reconstruction inverts the removal process by re-inserting black blocks at the recorded positions in reverse order.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[H]
+\caption{Shrink Frame (Removal Indices)}
+\begin{algorithmic}[1]
+\Require Frame $F$, Importance map $I$, Block size $b$, Shrink amount $\alpha$
+\Ensure Shrunken frame $F'$, Removal mask $M$, Removal indices list $R$
+\State $R \gets []$ \Comment{List of arrays}
+\While{$removed < target$}
+    \State \textcolor{blue}{\textbf{// Row Pass}}
+    \State $row\_indices \gets []$
+    \For{$row = 0$ \textbf{to} $current\_B_y - 1$}
+        \If{$removed \geq target$} \textbf{break} \EndIf
+        \State $j^* \gets \arg\min_j I[row, j]$
+        \State $row\_indices$.append($j^*$)
+        \State Remove block and shift left
+        \State $removed \gets removed + 1$
+    \EndFor
+    \If{$|row\_indices| > 0$} $R$.append($row\_indices$) \EndIf
+    \If{row pass complete} $current\_B_x \gets current\_B_x - 1$ \EndIf
+    \If{$removed \geq target$} \textbf{break} \EndIf
+    \State \textcolor{blue}{\textbf{// Column Pass}}
+    \State $col\_indices \gets []$
+    \For{$col = 0$ \textbf{to} $current\_B_x - 1$}
+        \If{$removed \geq target$} \textbf{break} \EndIf
+        \State $i^* \gets \arg\min_i I[i, col]$
+        \State $col\_indices$.append($i^*$)
+        \State Remove block and shift up
+        \State $removed \gets removed + 1$
+    \EndFor
+    \If{$|col\_indices| > 0$} $R$.append($col\_indices$) \EndIf
+    \If{column pass complete} $current\_B_y \gets current\_B_y - 1$ \EndIf
+\EndWhile
+\State \Return $F'$, $M$, $R$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Stretch Frame (Removal Indices)}
+\begin{algorithmic}[1]
+\Require Shrunken frame $F'$, Removal indices $R$, Original dims $B_y, B_x$, Block size $b$
+\Ensure Reconstructed frame $F_{out}$
+\State Initialize blocked array from $F'$
+\For{$pass = |R|-1$ \textbf{downto} $0$} \Comment{Reverse order}
+    \State $indices \gets R[pass]$
+    \If{$pass \mod 2 = 0$} \Comment{Row pass: expand width}
+        \State Allocate new array with $B_x + 1$ columns
+        \For{$row = 0$ \textbf{to} $|indices| - 1$}
+            \State $insert\_idx \gets indices[row]$
+            \State Copy blocks $[0, insert\_idx)$ to new array
+            \State Leave position $insert\_idx$ as zeros (black)
+            \State Copy blocks $[insert\_idx, B_x)$ to positions $[insert\_idx+1, B_x+1)$
+        \EndFor
+        \State $B_x \gets B_x + 1$
+    \Else \Comment{Column pass: expand height}
+        \State Allocate new array with $B_y + 1$ rows
+        \For{$col = 0$ \textbf{to} $|indices| - 1$}
+            \State $insert\_idx \gets indices[col]$
+            \State Copy blocks $[0, insert\_idx)$ to new array
+            \State Leave position $insert\_idx$ as zeros (black)
+            \State Copy blocks $[insert\_idx, B_y)$ to positions $[insert\_idx+1, B_y+1)$
+        \EndFor
+        \State $B_y \gets B_y + 1$
+    \EndIf
+\EndFor
+\State $F_{out} \gets$ crop to original dimensions
+\State \Return $F_{out}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Properties}
+\begin{itemize}
+    \item \textbf{Output dimensions}: $H' < H$, $W' < W$
+    \item \textbf{Metadata}: Removal indices list $R$ with variable-length arrays
+    \item \textbf{Storage}: $\sum_{i=0}^{|R|-1} |R[i]| \times \lceil\log_2(max\_dim)\rceil$ bits
+    \item \textbf{Reconstruction}: Inverse process by sequential re-insertion
+\end{itemize}
+
+\section{Storage Complexity Analysis}
+
+Let $n = B_y \cdot B_x$ be the total number of blocks and $k = \lfloor \alpha \cdot n \rfloor$ be the number of removed blocks.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Metadata Type} & \textbf{Storage (bits)} & \textbf{Asymptotic} \\
+\midrule
+Row-Only & Removal mask & $n$ & $O(n)$ \\
+Position Map & Mask + 2D coords & $n + 2(n-k)\log_2(\sqrt{n})$ & $O(n \log n)$ \\
+Removal Indices & Index list & $k \cdot \log_2(\sqrt{n})$ & $O(k \log n)$ \\
+\bottomrule
+\end{tabular}
+\caption{Storage complexity comparison for reconstruction metadata.}
+\label{tab:storage}
+\end{table}
+
+For typical configurations ($\alpha = 0.25$), the removal indices method requires approximately $25\%$ of the entries compared to position map, with each entry being a single index rather than a coordinate pair.
+
+\section{Experimental Setup}
+
+\subsection{Configuration}
+\begin{itemize}
+    \item \textbf{Test video}: bear.mp4 from DAVIS dataset
+    \item \textbf{Resolution}: 1280$\times$720 (80$\times$45 = 3600 blocks at $b=16$)
+    \item \textbf{Frames}: 82 frames at 24 fps
+    \item \textbf{Shrink amount}: $\alpha = 0.25$ (remove 25\% of blocks)
+    \item \textbf{Block size}: 16$\times$16 pixels
+    \item \textbf{Quality preset}: ``low'' (SVT-AV1 CRF 60)
+    \item \textbf{Inpainting models}: ProPainter, E2FGVI
+\end{itemize}
+
+\subsection{Metrics}
+\begin{itemize}
+    \item \textbf{SSIM}: Structural Similarity Index between original and inpainted frames
+    \item \textbf{Shrunken size}: File size of the compressed shrunken video
+    \item \textbf{Final size}: File size of the inpainted video
+\end{itemize}
+
+\section{Results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Shrunken Dims} & \textbf{Shrunken Size} & \textbf{ProPainter SSIM} & \textbf{E2FGVI SSIM} \\
+\midrule
+Row-Only & 960$\times$720 & 202,082 B & 0.7925 & 0.7930 \\
+Position Map & 1152$\times$608 & 203,314 B & 0.7926 & 0.7933 \\
+Removal Indices & 1152$\times$608 & 203,314 B & 0.7924 & 0.7933 \\
+\bottomrule
+\end{tabular}
+\caption{Ablation study results comparing three shrinking methods.}
+\label{tab:results}
+\end{table}
+
+\subsection{Key Observations}
+
+\begin{enumerate}
+    \item \textbf{Equivalent Quality}: All three methods achieve nearly identical SSIM scores ($\sim$0.793), indicating that the choice of position tracking method does not impact reconstruction quality when followed by neural inpainting.
+    
+    \item \textbf{Dimensional Differences}: Row-only removal produces frames with reduced width only (960$\times$720), while row+column methods reduce both dimensions (1152$\times$608). Despite the same number of removed blocks, the aspect ratios differ.
+    
+    \item \textbf{Similar Compression}: Shrunken video sizes are nearly identical ($\sim$202-203 KB), suggesting the block arrangement does not significantly affect encoder efficiency.
+    
+    \item \textbf{Inpainting Robustness}: Both ProPainter and E2FGVI produce consistent results across all methods, demonstrating that modern video inpainting is robust to different block removal patterns.
+\end{enumerate}
+
+\section{Discussion}
+
+\subsection{Method Selection Criteria}
+
+The choice between methods depends on the deployment scenario:
+
+\begin{itemize}
+    \item \textbf{Row-Only}: Simplest implementation, minimal metadata. Best when width reduction is acceptable and simplicity is prioritized.
+    
+    \item \textbf{Position Map}: Most explicit tracking, straightforward reconstruction. Best when metadata storage is not constrained and debugging/visualization is important.
+    
+    \item \textbf{Removal Indices}: Compact metadata representation, invertible process. Best when metadata must be transmitted alongside the video (streaming scenarios).
+\end{itemize}
+
+\subsection{Computational Considerations}
+
+\begin{itemize}
+    \item \textbf{Shrinking}: All methods have similar $O(k \cdot B_y)$ complexity for $k$ removals.
+    \item \textbf{Stretching}: Row-only is $O(B_y \cdot B_x)$, Position Map is $O((1-\alpha)n)$, Removal Indices is $O(k \cdot \max(B_y, B_x))$.
+    \item \textbf{Memory}: Position Map requires the largest intermediate storage during shrinking.
+\end{itemize}
+
+\section{Additional Ablation: ROI Encoding Comparison}
+
+We also conducted an ablation study comparing ROI-aware encoding using different video codecs. The goal is to evaluate whether allocating more bits to foreground (FG) regions improves perceptual quality as measured by FG-specific SSIM.
+
+\subsection{Configuration}
+\begin{itemize}
+    \item \textbf{Encoders}: KVAZAAR (H.265/HEVC), SVT-AV1 (AV1)
+    \item \textbf{ROI Strategy}: Foreground blocks encoded at higher quality (ROI delta QP = -10)
+    \item \textbf{Quality preset}: Low (CRF 60 baseline)
+    \item \textbf{Metrics}: Overall SSIM, FG-only SSIM, file size
+\end{itemize}
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Encoder} & \textbf{Overall SSIM} & \textbf{FG SSIM} & \textbf{FG Change} & \textbf{Size Change} \\
+\midrule
+KVAZAAR (baseline) & 0.7833 & 0.7517 & -- & -- \\
+KVAZAAR (ROI) & 0.7541 & 0.7757 & +2.40\% & -0.5\% \\
+\midrule
+SVT-AV1 (baseline) & 0.8799 & 0.8150 & -- & -- \\
+SVT-AV1 (ROI) & 0.8783 & 0.8176 & +0.26\% & +1.5\% \\
+\bottomrule
+\end{tabular}
+\caption{ROI encoding comparison: foreground quality vs overall quality trade-off.}
+\label{tab:roi}
+\end{table}
+
+\subsection{Key Observations}
+\begin{enumerate}
+    \item \textbf{FG Quality Improvement}: Both encoders show improved FG SSIM with ROI encoding, with KVAZAAR showing a more substantial +2.40\% gain.
+    \item \textbf{Overall SSIM Trade-off}: The overall SSIM decreases slightly, indicating background quality reduction to achieve FG improvement at similar bitrates.
+    \item \textbf{Codec Differences}: KVAZAAR benefits more from ROI encoding, possibly due to more aggressive delta QP handling in HEVC.
+\end{enumerate}
+
+\section{Additional Ablation: Degradation/Restoration Methods}
+
+We conducted experiments comparing different degradation and restoration methods for the adaptive encoding pipeline. The goal is to identify which combinations best preserve quality after the degrade-encode-restore cycle.
+
+\subsection{Configuration}
+\begin{itemize}
+    \item \textbf{Degradation methods}: Adaptive Downsample (up to 4$\times$), Adaptive Gaussian Blur (5 rounds max)
+    \item \textbf{Restoration methods}: OpenCV Sharpening, RealESRGAN Naive (full-frame), RealESRGAN Adaptive (spatially-varying), OpenCV Lanczos
+    \item \textbf{Tile size}: 256$\times$256 with 8-pixel context halo
+    \item \textbf{Temporal blend}: 0.1 (10\% previous frame blending)
+\end{itemize}
+
+\subsection{Results: Adaptive Downsample Degradation}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Restoration Method} & \textbf{SSIM} & \textbf{$\Delta$ SSIM} & \textbf{Size (bytes)} \\
+\midrule
+Degraded (no restoration) & 0.7250 & -- & 86,770 \\
+OpenCV Sharpening & 0.7498 & \textbf{+0.0248} & 18,150,059 \\
+RealESRGAN Naive & 0.7033 & -0.0216 & 15,608,485 \\
+RealESRGAN Adaptive & 0.6919 & -0.0330 & 19,258,537 \\
+\bottomrule
+\end{tabular}
+\caption{Restoration methods comparison for Adaptive Downsample degradation.}
+\label{tab:restoration}
+\end{table}
+
+\subsection{Key Observations}
+\begin{enumerate}
+    \item \textbf{OpenCV Sharpening Best}: Simple unsharp masking with per-block processing achieves the best SSIM improvement (+0.0248), outperforming neural super-resolution methods.
+    \item \textbf{RealESRGAN Artifacts}: Both naive and adaptive RealESRGAN produce SSIM values \emph{below} the degraded baseline, suggesting neural hallucination artifacts that differ from ground truth.
+    \item \textbf{Size-Quality Trade-off}: Restoration dramatically increases file size ($\sim$180-220$\times$) due to uncompressed frame output, suggesting restoration should occur client-side.
+    \item \textbf{Perceptual vs Metric Mismatch}: While RealESRGAN may produce perceptually sharper images, SSIM penalizes hallucinated details not present in the original.
+\end{enumerate}
+
+\section{Conclusion}
+
+This ablation study demonstrates that the three shrinking methods---row-only removal, position map tracking, and removal indices tracking---achieve equivalent reconstruction quality when combined with neural video inpainting. The primary differences lie in:
+
+\begin{enumerate}
+    \item \textbf{Output aspect ratio}: Row-only preserves height; row+column methods reduce both dimensions.
+    \item \textbf{Metadata overhead}: Removal indices provide the most compact representation.
+    \item \textbf{Implementation complexity}: Row-only is simplest; removal indices requires careful inverse reconstruction.
+\end{enumerate}
+
+Additionally, our ROI encoding experiments show that foreground-aware bit allocation can improve FG quality by up to 2.4\% with minimal size impact. For degradation/restoration, simple OpenCV sharpening outperforms neural super-resolution in SSIM metrics, though perceptual quality may differ.
+
+For the PRESLEY system, we recommend the \textbf{position map} method for offline processing (explicit, debuggable) and the \textbf{removal indices} method for streaming scenarios (compact metadata). For restoration, \textbf{OpenCV sharpening} provides the best metric-based quality recovery.
+
+\section*{Acknowledgments}
+
+This work is part of the PRESLEY project, extending ELVIS for importance-based video compression using learned saliency and neural reconstruction.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{propainter}
+Zhou, S., et al. ``ProPainter: Improving Propagation and Transformer for Video Inpainting.'' ICCV 2023.
+
+\bibitem{e2fgvi}
+Li, Z., et al. ``Towards An End-to-End Framework for Flow-Guided Video Inpainting.'' CVPR 2022.
+
+\bibitem{elvis}
+Artioli, E. ``ELVIS: Encoding with Learned Video Importance for Streaming.'' Technical Report, 2024.
+
+\end{thebibliography}
+
+\end{document}
